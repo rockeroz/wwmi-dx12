@@ -3,9 +3,9 @@ name: RT capture tool
 on:
   workflow_dispatch:
   push:
-    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'tests/mock_d3d12/**', 'reshade_addon/rt/shaders/**', '.github/workflows/rt-capture.yml']
+    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'tests/mock_d3d12/**', 'reshade_addon/rt/**', '.github/workflows/rt-capture.yml']
   pull_request:
-    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'tests/mock_d3d12/**', 'reshade_addon/rt/shaders/**', '.github/workflows/rt-capture.yml']
+    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'tests/mock_d3d12/**', 'reshade_addon/rt/**', '.github/workflows/rt-capture.yml']
 
 permissions:
   contents: read
@@ -32,6 +32,10 @@ jobs:
           cl /nologo /std:c++20 /EHsc /W4 /WX /MT /Itests\mock_d3d12 tests\rt_upload_readback_test.cpp /Febuild_addon\rt_capture\rt_upload_readback_test.exe /Fobuild_addon\rt_capture\rt_upload_readback_test.obj
           if errorlevel 1 exit /b 1
           build_addon\rt_capture\rt_upload_readback_test.exe
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /WX /MT tests\rt_registry_test.cpp /Febuild_addon\rt_capture\rt_registry_test.exe /Fobuild_addon\rt_capture\rt_registry_test.obj
+          if errorlevel 1 exit /b 1
+          build_addon\rt_capture\rt_registry_test.exe
           if errorlevel 1 exit /b 1
       - name: Test offline analysis
         run: python -m unittest discover -s tests -p "test_rt_*py"

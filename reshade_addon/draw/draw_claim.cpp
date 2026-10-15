@@ -180,7 +180,7 @@ std::optional<bool> ClaimDraw(const DrawArgs& da, BoneRoots& roots, DrawClaim& d
                         di.first_index = first_index;
                         di.index_count = index_count;
                         PortApi::DispatchTextureOverride(got, &di);
-                        if (di.skip) {
+                        if (di.skip && !RtHoldVanilla()) { // RTHOLD: the game keeps its own draw
                             ++g_skip_vbhash_drops;
                             if (g_debug && DiagOnce("SKIPONLY-DROP", (int)((vs_hash ^ got) ^ ((vs_hash ^ got) >> 32))))
                                 logger::write("SKIPONLY-DROP vs=%016llx first=%u count=%u hash=%08x -- the game's draw is cancelled",
@@ -202,7 +202,7 @@ std::optional<bool> ClaimDraw(const DrawArgs& da, BoneRoots& roots, DrawClaim& d
                         std::lock_guard l(g_claimed_ibhash_mtx);
                         never_claims = (g_claimed_ibhash.count(got) == 0);
                     }
-                    if (g_ibhash_suppress && match_mod >= 0 && never_claims) {
+                    if (g_ibhash_suppress && match_mod >= 0 && never_claims && !RtHoldVanilla()) {
                         ++g_ibhash_suppress_count;
                         if (g_debug && ProbeArmed() && DiagOnce("IBHASH-SUPPRESS", (int)((vs_hash ^ got) ^ ((vs_hash ^ got) >> 32)))) {
                             logger::trace("IBHASH-SUPPRESS vs=%016llx first=%u count=%u hash=%08x mod=%d comp=%d (LOD proxy dropped)",
@@ -362,6 +362,26 @@ std::optional<bool> ClaimDraw(const DrawArgs& da, BoneRoots& roots, DrawClaim& d
                 if (char_ibset && !is_mod_char && !char_vb)
                     g_ib_anchor_claims.fetch_add(1, std::memory_order_relaxed);
             }
+            bool rt_hold = false; // RTHOLD (rt_hooks.h): the RT module keeps this draw the game's own
+            {
+                RtClaimInfo ri;
+                ri.mod = md;
+                ri.comp = ci;
+                ri.identified = is_mod_char || char_vb || char_ibset;
+                ri.vb0 = all_vb_va[0];
+                ri.vb0_bytes = all_vb_sz[0];
+                ri.vb0_stride = all_vb_str[0];
+                {
+                    const auto& gs = CmdGfx(cmd_list);
+                    ri.ib_va = gs.ib.va;
+                    ri.index_bytes = gs.ib.index_bytes;
+                }
+                ri.first_index = first_index;
+                ri.index_count = index_count;
+                ri.vertex_offset = da.vertex_offset;
+                ri.vs_hash = vs_hash;
+                rt_hold = RtClaimNote(ri);
+            }
             if (g_debug && !is_mod_char && !char_vb && !char_ibset && DiagOnce("RTCLAIM", CompKey(md, ci)))
                 logger::write("RTCLAIM mod=%d comp=%d first=%u count=%u NOT IDENTIFIED: "
                               "char_vb=0 (vb0=%llx stride=%u inSkinPool=%d -- never learned) | char_ib=0 (ini hash=%08x computed=%08x%s) | "
@@ -406,7 +426,7 @@ std::optional<bool> ClaimDraw(const DrawArgs& da, BoneRoots& roots, DrawClaim& d
                     g_claimed_ibhash.insert(wcc->ib_hash);
                 }
             }
-            if ((is_mod_char || char_vb || char_ibset) && (g_wcl_draw || ModGeomEnabled(md))) {
+            if ((is_mod_char || char_vb || char_ibset) && (g_wcl_draw || ModGeomEnabled(md)) && !rt_hold) {
                 mc = &g_merged_comps[mc_slot];
                 RemovalPin::Mark(d3d12_cl, "game: claimed character draw"); // DRED breadcrumb context
                 rep_vs = vs_hash;

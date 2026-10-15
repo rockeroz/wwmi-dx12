@@ -56,6 +56,29 @@ struct RtPalResult {
 };
 RtPalResult RtPalPublish(uint64_t draw_pso, int dm, const WwmiMod::Component* wc, uint64_t port_cb4_va);
 
+// RTHOLD: a draw the core matched to a mod component by first index + count (draw_claim.cpp), with what it
+// saw bound. `identified` = the core's own definitive identification (IB hash, texture, anchor, learned VB0).
+// The module pairs it with the BLAS geometry reading the same index range to learn the character's ring.
+// true = leave this draw to the game: the module cannot draw the mod here (M1 observes only).
+struct RtClaimInfo {
+    int      mod = -1;
+    int      comp = -1;
+    bool     identified = false;
+    uint64_t vb0 = 0; // bound VB0 VA, vertex_offset NOT applied
+    uint32_t vb0_bytes = 0;
+    uint32_t vb0_stride = 0;
+    uint64_t ib_va = 0; // bound IB VA (first_index NOT applied)
+    uint32_t index_bytes = 0;
+    uint32_t first_index = 0;
+    uint32_t index_count = 0;
+    int32_t  vertex_offset = 0;
+    uint64_t vs_hash = 0;
+};
+bool RtClaimNote(const RtClaimInfo& info);
+// true = every mod edit of the game's own draws and dispatches is held back (component hides, draw /
+// dispatch overrides): the module's observe mode while the game ray traces. false whenever RT is off.
+bool RtHoldVanilla();
+
 // ---- overlay (rt/rt_overlay.cpp) ----
 void RtDrawOverlay();
 

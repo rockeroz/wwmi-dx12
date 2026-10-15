@@ -217,6 +217,9 @@
     <ClCompile Include="reshade_addon\rt\rt_stub.cpp">
       <Filter>rt</Filter>
     </ClCompile>
+    <ClCompile Include="reshade_addon\rt\rt_module.cpp">
+      <Filter>rt</Filter>
+    </ClCompile>
     <ClCompile Include="reshade_addon\instrumentation\chain_trace.cpp">
       <Filter>instrumentation</Filter>
     </ClCompile>
@@ -267,6 +270,9 @@
     <ClInclude Include="reshade_addon\build_stamp.h" />
     <ClInclude Include="reshade_addon\config.h" />
     <ClInclude Include="reshade_addon\rt\rt_hooks.h">
+      <Filter>rt</Filter>
+    </ClInclude>
+    <ClInclude Include="reshade_addon\rt\rt_registry.h">
       <Filter>rt</Filter>
     </ClInclude>
     <ClInclude Include="src\buffer_view_fit.h">

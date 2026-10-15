@@ -38,6 +38,14 @@ RtPalResult RtPalPublish(uint64_t, int, const WwmiMod::Component*, uint64_t)
 {
     return {};
 }
+bool RtClaimNote(const RtClaimInfo&)
+{
+    return false;
+}
+bool RtHoldVanilla()
+{
+    return false;
+}
 void RtDrawOverlay()
 {
     ImGui::TextDisabled("  ray tracing: this build has no RT module (WWMI_RT=0)");

@@ -37,7 +37,7 @@ bool on_dispatch(command_list* cmd_list, uint32_t group_count_x, uint32_t group_
     DispatchVerdict verdict;
     {
         PROF(PROF_Disp_Ovr);
-        verdict = RunDispatchOverrides(da, ck);
+        if (!RtHoldVanilla()) verdict = RunDispatchOverrides(da, ck); // RTHOLD: the game's dispatches run untouched
     }
     const bool     skip_dispatch = verdict.skip;
     const unsigned md_sections_fired = verdict.sections_fired;

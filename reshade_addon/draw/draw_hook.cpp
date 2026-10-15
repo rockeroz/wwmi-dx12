@@ -8,6 +8,7 @@
 #include "draw_ctx.h"
 #include "draw_parts.h"
 #include "../instrumentation/hot_path.h"
+#include "../rt/rt_hooks.h" // RtHoldVanilla
 #include <optional>
 
 thread_local uint8_t  t_x23_claimed = 0;
@@ -57,7 +58,7 @@ bool on_draw_indexed_body(command_list* cmd_list, uint32_t index_count, uint32_t
 
     if (g_merged_loaded) {
         auto hit = g_first_to_comp.find(FirstCountKey(first_index, index_count));
-        if (hit != g_first_to_comp.end() && g_merged_comps[hit->second].hide) {
+        if (hit != g_first_to_comp.end() && g_merged_comps[hit->second].hide && !RtHoldVanilla()) { // RTHOLD
             t_x23_hidden = 1;
             return true;
         }
@@ -69,7 +70,7 @@ bool on_draw_indexed_body(command_list* cmd_list, uint32_t index_count, uint32_t
             PortApi::RunPendingPost();
         }
     } post_after_draw;
-    if (RunDrawShaderOverrides(args)) return true;
+    if (!RtHoldVanilla() && RunDrawShaderOverrides(args)) return true; // RTHOLD: no ini edits of game draws
 
     DrawClaim claim;
     if (const std::optional<bool> r = ClaimDraw(args, roots, claim)) return *r;

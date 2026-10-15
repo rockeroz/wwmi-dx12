@@ -4,6 +4,12 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      rt:
+        description: 'RT module: 0 = public build (no RT module), observe = RT observe module M1'
+        type: choice
+        options: ['0', 'observe']
+        default: '0'
 
 permissions:
   contents: write
@@ -33,7 +39,7 @@ jobs:
         run: |
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
           $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\amd64\MSBuild.exe' | Select-Object -First 1
-          & $msbuild package.proj -m -nologo
+          & $msbuild package.proj -m -nologo "/p:WwmiPackageRT=${{ inputs.rt || '0' }}"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - uses: actions/upload-artifact@v4
