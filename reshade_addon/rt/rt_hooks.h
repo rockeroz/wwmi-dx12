@@ -75,8 +75,9 @@ struct RtClaimInfo {
     uint64_t vs_hash = 0;
 };
 bool RtClaimNote(const RtClaimInfo& info);
-// true = every mod edit of the game's own draws and dispatches is held back (component hides, draw /
-// dispatch overrides): the module's observe mode while the game ray traces. false whenever RT is off.
+// true = every mod edit of the game's frame is held back (component hides, draw / dispatch overrides,
+// texture placement swaps, shapekey relocation, the [Present] lists): the module's observe mode while the
+// game ray traces. false whenever RT is off.
 bool RtHoldVanilla();
 // The game issued DispatchRays (removal_pin.cpp): ray tracing is on even in a frame without a BLAS build.
 void RtNoteRays();

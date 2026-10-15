@@ -3,7 +3,8 @@
 // What M1 does while the game ray traces (a BLAS build or DispatchRays in the last kActiveFrames frames):
 //   - keeps the core running instead of switching it off (RtModulePresent), but HOLDS every mod edit of the
 //     game's frame (RtClaimNote / RtHoldVanilla): no mod geometry, no component hides, no draw / dispatch
-//     overrides, no texture swaps (entering the hold gives every stamped slot back, RtPresentTick). The game
+//     overrides, no [Present] lists, no texture swaps (entering the hold gives every stamped slot back and
+//     keeps it for retry when the hold ends, RtPresentTick). The game
 //     renders vanilla; the mod is NOT drawn yet;
 //   - learns each mod character's skin-cache output ring by pairing a BLAS triangle geometry with the
 //     claimed raster draw that reads the same index range and vertex base (rt_registry.h);
@@ -20,6 +21,7 @@
 #include "../hooks/resource_tracker.h"
 #include "../mods/layout_registry.h" // TableStartOf
 #include "../mods/skeleton.h"        // SnapshotGameCB
+#include "../textures/texture_module.h" // TexHoldForRetry / TexRetryMissed
 #include "rt_hooks.h"
 #include "rt_registry.h"
 #include <cstdarg>
@@ -36,7 +38,7 @@ constexpr uint32_t kSnapBytes = 16384;          // per binding snapshot
 constexpr uint64_t kLogDetailCap = 12ull << 20; // RTPAL detail stops here...
 constexpr uint64_t kLogCap = 16ull << 20;       // ...RTRING / RTSUM / hold lines continue to here
 constexpr size_t   kPendingText = 1u << 20;     // log text buffered between presents
-constexpr uint64_t kPendingBins = 8ull << 20;   // bin bytes buffered between presents
+constexpr uint64_t kPendingBins = 2ull << 20;   // bin bytes buffered between presents (written at present)
 constexpr uint64_t kBinCap = 64ull << 20;       // all bins together
 constexpr uint32_t kBinFiles = 4000;
 constexpr uint32_t kSummaryEvery = 600; // frames
@@ -253,6 +255,39 @@ uint32_t GuardedSnapshot(ID3D12Resource* res, uint64_t va, uint8_t* dst, uint32_
 #endif
 }
 
+// A descriptor-table slot: read through a private, immediately released mapping so a resource destroyed
+// meanwhile can never leave a stale entry in the core's own mapping cache (SnapshotGameCB caches its maps).
+uint32_t PrivateUploadRead(ID3D12Resource* res, uint64_t va, uint8_t* dst, uint32_t n)
+{
+    D3D12_HEAP_PROPERTIES hp = {};
+    D3D12_HEAP_FLAGS      hf = {};
+    if (FAILED(res->GetHeapProperties(&hp, &hf)) || hp.Type != D3D12_HEAP_TYPE_UPLOAD) return 0;
+    const uint64_t base = res->GetGPUVirtualAddress();
+    const uint64_t width = res->GetDesc().Width;
+    if (va < base || va - base >= width) return 0;
+    const uint64_t off = va - base;
+    const uint32_t m = (width - off) < n ? uint32_t(width - off) : n;
+    D3D12_RANGE    none = { 0, 0 };
+    void*          p = nullptr;
+    if (FAILED(res->Map(0, &none, &p)) || !p) return 0;
+    memcpy(dst, static_cast<const uint8_t*>(p) + off, m);
+    res->Unmap(0, &none);
+    return m;
+}
+uint32_t GuardedPrivateRead(ID3D12Resource* res, uint64_t va, uint8_t* dst, uint32_t n)
+{
+#ifdef _MSC_VER
+    __try {
+        return PrivateUploadRead(res, va, dst, n);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_c.snapshot_faults.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+#else
+    return PrivateUploadRead(res, va, dst, n);
+#endif
+}
+
 // ---- RTPAL sampling state (g_m) --------------------------------------------------------------------
 struct SampleKey {
     uint64_t cs, ring;
@@ -303,14 +338,13 @@ void RtPresentTick()
     static uint32_t s_last_summary = 0;
     const bool      held = RtHoldVanilla();
     if (held && !s_held) {
-        const UnstampTally t = UnstampAll(nullptr); // as SetAddonDisabled(true) does: the game's textures back
+        const UnstampTally t = UnstampAll(TexHoldForRetry); // as C1/C2 off does: the game's textures back, kept for retry
         g_c.unstamped.fetch_add(t.recorded, std::memory_order_relaxed);
         g_log.Line(true, "RTHOLD ON: the game ray traces -- mod held, %u stamped slot(s) given back (+%u in CPU-only heaps, %zu still stamped there)",
             t.recorded, t.cpu_only, t.cpu_only_stamped);
     } else if (!held && s_held) {
-        g_log.Line(true, "RTHOLD OFF: no ray tracing for %d frames -- mods draw again; texture swaps return as the game rewrites "
-                         "its descriptors (the overlay's reload brings back any that do not)",
-            kActiveFrames);
+        TexRetryMissed("RT hold ended"); // what UnstampAll and the held RestampResource calls set aside
+        g_log.Line(true, "RTHOLD OFF: no ray tracing for %d frames -- mods draw again, held texture swaps retried", kActiveFrames);
     }
     s_held = held;
     if (g_last_rt_frame.load(std::memory_order_relaxed) && (!s_last_summary || g_frame_id - s_last_summary >= kSummaryEvery)) {
@@ -459,6 +493,7 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
         uint64_t        va;
         uint32_t        size;
         ID3D12Resource* res;
+        uint32_t        age = 0; // table slots: frames since the descriptor was written
     };
     std::vector<Bound> bound;
     bound.reserve(96);
@@ -478,7 +513,7 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
         for (uint32_t i = 0; i < 32; ++i) {
             ResInfo ri;
             if (!g_heap_to_res.find({ ts.heap, ts.base + i }, ri)) continue;
-            if (ri.is_buffer && ri.cached_va) bound.push_back({ 3u, p, i, ri.cached_va, ri.size, ri.res });
+            if (ri.is_buffer && ri.cached_va) bound.push_back({ 3u, p, i, ri.cached_va, ri.size, ri.res, frame - ri.wrote_frame });
         }
     }
 
@@ -533,10 +568,12 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
     for (const Bound& b : bound) {
         Seen s{ &b, rtm::Overlaps(b.va, b.size ? b.size : 1, ring_va, ring_bytes), {} };
         // A table slot can outlive its resource (slots beyond what this shader reads), and so could a stale bind:
-        // only a buffer the resource tracker still knows as live is touched, and the read is SEH-guarded.
-        if (!s.is_ring && b.res && BufferLive(b.res)) {
+        // only a buffer the resource tracker still knows as live is touched, every read is SEH-guarded, and a
+        // table slot is read only if its descriptor was written within the last two frames, through a private map.
+        if (!s.is_ring && b.res && BufferLive(b.res) && (b.kind != 3 || b.age <= 2)) {
             const uint32_t want = b.size ? (b.size < kSnapBytes ? b.size : kSnapBytes) : kSnapBytes;
-            const uint32_t n = GuardedSnapshot(b.res, b.va, buf.data(), want); // 0 = not an UPLOAD buffer (or unmappable)
+            const uint32_t n = b.kind == 3 ? GuardedPrivateRead(b.res, b.va, buf.data(), want)
+                                           : GuardedSnapshot(b.res, b.va, buf.data(), want); // 0 = not UPLOAD / unmappable
             if (n) s.bytes.assign(buf.begin(), buf.begin() + n);
         }
         g_c.snapshots.fetch_add(1, std::memory_order_relaxed);
@@ -563,8 +600,12 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
         }
         ++lines;
         if (s.bytes.empty()) {
-            g_log.Line(false, "  %s p%u s%u va=%llx size=%u%s", kKind[b.kind], b.param, b.slot, (unsigned long long)b.va, b.size,
-                s.is_ring ? " <RING" : " (not CPU-readable: DEFAULT/other heap, or not live)");
+            if (b.kind == 3 && !s.is_ring && b.age > 2)
+                g_log.Line(false, "  tbl p%u s%u va=%llx size=%u (descriptor written %u frames ago: not read)", b.param, b.slot,
+                    (unsigned long long)b.va, b.size, b.age);
+            else
+                g_log.Line(false, "  %s p%u s%u va=%llx size=%u%s", kKind[b.kind], b.param, b.slot, (unsigned long long)b.va, b.size,
+                    s.is_ring ? " <RING" : " (not CPU-readable: DEFAULT/other heap, or not live)");
             continue;
         }
         const rtm::BoneRun run = rtm::BestBoneRun(s.bytes.data(), s.bytes.size());

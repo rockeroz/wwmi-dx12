@@ -624,7 +624,10 @@ void SetAddonDisabled(bool dis)
 bool RestampResource(uint64_t resH)
 {
     if (!g_d3d12_device || !resH || !g_tex_lineage) return false;
-    if (RtHoldVanilla()) return false; // RTHOLD: a miss, retried by the lineage paths once the hold ends
+    if (RtHoldVanilla()) { // RTHOLD: held as a miss; RtPresentTick retries the set when the hold ends
+        TexHoldForRetry(resH);
+        return false;
+    }
     HeapKey key{ 0, 0 };
     if (!g_res_to_slot.find(resH, key) || !key.heap) {
         if (g_debug && DiagOnce("RESTAMP-NOSLOT", (int)(resH >> 4)))

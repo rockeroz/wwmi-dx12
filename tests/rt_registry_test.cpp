@@ -160,11 +160,21 @@ static void bones()
 static void judge()
 {
     CsJudge j;
-    // an unknown shader: kPerFrame looks per frame, for kJudgeFrames frames after a ring change
-    CHECK(j.ShouldInspect(0xAA, 1, 1000));
-    CHECK(j.ShouldInspect(0xAA, 1, 1000));
-    CHECK(!j.ShouldInspect(0xAA, 1, 1000));
+    // an unknown shader: kPerFrame dispatches per frame, the window moving through the frame's dispatch order
+    CHECK(j.ShouldInspect(0xAA, 1, 1000));  // idx 0
+    CHECK(j.ShouldInspect(0xAA, 1, 1000));  // idx 1
+    CHECK(!j.ShouldInspect(0xAA, 1, 1000)); // idx 2
+    CHECK(!j.ShouldInspect(0xAA, 1, 1001)); // next frame: window 2..3
+    CHECK(!j.ShouldInspect(0xAA, 1, 1001));
     CHECK(j.ShouldInspect(0xAA, 1, 1001));
+    // the 7th dispatch of every frame (idx 6) is reached by frame since+3
+    bool reached = false;
+    for (uint32_t f = 1002; f < 1000 + CsJudge::kJudgeFrames && !reached; ++f)
+        for (uint32_t i = 0; i < 8; ++i) {
+            const bool look = j.ShouldInspect(0xAA, 1, f);
+            if (look && i == 6) reached = true;
+        }
+    CHECK(reached);
     CHECK(!j.ShouldInspect(0xAA, 1, 1000 + CsJudge::kJudgeFrames));
     CHECK(j.ShouldInspect(0xAA, 2, 1000 + CsJudge::kJudgeFrames)); // rings changed: judged again
     j.Verdict(0xAA, true);

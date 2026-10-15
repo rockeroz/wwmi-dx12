@@ -329,9 +329,10 @@ inline uint32_t ChangedWords(const std::vector<uint8_t>& a, const std::vector<ui
 
 // When the module looks at a dispatch's bindings. Looking costs a few hundred lock-free heap lookups, so:
 //   - a compute shader seen binding a ring is looked at only on observation frames (IsObservationFrame);
-//   - any other shader is judged again after the rings change (gen), at most kPerFrame of its dispatches per
-//     frame, for kJudgeFrames frames -- the skin-cache shader is shared by every character, so the mod
-//     character's dispatch need not be among the first few after a change.
+//   - any other shader is judged again after the rings change (gen): kPerFrame of its dispatches per frame,
+//     for kJudgeFrames frames, at a window that moves through the frame's first kWindow dispatches -- the
+//     skin-cache shader is shared by every character and dispatch order repeats frame to frame, so a fixed
+//     "first few" would never reach a character that is not dispatched first.
 inline bool IsObservationFrame(uint32_t frame)
 {
     const uint32_t m = frame % 1800u;
@@ -341,6 +342,7 @@ class CsJudge {
 public:
     static constexpr uint32_t kPerFrame = 2;
     static constexpr uint32_t kJudgeFrames = 300;
+    static constexpr uint32_t kWindow = 128;
     static constexpr size_t   kMaxShaders = 4096;
     // True = look at this dispatch's bindings now. `first_sight` = the rings changed since this shader was last judged.
     bool ShouldInspect(uint64_t cs, uint32_t ring_gen, uint32_t frame)
@@ -359,9 +361,11 @@ public:
             e.frame = frame;
             e.in_frame = 0;
         }
+        const uint32_t idx = e.in_frame++; // this dispatch's position among the shader's dispatches this frame
         if (e.hits) return IsObservationFrame(frame) || frame - e.since < 2; // a new ring: look right away too
         if (frame - e.since >= kJudgeFrames) return false;
-        return e.in_frame++ < kPerFrame;
+        const uint32_t off = ((frame - e.since) * kPerFrame) % kWindow;
+        return idx >= off && idx < off + kPerFrame;
     }
     void Verdict(uint64_t cs, bool binds_ring)
     {

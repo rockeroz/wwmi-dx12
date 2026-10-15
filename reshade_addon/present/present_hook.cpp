@@ -59,7 +59,7 @@ void on_present_body(command_queue* queue, swapchain* sc)
         logger::write("RELOAD: engine state cleared (g_texovr_ready=0) -- inis will be re-parsed");
     }
     ModLoader::Tick();
-    if (!g_skip_engine_tick) EngineFrameTick(queue, sc);
+    if (!g_skip_engine_tick && !RtHoldVanilla()) EngineFrameTick(queue, sc); // RTHOLD: no [Present] lists while held (as A9)
     StartRemovalWatchdog(sc);
     g_buffer_reloc.Sweep(sc->get_device());
     ModTexturesTick();
