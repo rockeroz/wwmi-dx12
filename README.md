@@ -186,6 +186,12 @@ brings seeds of what was already learned (`wwmi_dx12\cache\seed-<version>.lodcac
 - **Uninstall:** delete everything starting with `wwmi_dx12` in `<Win64>` (the `wwmi_dx12` folder holds
   the caches); ReShade if nothing else uses it; optionally the `Engine.ini` and `UserEngine.ini` lines.
 
+## RT development
+
+A passive [RT capture tool](tools/rt_capture/README.md) is available for collecting the geometry,
+shader and animation metadata needed to implement full native RT mesh support. It builds independently;
+RT mesh replacement is not implemented and the production RT stop gate remains in place.
+
 ## Building
 
 Visual Studio 2022 or later (C++ desktop, Windows SDK). `git clone --recurse-submodules`, open

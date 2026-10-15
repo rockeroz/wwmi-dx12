@@ -1,0 +1,39 @@
+name: RT capture tool
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ['tools/rt_capture/**', 'tests/*rt_capture*', '.github/workflows/rt-capture.yml']
+  pull_request:
+    paths: ['tools/rt_capture/**', 'tests/*rt_capture*', '.github/workflows/rt-capture.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: false
+      - name: Fetch the pinned ReShade SDK headers
+        run: git submodule update --init reshade_addon/sdk
+      - name: Build capture add-on and run CPU tests
+        shell: cmd
+        run: |
+          call tools\rt_capture\build.cmd
+          if errorlevel 1 exit /b 1
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+          cl /nologo /std:c++20 /EHsc /W4 /WX /MT tests\rt_capture_test.cpp /Febuild_addon\rt_capture\rt_capture_test.exe /Fobuild_addon\rt_capture\rt_capture_test.obj
+          if errorlevel 1 exit /b 1
+          build_addon\rt_capture\rt_capture_test.exe
+      - name: Test offline analysis
+        run: python -m unittest discover -s tests -p "test_rt_capture_analysis.py"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wwmi-rt-capture-development
+          path: |
+            build_addon/rt_capture/wwmi_rt_capture.addon64
+            tools/rt_capture/README.md
+            tools/rt_capture/analyze_capture.py
