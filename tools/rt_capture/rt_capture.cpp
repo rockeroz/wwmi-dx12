@@ -6,6 +6,7 @@
 #include <d3d12.h>
 #include <reshade.hpp>
 #include "trace_buffer.h"
+#include "callback_gate.h"
 #include <atomic>
 #include <algorithm>
 #include <array>
@@ -25,12 +26,16 @@ using rt_capture::hex;
 std::mutex mutex;
 std::atomic<device*> owner{ nullptr };
 std::atomic<bool> recording{ false };
+std::atomic<bool> monitoring{ false }; // starts dormant; F7 enables metadata AFTER the game is running
 std::atomic<bool> trace_full{ false }, probe_failed{ false };
+std::atomic<HANDLE> boot_log{ INVALID_HANDLE_VALUE };
+std::atomic<uint32_t> boot_hooks_seen{ 0 };
 rt_capture::TraceBuffer trace;
 uint64_t sequence = 0, frame = 0, next_id = 1, end_frame = 0;
 uint64_t metadata_dropped = 0, shader_bytes = 0;
 size_t metadata_bytes = 0;
-bool last_f8 = false, last_f9 = false;
+bool last_f7 = false, last_f8 = false, last_f9 = false;
+bool present_seen = false;
 fs::path output_base;
 constexpr size_t max_metadata = 16384;
 constexpr size_t max_shader_bytes = 16 * 1024 * 1024;
@@ -56,7 +61,32 @@ constexpr size_t max_descriptors = 131072;
 std::unordered_map<command_list*, List> lists;
 std::vector<std::string> inventory;
 
-bool ours(device* dev) { return dev && !probe_failed.load() && owner.load(std::memory_order_acquire) == dev; }
+void boot_line(const char* text) noexcept
+{
+    const auto file = boot_log.load();
+    if (file == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(file, text, DWORD(lstrlenA(text)), &written, nullptr);
+    FlushFileBuffers(file); // only startup/control/first-hook breadcrumbs, never every draw
+}
+void boot_hook(uint32_t bit, const char* text) noexcept
+{
+    if ((boot_hooks_seen.fetch_or(bit) & bit) == 0) boot_line(text);
+}
+void open_boot_log() noexcept
+{
+    wchar_t path[32768];
+    const DWORD length = GetModuleFileNameW(nullptr, path, 32768);
+    if (!length || length >= 32768) return;
+    DWORD start = length;
+    while (start && path[start - 1] != L'\\' && path[start - 1] != L'/') --start;
+    constexpr wchar_t name[] = L"wwmi_rt_capture_boot.log";
+    if (start + sizeof(name) / sizeof(wchar_t) > 32768) return;
+    for (size_t i = 0; i < sizeof(name) / sizeof(wchar_t); ++i) path[start + i] = name[i];
+    boot_log.store(CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+}
+bool ours(device* dev) { return monitoring.load() && dev && !probe_failed.load() && owner.load(std::memory_order_acquire) == dev; }
 bool active(command_list* list)
 {
     return recording.load(std::memory_order_relaxed) && !trace_full.load(std::memory_order_relaxed) && list && ours(list->get_device());
@@ -154,6 +184,7 @@ void on_view(device* dev, resource res, resource_usage usage, const resource_vie
 bool on_update_tables(device* dev, uint32_t count, const descriptor_table_update* updates)
 {
     if (!ours(dev)) return false;
+    boot_hook(1, "first descriptor update entered\r\n");
     std::lock_guard lock(mutex);
     for (uint32_t u = 0; u < count; ++u) {
         const auto& update = updates[u];
@@ -184,6 +215,7 @@ bool on_update_tables(device* dev, uint32_t count, const descriptor_table_update
 bool on_copy_tables(device* dev, uint32_t count, const descriptor_table_copy* copies)
 {
     if (!ours(dev)) return false;
+    boot_hook(2, "first descriptor copy entered\r\n");
     std::lock_guard lock(mutex);
     for (uint32_t c = 0; c < count; ++c) {
         const auto& copy = copies[c];
@@ -232,19 +264,13 @@ std::string sample_compute_tables(command_list* list) // mutex held
     s << ']'; return s.str();
 }
 
-void on_init_device(device* dev)
-{
-    if (dev->get_api() != device_api::d3d12) return;
-    device* expected = nullptr;
-    if (!owner.compare_exchange_strong(expected, dev)) return;
-    reshade::log::message(reshade::log::level::info,
-        "WWMI RT Capture 0.1: F8 captures six frames; F9 cancels. Passive probe; full RT mesh support is not implemented.");
-}
 void on_destroy_device(device* dev)
 {
     // A temporary D3D11/secondary device must never tear down the primary capture.
+    if (owner.load() != dev) return; // no capture mutex during unrelated device creation/destruction
     std::lock_guard lock(mutex);
     if (owner.load() != dev) return;
+    monitoring.store(false);
     recording.store(false);
     owner.store(nullptr);
     resources.clear(); pipelines.clear(); layouts.clear(); shaders.clear(); lists.clear(); inventory.clear(); descriptors.clear();
@@ -256,6 +282,7 @@ void on_destroy_device(device* dev)
 void on_init_resource(device* dev, const resource_desc& desc, const subresource_data*, resource_usage state, resource res)
 {
     if (!ours(dev)) return;
+    boot_hook(4, "first resource metadata entered\r\n");
     std::lock_guard lock(mutex);
     std::ostringstream s;
     s << "\"kind\":\"resource\",\"type\":" << uint32_t(desc.type) << ",\"heap\":" << uint32_t(desc.heap)
@@ -281,6 +308,7 @@ void on_destroy_resource(device* dev, resource res)
 void on_init_pipeline(device* dev, pipeline_layout layout, uint32_t count, const pipeline_subobject* subobjects, pipeline pipe)
 {
     if (!ours(dev)) return;
+    boot_hook(8, "first shader metadata entered\r\n");
     std::lock_guard lock(mutex);
     std::ostringstream s;
     s << "\"kind\":\"pipeline\",\"layout_id\":" << id_of(layouts, layout.handle) << ",\"shaders\":[";
@@ -513,6 +541,7 @@ bool on_build(command_list* list, acceleration_structure_type type, acceleration
     resource_view source, resource_view dest, acceleration_structure_build_mode mode)
 {
     if (!active(list)) return false;
+    boot_hook(16, "first acceleration structure capture entered\r\n");
     std::lock_guard lock(mutex);
     std::ostringstream s;
     s << list_fields(list) << "\"event\":\"as_build\",\"type\":" << uint32_t(type) << ",\"flags\":" << uint32_t(flags)
@@ -580,12 +609,12 @@ bool write_capture() // render thread, after recording stopped; no other callbac
     if (!out) return false;
     LARGE_INTEGER frequency;
     QueryPerformanceFrequency(&frequency);
-    out << "{\"schema\":\"wwmi-rt-capture-v1\",\"base_commit\":\"845cec6\",\"full_rt_mesh_support\":false,"
+    out << "{\"schema\":\"wwmi-rt-capture-v1\",\"probe_version\":\"0.1.1\",\"startup_mode\":\"dormant_until_F7\",\"base_commit\":\"845cec6\",\"full_rt_mesh_support\":false,"
         << "\"qpc_frequency\":" << frequency.QuadPart << ",\"dropped_events\":" << trace.dropped
         << ",\"dropped_metadata\":" << metadata_dropped
         << ",\"dropped_descriptors\":" << descriptor_dropped
         << ",\"limitations\":[\"CPU callback order is not GPU execution order\",\"No GPU buffer contents or SBT local records\","
-        << "\"Bindings before capture starts are unknown\",\"Descriptor tables are sampled: first 64 slots/table, at most 64 buffer slots/dispatch\","
+        << "\"Bindings before capture starts are unknown\",\"Resources and shaders created before F7 are not inventoried\",\"Descriptor tables are sampled: first 64 slots/table, at most 64 buffer slots/dispatch\","
         << "\"Descriptor heap destruction is not observable; sampled associations are candidates\"],\"inventory\":[";
     for (size_t i = 0; i < inventory.size(); ++i) { if (i) out << ','; out << inventory[i]; }
     out << "],\"events\":[";
@@ -603,19 +632,48 @@ bool write_capture() // render thread, after recording stopped; no other callbac
 }
 void on_present(command_queue* queue, swapchain*, const rect*, const rect*, uint32_t, const rect*)
 {
-    if (!ours(queue->get_device())) return;
+    if (probe_failed.load() || !queue) return;
+    if (!present_seen) { boot_line("first present callback entered\r\n"); present_seen = true; }
+    auto* dev = queue->get_device();
+    if (!dev) return;
+    if (!owner.load()) {
+        boot_line("checking API after first present\r\n");
+        if (dev->get_api() != device_api::d3d12) return;
+        device* expected = nullptr;
+        if (owner.compare_exchange_strong(expected, dev)) {
+            boot_line("DX12 present reached; metadata hooks remain dormant until F7\r\n");
+            wchar_t exe[32768];
+            const DWORD size = GetModuleFileNameW(nullptr, exe, 32768);
+            if (!size || size >= 32768) { probe_failed.store(true); return; }
+            output_base = fs::path(exe).parent_path() / "wwmi_rt_captures";
+        }
+    }
+    if (owner.load() != dev) return;
     DWORD pid = 0;
     if (const auto fg = GetForegroundWindow()) GetWindowThreadProcessId(fg, &pid);
     const bool focused = pid == GetCurrentProcessId();
+    const bool f7 = focused && (GetAsyncKeyState(VK_F7) & 0x8000);
     const bool f8 = focused && (GetAsyncKeyState(VK_F8) & 0x8000), f9 = focused && (GetAsyncKeyState(VK_F9) & 0x8000);
+    const bool enable = f7 && !last_f7, capture = f8 && !last_f8, stop = f9 && !last_f9;
+    last_f7 = f7; last_f8 = f8; last_f9 = f9;
+    if (!enable && !capture && !stop && !recording.load()) return; // no capture lock on the dormant frame path
     std::lock_guard lock(mutex);
     ++frame;
-    if (f9 && !last_f9) {
+    if (stop) {
+        monitoring.store(false);
         recording.store(false);
         trace.clear(); inventory.clear(); trace_full.store(false);
         for (auto& [list, state] : lists) { (void)list; state.compute_tables = {}; state.compute_layout = 0; }
         reshade::log::message(reshade::log::level::info, "WWMI RT Capture: cancelled.");
-    } else if (f8 && !last_f8 && !recording.load()) {
+        boot_line("F9: all capture hooks dormant\r\n");
+    } else if (enable && !monitoring.load()) {
+        boot_line("F7: enabling metadata hooks after game startup\r\n");
+        monitoring.store(true);
+        reshade::log::message(reshade::log::level::info, "WWMI RT Capture 0.1.1: metadata enabled. Change character, then F8 captures six frames. F9 disables monitoring.");
+    } else if (capture && !monitoring.load()) {
+        boot_line("F8 ignored: press F7 to enable monitoring first\r\n");
+    } else if (capture && !recording.load()) {
+        boot_line("F8: starting six-frame capture\r\n");
         trace.clear(); inventory.clear(); trace_full.store(false);
         for (auto& [list, state] : lists) { (void)list; state.compute_tables = {}; state.compute_layout = 0; }
         for (const auto* entries : { &resources, &pipelines, &layouts })
@@ -627,22 +685,24 @@ void on_present(command_queue* queue, swapchain*, const rect*, const rect*, uint
         recording.store(false);
         // One bounded file write after capture. No disk I/O occurs in draw/dispatch/build hooks.
         const bool ok = write_capture();
+        boot_line(ok ? "capture saved\r\n" : "capture save failed\r\n");
         reshade::log::message(ok ? reshade::log::level::info : reshade::log::level::error,
             ok ? "WWMI RT Capture: saved to wwmi_rt_captures next to the game exe."
                : "WWMI RT Capture: save FAILED (check writable game directory and free disk space).");
     }
-    last_f8 = f8; last_f9 = f9;
 }
 } // namespace
 
 // A diagnostic callback must never cancel game work or propagate an allocation/IO exception.
-template <auto Fn> struct SafeCallback;
-template <class R, class... Args, R (*Fn)(Args...)> struct SafeCallback<Fn> {
+template <auto Fn, bool Always = false> struct SafeCallback;
+template <class R, class... Args, R (*Fn)(Args...), bool Always> struct SafeCallback<Fn, Always> {
     static R call(Args... args) noexcept
     {
-        try { return Fn(args...); }
+        try { return rt_capture::invoke_when_enabled<Fn>(Always || monitoring.load(), args...); }
         catch (...) {
+            monitoring.store(false);
             recording.store(false);
+            boot_line("C++ exception: capture disabled; original game calls preserved\r\n");
             if (!probe_failed.exchange(true))
                 reshade::log::message(reshade::log::level::error, "WWMI RT Capture: probe stopped after an exception. Game calls are passed through.");
             if constexpr (!std::is_void_v<R>) return R{};
@@ -652,18 +712,15 @@ template <class R, class... Args, R (*Fn)(Args...)> struct SafeCallback<Fn> {
 
 extern "C" {
 __declspec(dllexport) const char* NAME = "WWMI RT Capture";
-__declspec(dllexport) const char* DESCRIPTION = "Passive DX12 geometry/animation trace for implementing native RT mesh support. F8: capture. F9: cancel.";
+__declspec(dllexport) const char* DESCRIPTION = "RT Capture 0.1.1: dormant startup. F7 enables metadata, F8 captures, F9 disables. Not full RT mesh support.";
 }
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+extern "C" __declspec(dllexport) bool AddonInit(HMODULE, HMODULE)
 {
-    if (reason == DLL_PROCESS_ATTACH) {
-        if (!reshade::register_addon(module)) return FALSE;
-        wchar_t exe[32768];
-        const DWORD size = GetModuleFileNameW(nullptr, exe, 32768);
-        if (!size || size >= 32768) { reshade::unregister_addon(module); return FALSE; }
-        output_base = fs::path(exe).parent_path() / "wwmi_rt_captures";
+    try {
+        open_boot_log();
+        boot_line("WWMI RT Capture 0.1.1 AddonInit entered outside DllMain\r\n");
 #define EVENT(e, f) reshade::register_event<reshade::addon_event::e>(SafeCallback<f>::call)
-        EVENT(init_device, on_init_device); EVENT(destroy_device, on_destroy_device);
+        reshade::register_event<reshade::addon_event::destroy_device>(SafeCallback<on_destroy_device, true>::call);
         EVENT(init_resource, on_init_resource); EVENT(destroy_resource, on_destroy_resource);
         EVENT(init_resource_view, on_view); EVENT(update_descriptor_tables, on_update_tables); EVENT(copy_descriptor_tables, on_copy_tables);
         EVENT(init_pipeline, on_init_pipeline); EVENT(destroy_pipeline, on_destroy_pipeline);
@@ -674,8 +731,30 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         EVENT(bind_vertex_buffers, on_vb); EVENT(bind_index_buffer, on_ib);
         EVENT(draw_indexed, on_draw); EVENT(dispatch, on_dispatch);
         EVENT(build_acceleration_structure, on_build); EVENT(dispatch_rays, on_rays);
-        EVENT(execute_command_list, on_execute); EVENT(present, on_present);
+        EVENT(execute_command_list, on_execute);
+        reshade::register_event<reshade::addon_event::present>(SafeCallback<on_present, true>::call);
 #undef EVENT
-    } else if (reason == DLL_PROCESS_DETACH) reshade::unregister_addon(module);
+        boot_line("callbacks registered; metadata, draw and RT hooks are dormant\r\n");
+        return true;
+    } catch (...) {
+        monitoring.store(false);
+        probe_failed.store(true);
+        boot_line("AddonInit failed; monitoring disabled\r\n");
+        return false;
+    }
+}
+extern "C" __declspec(dllexport) void AddonUninit(HMODULE, HMODULE)
+{
+    monitoring.store(false);
+    recording.store(false);
+    boot_line("AddonUninit\r\n");
+    const auto file = boot_log.exchange(INVALID_HANDLE_VALUE);
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+}
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+{
+    // No paths, files, capture locks, native API queries, or callback setup under the loader lock.
+    if (reason == DLL_PROCESS_ATTACH && !reshade::register_addon(module)) return FALSE;
+    if (reason == DLL_PROCESS_DETACH) reshade::unregister_addon(module);
     return TRUE;
 }

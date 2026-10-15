@@ -1,19 +1,45 @@
-# WWMI RT Capture 0.1
+# WWMI RT Capture 0.1.1 — arranque inactivo
 
 Companion ReShade add-on for developing **full native RT mesh support** in wwmi-dx12.
 This is a diagnostic prerequisite, **not an implementation of RT mesh replacement**.
 The production add-on still stops when RT is detected. Its safety gate is unchanged.
+
+## Cambio por el fallo de inicio reportado
+
+La 0.1.0 impidió iniciar el juego en el equipo de prueba del usuario. El log
+disponible confirma que se registraba el capturador, pero no identifica la
+excepción ni demuestra una causa concreta. Esa versión se retira de las pruebas.
+
+La 0.1.1 es **una versión de prueba de arranque**, todavía sin validar en el juego:
+
+- `DllMain` solo registra/desregistra el add-on. La preparación se hace en
+  `AddonInit`, fuera del bloqueo del cargador.
+- Los hooks de recursos, shaders, descriptores, dibujo y RT permanecen inactivos
+  hasta pulsar **F7 dentro del juego**. Desactivados no entran en sus callbacks,
+  consultan objetos nativos ni toman el mutex de captura.
+- El dispositivo DX12 se elige en el primer Present, después de la creación.
+- `wwmi_rt_capture_boot.log`, junto al ejecutable, registra el inicio sin
+  depender de la opción debug de WWMI. Se vacía en cada nuevo arranque: guárdalo
+  antes de repetir una prueba fallida. Incluye marcas antes de activar hooks.
+- **F9** desactiva también el seguimiento, además de cancelar la captura.
+
+Primera prueba: reemplaza solo `wwmi_rt_capture.addon64` y comprueba que el juego
+abre **sin pulsar F7 ni F8**. Si falla, retira ese archivo y conserva
+`wwmi_rt_capture_boot.log` y `ReShade.log`. Que compile no demuestra que el fallo
+de arranque esté resuelto.
 
 ## Capturar en el juego
 
 1. Usa ReShade 6.8.0 o posterior, con soporte completo de add-ons, y DirectX 12.
 2. Copia `wwmi_rt_capture.addon64` al mismo directorio de add-ons que ya utiliza
    `wwmi_dx12.addon64`. Si ReShade.ini tiene `AddonPath`, usa esa carpeta.
-3. Inicia el juego. En ReShade.log debe aparecer `WWMI RT Capture 0.1`.
-4. Con RT **desactivado**, muestra un solo personaje cuyo mod funcione en DX12.
-   Mueve al personaje y pulsa **F8** una vez. Se capturan seis fotogramas.
+3. Inicia el juego. En `wwmi_rt_capture_boot.log` debe aparecer
+   `WWMI RT Capture 0.1.1 AddonInit`.
+4. Una vez comprobado el inicio, con RT **desactivado**, pulsa **F7**. Cambia al
+   personaje de prueba para provocar nuevos recursos y pipelines. Muévelo y
+   pulsa **F8** una vez. Se capturan seis fotogramas.
 5. Activa RT y reinicia si el juego lo solicita. Muestra el mismo personaje,
-   muévelo y vuelve a pulsar **F8**. El add-on original puede desactivar los mods;
+   pulsa **F7** si reiniciaste, muévelo y vuelve a pulsar **F8**. El add-on original puede desactivar los mods;
    esta captura independiente sigue funcionando.
 6. Espera el mensaje `saved to wwmi_rt_captures` en ReShade.log. Encontrarás
    una carpeta por captura en `Win64/wwmi_rt_captures`, junto al ejecutable.
@@ -22,7 +48,7 @@ The production add-on still stops when RT is detected. Its safety gate is unchan
    Conserva el .ini y los .buf del mod: hacen falta para contrastar los índices
    de huesos y los componentes con la captura.
 
-**F9** cancela una captura pendiente. Mantén el juego en primer plano para usar
+**F9** cancela una captura pendiente y desactiva el seguimiento. Mantén el juego en primer plano para usar
 las teclas. Se escriben archivos solamente al terminar la captura; puede haber
 una pausa puntual al guardar. No se capturan continuamente ni se envían datos.
 Para retirar la herramienta, cierra el juego y elimina `wwmi_rt_capture.addon64`.
@@ -63,6 +89,12 @@ UAV de cómputo y posiciones FLOAT3 usadas para construir BLAS. Son **candidatos
 no prueban que un shader escriba ese rango ni que pertenezca al personaje.
 Las tablas pueden contener descriptores no utilizados por el shader. El orden
 de callbacks CPU tampoco demuestra el orden GPU entre listas distintas.
+
+Los recursos y shaders creados antes de F7 no forman parte del inventario; las
+direcciones RT absolutas siguen registrándose. Los metadatos faltantes quedan
+sin resolver. Cambiar de personaje puede crear recursos nuevos, pero no garantiza
+la recreación de shaders. Esta limitación impide usar la captura como prueba de
+que se hayan identificado todos los enlaces del modelo.
 
 La captura no contiene los vértices, matrices de huesos, instancias TLAS ni
 registros locales SBT almacenados en GPU. Hace falta una fase posterior de
