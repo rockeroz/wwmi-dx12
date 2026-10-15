@@ -46,6 +46,8 @@ bool RtHoldVanilla()
 {
     return false;
 }
+void RtNoteRays() {}
+void RtPresentTick() {}
 void RtDrawOverlay()
 {
     ImGui::TextDisabled("  ray tracing: this build has no RT module (WWMI_RT=0)");

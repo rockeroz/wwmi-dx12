@@ -78,6 +78,11 @@ bool RtClaimNote(const RtClaimInfo& info);
 // true = every mod edit of the game's own draws and dispatches is held back (component hides, draw /
 // dispatch overrides): the module's observe mode while the game ray traces. false whenever RT is off.
 bool RtHoldVanilla();
+// The game issued DispatchRays (removal_pin.cpp): ray tracing is on even in a frame without a BLAS build.
+void RtNoteRays();
+// Once per frame from the present path, while the add-on is enabled: the module's hold transitions
+// (entering the hold gives every stamped texture slot back to the game) and its periodic work.
+void RtPresentTick();
 
 // ---- overlay (rt/rt_overlay.cpp) ----
 void RtDrawOverlay();

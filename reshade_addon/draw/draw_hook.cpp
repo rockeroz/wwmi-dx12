@@ -98,7 +98,7 @@ bool on_draw_indexed_body(command_list* cmd_list, uint32_t index_count, uint32_t
     DrawProbeVb6Reader(args, claim);
     DrawProbeOffLeak(args, claim);
 
-    if (g_hide_unclaimed_char && !mc && index_count >= 2000) {
+    if (g_hide_unclaimed_char && !mc && index_count >= 2000 && !RtHoldVanilla()) { // RTHOLD
         uint64_t vb0 = 0;
         {
             vb0 = CmdGfx(cmd_list).vb[0].va;

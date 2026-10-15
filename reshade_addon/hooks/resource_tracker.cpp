@@ -312,6 +312,7 @@ bool on_update_descriptor_tables(device* device, uint32_t count, const descripto
             } else {
                 FlatHeapMap::set_at(dp, rvs[i].handle, g_view_seq.load(std::memory_order_acquire), g_frame_id, 1, nullptr);
                 if (update.type == descriptor_type::shader_resource_view && vinfo.tex_cand && // hashable textures only
+                    !RtHoldVanilla() &&                                                       //   RTHOLD: no swaps while held
                     !GlobalTexSwap(dev_u, heap.handle, base_offset + i, vinfo.res) &&         //   -> skip swap lock otherwise
                     g_texnoswap_arm.load(std::memory_order_relaxed) > 0)
                     TexNoSwapNote(heap.handle, base_offset + i, vinfo.res, "update");
@@ -623,6 +624,7 @@ void SetAddonDisabled(bool dis)
 bool RestampResource(uint64_t resH)
 {
     if (!g_d3d12_device || !resH || !g_tex_lineage) return false;
+    if (RtHoldVanilla()) return false; // RTHOLD: a miss, retried by the lineage paths once the hold ends
     HeapKey key{ 0, 0 };
     if (!g_res_to_slot.find(resH, key) || !key.heap) {
         if (g_debug && DiagOnce("RESTAMP-NOSLOT", (int)(resH >> 4)))

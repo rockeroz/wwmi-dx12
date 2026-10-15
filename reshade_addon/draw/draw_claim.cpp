@@ -175,12 +175,12 @@ std::optional<bool> ClaimDraw(const DrawArgs& da, BoneRoots& roots, DrawClaim& d
                         logger::write("SKIPONLY-SEEN vs=%016llx first=%u count=%u vb0=%llx ibBytes=%u stride=%u -> hash %08x%s",
                             (unsigned long long)vs_hash, first_index, index_count, (unsigned long long)bvb0, ib_bytes, vstride, got,
                             !got ? " (pending)" : (skip_vbhash && skip_vbhash->count(got) ? " IN the skip set" : ""));
-                    if (skip_vbhash && skip_vbhash->count(got)) {
+                    if (skip_vbhash && skip_vbhash->count(got) && !RtHoldVanilla()) { // RTHOLD: no mod commands on game draws
                         PortApi::DrawInfo di;
                         di.first_index = first_index;
                         di.index_count = index_count;
                         PortApi::DispatchTextureOverride(got, &di);
-                        if (di.skip && !RtHoldVanilla()) { // RTHOLD: the game keeps its own draw
+                        if (di.skip) {
                             ++g_skip_vbhash_drops;
                             if (g_debug && DiagOnce("SKIPONLY-DROP", (int)((vs_hash ^ got) ^ ((vs_hash ^ got) >> 32))))
                                 logger::write("SKIPONLY-DROP vs=%016llx first=%u count=%u hash=%08x -- the game's draw is cancelled",
@@ -391,7 +391,7 @@ std::optional<bool> ClaimDraw(const DrawArgs& da, BoneRoots& roots, DrawClaim& d
                     !has_ib_ref ? ", no hash= in the ini" : (ib_got == 0 ? ", NOT COMPUTED YET" : ", MISMATCH"),
                     has_ib_ref ? "skipped (the mod carries hash=)" : "probed and missed",
                     (unsigned long long)all_vb_va[6]);
-            if (is_mod_char) {
+            if (is_mod_char && !rt_hold) { // RTHOLD: vb0 is the skin cache's posed ring, not a bind-pose mesh
                 const uint32_t sh = HashBoneCB(cur.res, cur.va);
                 if (vb0) {
                     std::lock_guard l(g_char_mesh_mtx);
@@ -406,7 +406,7 @@ std::optional<bool> ClaimDraw(const DrawArgs& da, BoneRoots& roots, DrawClaim& d
                         ci, vs_hash, first_index, index_count);
                 }
             }
-            if (is_mod_char || char_vb || char_ibset) {
+            if ((is_mod_char || char_vb || char_ibset) && !rt_hold) { // RTHOLD: a held mod is not on screen
                 g_geomods[md].last_char_frame = g_frame_id;
                 for (const int s : g_merged_comps[mc_slot].with) g_geomods[g_merged_comps[s].mod_id].last_char_frame = g_frame_id;
             }
@@ -419,7 +419,7 @@ std::optional<bool> ClaimDraw(const DrawArgs& da, BoneRoots& roots, DrawClaim& d
                 v.vs = vs_hash;
                 RtNoteDrawVb(md, ci, v);
             }
-            if (is_mod_char || char_vb || char_ibset) {
+            if ((is_mod_char || char_vb || char_ibset) && !rt_hold) {
                 const WwmiMod::Component* wcc = WmodComp(md, ci);
                 if (wcc && wcc->ib_hash) {
                     std::lock_guard l(g_claimed_ibhash_mtx);

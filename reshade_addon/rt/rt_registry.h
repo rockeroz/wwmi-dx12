@@ -129,7 +129,7 @@ public:
         if (!va || !bytes) return;
         for (Ring& r : rings_)
             if (r.va == va) {
-                r.bytes = std::max(r.bytes, bytes);
+                r.bytes = (std::max)(r.bytes, bytes);
                 if (mod >= 0 && (!weak || r.weak || r.mod < 0)) r.mod = mod;
                 r.weak = r.weak && weak;
                 r.confirmed_frame = frame;
@@ -321,32 +321,52 @@ inline BoneRun BestBoneRun(const uint8_t* bytes, size_t n)
 // How many 4-byte words differ between two snapshots of the same place (over the shorter length).
 inline uint32_t ChangedWords(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b)
 {
-    const size_t n = std::min(a.size(), b.size()) / 4;
+    const size_t n = (std::min)(a.size(), b.size()) / 4;
     uint32_t     c = 0;
     for (size_t i = 0; i < n; ++i) c += std::memcmp(a.data() + i * 4, b.data() + i * 4, 4) != 0;
     return c;
 }
 
-// Per compute-shader verdict cache: is this CS ever seen writing a ring? Re-judged when the rings change.
+// When the module looks at a dispatch's bindings. Looking costs a few hundred lock-free heap lookups, so:
+//   - a compute shader seen binding a ring is looked at only on observation frames (IsObservationFrame);
+//   - any other shader is judged again after the rings change (gen), at most kPerFrame of its dispatches per
+//     frame, for kJudgeFrames frames -- the skin-cache shader is shared by every character, so the mod
+//     character's dispatch need not be among the first few after a change.
+inline bool IsObservationFrame(uint32_t frame)
+{
+    const uint32_t m = frame % 1800u;
+    return m == 0 || m == 1 || m == 30;
+}
 class CsJudge {
 public:
-    static constexpr uint32_t kTries = 8;
-    // True = look at this dispatch's bindings now.
-    bool ShouldInspect(uint64_t cs, uint32_t ring_gen)
+    static constexpr uint32_t kPerFrame = 2;
+    static constexpr uint32_t kJudgeFrames = 300;
+    static constexpr size_t   kMaxShaders = 4096;
+    // True = look at this dispatch's bindings now. `first_sight` = the rings changed since this shader was last judged.
+    bool ShouldInspect(uint64_t cs, uint32_t ring_gen, uint32_t frame)
     {
-        Entry& e = map_[cs];
+        auto it = map_.find(cs);
+        if (it == map_.end()) {
+            if (map_.size() >= kMaxShaders) return false;
+            it = map_.emplace(cs, Entry{}).first;
+        }
+        Entry& e = it->second;
         if (e.gen != ring_gen) {
             e.gen = ring_gen;
-            e.tries = 0;
+            e.since = frame;
         }
-        if (e.hits) return true;
-        return e.tries < kTries;
+        if (e.frame != frame) {
+            e.frame = frame;
+            e.in_frame = 0;
+        }
+        if (e.hits) return IsObservationFrame(frame) || frame - e.since < 2; // a new ring: look right away too
+        if (frame - e.since >= kJudgeFrames) return false;
+        return e.in_frame++ < kPerFrame;
     }
-    void Verdict(uint64_t cs, bool writes_ring)
+    void Verdict(uint64_t cs, bool binds_ring)
     {
-        Entry& e = map_[cs];
-        ++e.tries;
-        if (writes_ring) ++e.hits;
+        auto it = map_.find(cs);
+        if (it != map_.end() && binds_ring) ++it->second.hits;
     }
     uint32_t Hits(uint64_t cs) const
     {
@@ -363,7 +383,9 @@ public:
 private:
     struct Entry {
         uint32_t gen = UINT32_MAX;
-        uint32_t tries = 0;
+        uint32_t since = 0;
+        uint32_t frame = UINT32_MAX;
+        uint32_t in_frame = 0;
         uint32_t hits = 0;
     };
     std::map<uint64_t, Entry> map_;

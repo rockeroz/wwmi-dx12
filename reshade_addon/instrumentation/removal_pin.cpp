@@ -317,6 +317,7 @@ bool on_dispatch_rays(reshade::api::command_list* cmd_list, reshade::api::resour
     const unsigned long long               n = s_n.fetch_add(1, std::memory_order_relaxed);
     if (n == 0 || n == 1000 || n == 100000)
         logger::report("RT ACTIVE: DispatchRays #%llu (%u x %u x %u) at frame %u", n + 1, width, height, depth, g_frame_id);
+    RtNoteRays();
     if (cmd_list) RemovalPin::Ours(reinterpret_cast<const void*>(cmd_list->get_native()), "game-dispatch-rays");
     return false;
 }

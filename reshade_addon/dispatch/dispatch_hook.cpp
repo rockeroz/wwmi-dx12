@@ -27,7 +27,7 @@ bool on_dispatch(command_list* cmd_list, uint32_t group_count_x, uint32_t group_
 
     {
         PROF(PROF_Disp_Resolve);
-        SkResolveU0(cmd_list, cs_hash, group_count_x, group_count_y, group_count_z, ck);
+        if (!RtHoldVanilla()) SkResolveU0(cmd_list, cs_hash, group_count_x, group_count_y, group_count_z, ck); // RTHOLD: no relocation / copies on game buffers
     }
 
     const CmdState& state = CmdGfx(cmd_list);

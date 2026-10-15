@@ -1,5 +1,17 @@
 // CPU tests for reshade_addon/rt/rt_registry.h (no D3D12). Build: g++ -std=c++20 -Wall -Wextra -Werror
+// <Windows.h> without NOMINMAX defines these as macros; the header must still compile (MSVC C2589).
+// The standard headers come first (some standard libraries #undef the two), as in the add-on.
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <map>
+#include <optional>
+#include <vector>
+#define min(a, b) (((a) < (b)) ? (a) : (b))
+#define max(a, b) (((a) > (b)) ? (a) : (b))
 #include "../reshade_addon/rt/rt_registry.h"
+#undef min
+#undef max
 #include <cstdio>
 #include <cstdlib>
 
@@ -148,15 +160,23 @@ static void bones()
 static void judge()
 {
     CsJudge j;
-    for (uint32_t i = 0; i < CsJudge::kTries; ++i) {
-        CHECK(j.ShouldInspect(0xAA, 1));
-        j.Verdict(0xAA, false);
-    }
-    CHECK(!j.ShouldInspect(0xAA, 1));
-    CHECK(j.ShouldInspect(0xAA, 2)); // rings changed: judged again
+    // an unknown shader: kPerFrame looks per frame, for kJudgeFrames frames after a ring change
+    CHECK(j.ShouldInspect(0xAA, 1, 1000));
+    CHECK(j.ShouldInspect(0xAA, 1, 1000));
+    CHECK(!j.ShouldInspect(0xAA, 1, 1000));
+    CHECK(j.ShouldInspect(0xAA, 1, 1001));
+    CHECK(!j.ShouldInspect(0xAA, 1, 1000 + CsJudge::kJudgeFrames));
+    CHECK(j.ShouldInspect(0xAA, 2, 1000 + CsJudge::kJudgeFrames)); // rings changed: judged again
     j.Verdict(0xAA, true);
-    for (int i = 0; i < 20; ++i) CHECK(j.ShouldInspect(0xAA, 2));
+    // a ring shader: right after the change, then only on observation frames
+    CHECK(j.ShouldInspect(0xAA, 2, 1001 + CsJudge::kJudgeFrames));
+    CHECK(!j.ShouldInspect(0xAA, 2, 1500));
+    CHECK(j.ShouldInspect(0xAA, 2, 1800));
+    CHECK(j.ShouldInspect(0xAA, 2, 1801));
+    CHECK(j.ShouldInspect(0xAA, 2, 1830));
+    CHECK(!j.ShouldInspect(0xAA, 2, 1831));
     CHECK(j.SkinShaders() == 1);
+    CHECK(IsObservationFrame(3600) && !IsObservationFrame(3602));
 }
 
 int main()

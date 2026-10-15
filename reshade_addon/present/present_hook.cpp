@@ -13,6 +13,7 @@
 #include "../instrumentation/hot_path.h"
 #include "../instrumentation/perf_monitor.h"
 #include "../hud/uid_hide.h"
+#include "../rt/rt_hooks.h" // RtPresentTick
 
 void on_present_body(command_queue* queue, swapchain* sc)
 {
@@ -41,6 +42,7 @@ void on_present_body(command_queue* queue, swapchain* sc)
     }
     VerboseTick();
     if (g_addon_disabled) return;
+    RtPresentTick(); // RT module: hold transitions (rt_hooks.h)
     if (g_hide_uid) g_uid_hide.NoteBackBuffer(sc);
     RemovalPin::Check(g_d3d12_device, "Present");
 
