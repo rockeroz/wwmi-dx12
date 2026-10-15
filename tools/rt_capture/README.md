@@ -1,192 +1,167 @@
-# WWMI RT Capture 0.1.2 — presupuesto RT independiente
+# WWMI RT Capture 0.1.3 — constantes del personaje
 
-Companion ReShade add-on for developing **full native RT mesh support** in wwmi-dx12.
-This is a diagnostic prerequisite, **not an implementation of RT mesh replacement**.
-The production add-on still stops when RT is detected. Its safety gate is unchanged.
+Herramienta independiente para desarrollar modelos completos en RT nativo.
+**Todavía no implementa reemplazo RT.** El add-on original conserva su bloqueo:
+`RtModulePresent()` sigue devolviendo false. No se instala un módulo RT funcional.
 
-## Cambio por el fallo de inicio reportado
+## Qué cambia
 
-La 0.1.0 impidió iniciar el juego en el equipo de prueba del usuario. El log
-disponible confirma que se registraba el capturador, pero no identifica la
-excepción ni demuestra una causa concreta. Esa versión se retira de las pruebas.
+La captura recibida de 0.1.2 permitió correlacionar las ocho geometrías originales
+con los mismos VB/IB usados por los dibujos raster, pero guardaba direcciones,
+no bytes de constantes. La 0.1.3 añade copias acotadas UPLOAD → READBACK para
+inspeccionarlas, con una firma de geometría configurable y fences propios.
+La firma indica un candidato; no verifica identidad, huesos ni materiales.
 
-El usuario confirmó que la 0.1.1 inicia y capturó datos. La 0.1.2 conserva ese
-arranque inactivo, pero sus nuevos hooks todavía deben validarse en el juego:
+- Reconoce todos los componentes en orden, sus conteos, ventanas relativas de
+  índices, formato FLOAT3, stride 12 y número de vértices nativos.
+- Correlaciona draws con VB/IB de ese BLAS; también muestrea dispatches cuyas
+  tablas incluyen su dirección de posiciones. Una tabla no demuestra uso real.
+- Mantiene el estado de bindings durante los doce Present de la captura aunque
+  se llene el presupuesto de filas generales. Los eventos objetivo usan el
+  presupuesto RT independiente.
+- Corrige las unidades de las vistas typed/raw del backend D3D12 del SDK fijado:
+  FirstElement y NumElements se convierten a bytes según el formato, con controles
+  de overflow. Las vistas estructuradas y CBV conservan sus unidades propias.
+- El analizador normaliza las muestras typed/raw antiguas de 0.1.0–0.1.2. Los
+  formatos desconocidos quedan sin resolver.
 
-- `DllMain` solo registra/desregistra el add-on. La preparación se hace en
-  `AddonInit`, fuera del bloqueo del cargador.
-- Los hooks de recursos, shaders, descriptores, dibujo y RT permanecen inactivos
-  hasta pulsar **F7 dentro del juego**. Desactivados no entran en sus callbacks,
-  consultan objetos nativos ni toman el mutex de captura.
-- El dispositivo DX12 se elige en el primer Present, después de la creación.
-- `wwmi_rt_capture_boot.log`, junto al ejecutable, registra el inicio sin
-  depender de la opción debug de WWMI. Se vacía en cada nuevo arranque: guárdalo
-  antes de repetir una prueba fallida. Incluye marcas antes de activar hooks.
-- **F9** desactiva también el seguimiento, además de cancelar la captura.
+## Prueba en el juego
 
-La 0.1.2 reserva un segundo búfer para BLAS/TLAS y DispatchRays: llenar el
-registro de draws ya no termina la captura ni consume el espacio de RT. También
-consulta los metadatos de búferes anteriores a F7 al recibir un handle válido en
-un callback. No interpreta una dirección GPU absoluta como un objeto nativo.
-Los pipelines desconocidos conservan su handle, sin atribuirles otro shader.
-Reactivar F7 tras F9 descarta asociaciones antiguas: durante la pausa podrían
-haberse destruido o reutilizado sus handles.
+1. Con el juego cerrado, copia `wwmi_rt_capture.addon64` y `wwmi_rt_target.txt`
+   juntos a tu carpeta de add-ons. Si usas AddonPath, ambos van allí.
+2. La configuración incluida deriva del cuerpo Hsin observado: 87374 vértices
+   nativos y ocho ventanas originales. No son los 137779 vértices del mod.
+3. Activa RT y reinicia si el juego lo solicita. El mod seguirá bloqueado por el
+   add-on original; esta herramienta obtiene datos del modelo nativo.
+4. En mundo abierto, pulsa F7, cambia al mismo personaje y muévelo. Pulsa F8 una
+   vez. Se registran doce Present; después se consultan los fences sin bloquear.
+5. Espera `saved to wwmi_rt_captures` en ReShade.log. Comprime la nueva carpeta
+   dentro de `Client/Binaries/Win64/wwmi_rt_captures` y compártela completa.
+   Puede incluir `upload_windows/*.bin`, además de capture.json y shaders/*.dxil.
+6. Si no hay ventanas, conserva la carpeta igualmente: los contadores explican
+   si faltó la firma, los enlaces, recursos UPLOAD o una copia completada.
 
-## Capturar en el juego
+La prueba anterior ya cumplió su objetivo. Esta nueva captura agrega contenido
+que antes no existía; no hace falta repetir la referencia con RT apagado ni enviar
+el mod otra vez. Requiere ReShade 6.8.0 con soporte completo de add-ons y DX12.
 
-1. Usa ReShade 6.8.0 o posterior, con soporte completo de add-ons, y DirectX 12.
-2. Copia `wwmi_rt_capture.addon64` al mismo directorio de add-ons que ya utiliza
-   `wwmi_dx12.addon64`. Si ReShade.ini tiene `AddonPath`, usa esa carpeta.
-3. Inicia el juego. En `wwmi_rt_capture_boot.log` debe aparecer
-   `WWMI RT Capture 0.1.2 AddonInit`.
-4. La referencia recibida no contiene eventos RT. La siguiente prueba pendiente
-   es con **RT activado** en los ajustes del juego; reinicia si lo solicita.
-5. Muestra el mismo personaje en mundo abierto. Pulsa **F7**, cambia al personaje
-   de prueba para provocar recursos nuevos, muévelo y pulsa **F8** una vez.
-   El add-on original puede desactivar los mods; esta captura es independiente.
-6. Espera el mensaje `saved to wwmi_rt_captures` en ReShade.log. Encontrarás
-   una carpeta por captura en `Win64/wwmi_rt_captures`, junto al ejecutable.
-   Cada carpeta contiene `capture.json` y `shaders/*.dxil`.
-7. Comparte la nueva carpeta comprimida e indica que RT estaba activado.
-   El mod y la referencia anterior ya se recibieron; no hace falta reenviarlos.
+F9 cancela y desactiva el seguimiento. Las copias ya enviadas conservan recursos
+hasta su fence; no se cancelan operaciones GPU que ya están en la cola. No hay
+captura continua ni envío de datos. Para retirar la herramienta, cierra el juego
+y elimina los dos archivos instalados. Conserva los logs si falla el inicio.
 
-**F9** cancela una captura pendiente y desactiva el seguimiento. Mantén el juego en primer plano para usar
-las teclas. Se escriben archivos solamente al terminar la captura; puede haber
-una pausa puntual al guardar. No se capturan continuamente ni se envían datos.
-Para retirar la herramienta, cierra el juego y elimina `wwmi_rt_capture.addon64`.
-Puedes conservar o borrar las carpetas de capturas por separado.
+## Contrato de las copias
 
-## Qué registra
+Los callbacks permanecen inactivos hasta F7. DllMain solo registra/desregistra el
+add-on; AddonInit prepara el archivo objetivo fuera del bloqueo del cargador.
+La 0.1.1 y la 0.1.2 iniciaron en el equipo de prueba; la 0.1.3 requiere validación
+nueva dentro del juego. `wwmi_rt_capture_boot.log` marca inicio, firma encontrada,
+copia enviada y lectura después del fence; se sobrescribe en cada arranque.
 
-- BLAS/TLAS, geometrías, VA originales, offsets, formatos, número de vértices e
-  índices, flags, modo build/update, destino y scratch.
-- Raíces de cómputo y gráficos, constantes, layouts, shaders y búferes de dibujo.
-- Muestras de descriptores de búfer en tablas de cómputo: hasta los primeros 64
-  slots por tabla y un máximo de 64 búferes por dispatch.
-- DispatchRays y los rangos/strides de sus cuatro tablas SBT.
-- Identidad y generación de listas, cola de envío, secuencia CPU y tiempos QPC.
-- Inventario de recursos y shaders con identificadores independientes de las
-  direcciones, para distinguir la reutilización de handles.
+En el callback anterior a ExecuteCommandLists, en su mismo hilo y cola, se envía
+una lista nativa independiente con las copias y después un Signal de un fence
+propio. Solo se aceptan buffers cuyo GetHeapProperties devuelve UPLOAD, que
+permanecen en GENERIC_READ y no pueden ser escritos por la GPU. No se adivinan
+estados ni se hacen transiciones de recursos del juego. No se lee DEFAULT,
+GPU_UPLOAD ni memoria custom; se contabilizan como omitidos. El juego conserva
+sus draws, dispatches y builds: los callbacks booleanos siguen devolviendo false.
 
-No cambia draw calls, shaders, vértices, BLAS, TLAS ni tablas del juego. Todos los
-callbacks con retorno booleano devuelven false. No hace readback GPU, ni espera
-fences, ni llama Map sobre buffers del juego. Los shaders retenidos se copian
-del bytecode CPU recibido en los eventos de creación de pipeline.
+La CPU solo llama Map en el READBACK propio cuando su fence completa. No se llama
+Map en los recursos del juego, ni WaitForSingleObject, ni wait_idle. Se conservan
+las fuentes, allocator, lista, READBACK y fence hasta completar la copia. Las
+creaciones/asignaciones que pueden lanzar una excepción terminan antes del envío.
+Un Signal fallido nunca cuenta como copia completada. En un unload forzado se
+retienen los jobs incompletos hasta terminar el proceso, antes que liberar memoria
+que la GPU podría seguir usando; no queda ningún hilo ejecutándose fuera del DLL.
 
-La memoria de filas está limitada a 8 MiB/32768 eventos generales y otros
-8 MiB/32768 eventos RT, más sus índices/objetos de almacenamiento; los metadatos
-tienen un límite de 16 MiB, los shaders de 16 MiB (máximo 2048) y hay hasta
-131072 descriptores. Se capturan seis fotogramas o hasta llenar el presupuesto
-RT. Llenar el registro general deja incompletos los enlaces generales posteriores,
-pero los eventos RT siguen registrándose. `general_trace_truncated` y los
-contadores `dropped_*` exponen pérdidas; estos contadores no cuentan callbacks
-que ya no entraron por estar lleno su presupuesto. Un fallo de guardado se
-comunica en el log.
+Límites por captura: 128 ventanas, 16 KiB por ventana, 2 MiB de bytes copiados y
+16 envíos. Los candidatos de cómputo usan hasta 32 ventanas y solo los primeros
+ocho envíos pueden contener exclusivamente cómputo: se reserva capacidad para
+las coincidencias raster más precisas. Cada ventana única de recurso/offset se copia una vez. Un root CBV no
+informa su longitud; la ventana termina en el límite del recurso o en 16 KiB y
+**puede contener asignaciones vecinas**. `extent_known=false` y
+`verified_bone_palette=false` son deliberados. No se declara que una ventana
+corresponda a un hueso, ni que su contenido sea la pose consumida por un draw.
 
-## Análisis offline
+`upload_readback` expone muestras, recursos/rangos/presupuesto omitidos, fallos,
+ventanas sin envío y copias pendientes al guardar. Se permite hasta cinco segundos
+de sondeo entre Present después de registrar; en timeout se guarda el estado
+incompleto y se retienen los jobs. No se crea un archivo de ceros para una copia
+sin completar. Mientras queden jobs pendientes no se inicia otra captura.
+
+Los eventos generales y prioritarios tienen 8 MiB/32768 filas cada uno, más sus
+índices/objetos; metadatos y shaders tienen 16 MiB cada uno. Hay hasta 131072
+asociaciones de descriptores. Los contadores no incluyen todos los callbacks que
+ya dejaron de emitir filas tras llenar su presupuesto. Las muestras de tablas
+pueden ser incompletas o incluir entradas ajenas; no prueban el skinning.
+
+## Analizar
 
 Con Python 3.10 o posterior:
 
 ```sh
-python tools/rt_capture/analyze_capture.py ruta/capture.json
+python tools/rt_capture/analyze_capture.py captura/capture.json
+python tools/rt_capture/inspect_upload_windows.py captura/capture.json
+python tools/rt_capture/inspect_mod.py carpeta_mod --output perfil.json
+python tools/rt_capture/match_rt_geometry.py captura/capture.json perfil.json --output candidatos.json
 ```
 
-Crea `analysis.json` junto a la captura. Busca coincidencias de direcciones entre
-UAV de cómputo y posiciones FLOAT3 usadas para construir BLAS. Son **candidatos**:
-no prueban que un shader escriba ese rango ni que pertenezca al personaje.
-Las tablas pueden contener descriptores no utilizados por el shader. El orden
-de callbacks CPU tampoco demuestra el orden GPU entre listas distintas.
+El inspector de ventanas verifica tamaño, hash y procedencia de fence/UPLOAD.
+Busca secuencias compatibles con filas afines 3x4 como heurística; cámaras,
+objetos u otros datos también pueden pasarla. No genera un adaptador de paleta.
+Los shaders anteriores a F7 siguen sin bytecode. Los datos GPU de posiciones,
+instancias TLAS y registros locales SBT todavía no se leen.
 
-Los búferes anteriores a F7 se identifican de forma diferida cuando un callback
-proporciona un handle válido; los shaders anteriores a F7 siguen desconocidos.
-Las direcciones RT absolutas se registran sin desreferenciarlas. Los metadatos
-faltantes quedan sin resolver. Cambiar de personaje puede crear recursos nuevos, pero no garantiza
-la recreación de shaders. Esta limitación impide usar la captura como prueba de
-que se hayan identificado todos los enlaces del modelo.
+El inspector del mod no edita archivos: valida buffers reales y drawindexed,
+separa los rangos originales de matching de las ventanas del mod, y conserva
+condiciones como texto sin ejecutar toda la lógica INI. Las variantes que
+comparten la misma topología original permanecen como candidatos separados.
 
-La captura no contiene los vértices, matrices de huesos, instancias TLAS ni
-registros locales SBT almacenados en GPU. Hace falta una fase posterior de
-readback con fences para verificar esos contenidos. La destrucción de heaps
-de descriptores no se observa mediante esta API; sus asociaciones se tratan
-como candidatos. Las vinculaciones anteriores a F8 quedan desconocidas.
+`SkinModPositions.hlsl` y `skin_reference.py` preparan skinning canónico de cuatro
+u ocho influencias. El kernel compiló de forma independiente, pero aún no se
+invoca desde el add-on. Faltan la paleta nativa verificada, shapekeys, BLAS/TLAS,
+materiales/SBT, sincronización y validación visual de modelos completos en RT.
 
-## Lo que falta para modelos completos
+## Configuración objetivo
 
-1. Verificar en una captura del juego qué dispatch genera el skin cache de cada
-   personaje, el formato de la paleta de huesos y el orden GPU.
-2. Generar las posiciones animadas del mod, incluidos remapeos de huesos,
-   shapekeys y copias independientes del personaje, usando esos datos verificados.
-3. Construir BLAS para la topología del mod y redirigir las instancias TLAS.
-   Preservar el índice de geometría/material no basta cuando cambia el número
-   de segmentos: hay que adaptar también atributos y registros locales SBT.
-4. Mantener recursos/scratch por envío hasta su fence; cubrir actualizaciones,
-   compactación, cambio de personaje/LOD, recarga y vuelta al modelo original.
-5. Validar en el juego sombras/reflejos, materiales translúcidos, animación,
-   dos copias del personaje y frame generation, con el debug layer de DX12.
+El formato de `wwmi_rt_target.txt` es:
 
-Quitar `RtBlockWithoutModule()` o devolver true desde `RtModulePresent()` sin
-esas conexiones solo elimina el bloqueo: no implementa modelos completos en RT.
+```text
+WWMI_RT_TARGET_V1
+numero_vertices_nativos numero_componentes
+primer_indice cantidad_indices
+...
+```
 
-## Compilar
+Hay un ejemplo derivado de la captura en `targets/hsin-body.target`. La firma no
+contiene direcciones, hashes de shaders ni offsets de huesos adivinados. Si falta
+o es inválida, la herramienta solo registra metadatos y no copia constantes.
 
-En la raíz del repositorio, con Visual Studio 2022 (C++ desktop + Windows SDK):
+## Compilar y validar
+
+Desde la raíz, con Visual Studio 2022 C++ desktop y Windows SDK:
 
 ```bat
 tools\rt_capture\build.cmd
 ```
 
-Salida: `build_addon/rt_capture/wwmi_rt_capture.addon64`. Solo necesita los headers
-del SDK ReShade fijado por el submódulo; no usa 3Dmigoto, ImGui ni DXC.
-El workflow `rt-capture.yml` compila y prueba esta herramienta sin publicar releases.
-
-Pruebas de lógica CPU:
+Salida: build_addon/rt_capture/wwmi_rt_capture.addon64. Solo necesita los headers
+ReShade fijados por el submódulo; no usa 3Dmigoto, ImGui ni DXC. El workflow
+rt-capture.yml compila la DLL y las pruebas sin publicar releases.
 
 ```sh
-g++ -std=c++20 -Wall -Wextra -Werror tests/rt_capture_test.cpp -o /tmp/rt_capture_test
-/tmp/rt_capture_test
+g++ -std=c++20 -Wall -Wextra -Werror tests/rt_capture_test.cpp -o rt_capture_test
+g++ -std=c++20 -Wall -Wextra -Werror -I tests/mock_d3d12 tests/rt_upload_readback_test.cpp -o rt_upload_readback_test
 python -m unittest discover -s tests -p 'test_rt_*py'
 ```
 
-El compilado de desarrollo entregado fue compilado para Windows x64 con GCC
-MinGW-w64 13-posix y el SDK ReShade `05c95f4a`. Aún no se ha ejecutado dentro del
-juego. Compilarlo no valida el comportamiento del driver ni el resultado visual.
+Las pruebas de readback usan un doble de API determinista: verifican que no se
+mapea antes del fence, que un Signal fallido no libera recursos, y que se respetan
+rangos, heaps, deduplicación y presupuestos. No validan la GPU ni el driver. La DLL
+entregada compila con MinGW-w64 GCC 13.2.0-posix y -Werror; el workflow MSVC aún
+no se ha ejecutado. El soporte RT completo no se presenta como terminado.
 
-## Preparación de geometría
-
-`inspect_mod.py carpeta_mod --output perfil.json` valida tamaños reales, índices,
-posiciones y pesos sin editar el mod. Separa los rangos originales usados para
-matching de los `drawindexed` reales del mod y conserva sus condiciones como
-texto, sin ejecutar la lógica INI. No resuelve automáticamente huesos nativos RT.
-
-`reshade_addon/rt/shaders/SkinModPositions.hlsl` y `skin_reference.py` preparan
-el skinning canónico de cuatro u ocho influencias. El kernel se compila por
-separado con DXC; **no se ejecuta desde el capturador ni desde el módulo RT**.
-Ver el README de shaders para contratos de recursos y límites de validación.
-
-## Correlacionar componentes con BLAS
-
-```sh
-python tools/rt_capture/match_rt_geometry.py captura/capture.json perfil.json --output candidatos.json
-```
-
-Compara todos los componentes en orden, sus conteos originales y las direcciones
-relativas de sus ventanas de índices. Exige posiciones FLOAT3 compartidas y un
-mismo búfer base de índices; busca además draws con los mismos VB/IB y rangos.
-Devuelve todas las variantes compatibles sin elegir una ni activar reemplazos.
-No compara solo el número total de índices. Las coincidencias siguen siendo
-candidatos de metadatos CPU: la reutilización de VA, el tiempo de vida, el orden
-GPU, la paleta nativa y los materiales requieren verificación independiente.
-
-La captura RT recibida de 0.1.2 contiene 300 eventos BLAS, 3 TLAS y 12
-DispatchRays. Los ocho rangos del personaje y el accesorio tienen candidatos
-con correlaciones raster. **Esto no habilita el módulo RT:** `rt_stub.cpp`
-continúa devolviendo false en `RtModulePresent()` y el add-on bloquea los mods.
-
-Los descriptores de tablas de 0.1.2 pueden haberse perdido por su límite de
-capacidad. Además, en la conversión nativa D3D12 del SDK fijado, los offsets y
-tamaños de vistas typed/raw se expresan en elementos aunque la estructura API
-los documente como bytes. La 0.1.2 los guardó directamente con nombres de bytes.
-Sus asociaciones UAV no deben usarse para deducir una paleta de huesos ni un
-rango exacto sin normalizar las unidades según formato y versión. El correlador
-de geometría usa únicamente las direcciones VB/IB/AS y no depende de esas
-muestras de descriptores.
+Referencias primarias: [Readback con heaps](https://learn.microsoft.com/en-us/windows/win32/direct3d12/readback-data-using-heaps),
+[estados de recursos UPLOAD](https://learn.microsoft.com/en-us/windows/win32/direct3d12/using-resource-barriers-to-synchronize-resource-states-in-direct3d-12).
+La conversión de unidades se contrastó con source/d3d12/d3d12_impl_type_convert.cpp
+del SDK ReShade fijado en el repositorio.

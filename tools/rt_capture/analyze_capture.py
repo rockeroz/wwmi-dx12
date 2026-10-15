@@ -11,6 +11,23 @@ def number(value):
     return int(value, 0) if isinstance(value, str) else int(value)
 
 
+def normalize_table_sample(sample, capture):
+    """Correct native DX12 element units saved as bytes by probe 0.1.0-0.1.2."""
+    if capture.get("descriptor_range_units") == "bytes" or capture.get("probe_version") not in ("0.1.0", "0.1.1", "0.1.2"):
+        return sample
+    fmt = sample.get("format", 0)
+    if not fmt or sample.get("type") == 6:  # structured or constant buffer: already byte offsets
+        return sample
+    element = 16 if 1 <= fmt <= 4 else 12 if 5 <= fmt <= 8 else 8 if 9 <= fmt <= 22 else 4 if 23 <= fmt <= 47 else 2 if 48 <= fmt <= 59 else 1 if 60 <= fmt <= 65 else 0
+    if not element:
+        return None  # unknown format: never guess an address
+    offset = number(sample.get("offset", 0)) * element
+    size = number(sample.get("bytes", 0)) * element
+    if offset < 0 or size < 0 or offset + size >= 2**64:
+        return None
+    return {**sample, "offset": offset, "bytes": size}
+
+
 def analyze(capture):
     if capture.get("schema") != "wwmi-rt-capture-v1":
         raise ValueError("Unsupported capture schema")
@@ -98,6 +115,9 @@ def analyze(capture):
             for sample in event.get("buffer_table_samples", []):
                 if sample.get("type") not in (3, 5):  # unordered_access_view / buffer_unordered_access_view
                     continue
+                sample = normalize_table_sample(sample, capture)
+                if sample is None:
+                    continue
                 va = resolve(sample)
                 if va:
                     candidates.append((sample["param"], va, "sampled_table_uav"))
@@ -152,6 +172,7 @@ def analyze(capture):
             "dropped_metadata": capture.get("dropped_metadata", 0),
             "dropped_descriptors": capture.get("dropped_descriptors", 0),
             "dropped_rt_events": capture.get("dropped_rt_events", 0),
+            "legacy_table_units_normalized": capture.get("descriptor_range_units") != "bytes" and capture.get("probe_version") in ("0.1.0", "0.1.1", "0.1.2"),
             "general_trace_truncated": capture.get("general_trace_truncated", bool(capture.get("dropped_events", 0))),
             "limitations": ["Candidate links do not prove writes, character ownership or bone palette layout.",
                             "Cross-list GPU order requires submission/fence analysis.",

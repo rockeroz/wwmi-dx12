@@ -188,8 +188,9 @@ brings seeds of what was already learned (`wwmi_dx12\cache\seed-<version>.lodcac
 
 ## RT development
 
-A passive [RT capture tool](tools/rt_capture/README.md) is available for collecting the geometry,
-shader and animation metadata needed to implement full native RT mesh support. It builds independently;
+An independent [RT capture tool](tools/rt_capture/README.md) is available for collecting the geometry,
+shader and animation metadata needed to implement full native RT mesh support. A configured target can also
+copy bounded UPLOAD constant windows to READBACK buffers with its own completion fences. It builds independently;
 RT mesh replacement is not implemented and the production RT stop gate remains in place.
 
 ## Building

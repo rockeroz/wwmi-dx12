@@ -25,6 +25,13 @@ def fixture():
 
 
 class AnalysisTest(unittest.TestCase):
+    def test_legacy_typed_table_units_are_converted_without_touching_new_captures(self):
+        sample = {"type": 3, "format": 41, "offset": "0x100", "bytes": 8}
+        self.assertEqual(module.normalize_table_sample(sample, {"probe_version": "0.1.2"})["offset"], 1024)
+        self.assertEqual(module.normalize_table_sample(sample, {"descriptor_range_units": "bytes"}), sample)
+        self.assertIsNone(module.normalize_table_sample({**sample, "format": 999}, {"probe_version": "0.1.2"}))
+        self.assertIsNone(module.normalize_table_sample({**sample, "offset": hex(2**64 - 1)}, {"probe_version": "0.1.2"}))
+
     def test_candidates_are_not_promoted_to_proof(self):
         report = module.analyze(fixture())
         self.assertFalse(report["full_rt_mesh_support"])

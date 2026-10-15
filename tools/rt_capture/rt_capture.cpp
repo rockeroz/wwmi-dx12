@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Independent, passive ReShade add-on. This does NOT enable mesh replacement with RT.
+// Independent ReShade diagnostic add-on with bounded upload readback. This does NOT enable mesh replacement with RT.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -7,6 +7,7 @@
 #include <reshade.hpp>
 #include "trace_buffer.h"
 #include "callback_gate.h"
+#include "upload_readback.h"
 #include <atomic>
 #include <algorithm>
 #include <array>
@@ -23,7 +24,7 @@ using namespace reshade::api;
 namespace fs = std::filesystem;
 namespace {
 using rt_capture::hex;
-std::mutex mutex;
+std::recursive_mutex mutex; // final COM Release can re-enter resource-destruction callbacks
 std::atomic<device*> owner{ nullptr };
 std::atomic<bool> recording{ false };
 std::atomic<bool> monitoring{ false }; // starts dormant; F7 enables metadata AFTER the game is running
@@ -36,7 +37,12 @@ uint64_t sequence = 0, frame = 0, next_id = 1, end_frame = 0;
 uint64_t metadata_dropped = 0, shader_bytes = 0;
 size_t metadata_bytes = 0;
 bool last_f7 = false, last_f8 = false, last_f9 = false;
-bool present_seen = false;
+bool present_seen = false, saving_pending = false;
+uint64_t save_started = 0, unsubmitted_windows = 0;
+rt_capture::UploadReadbacks readbacks;
+std::optional<rt_capture::Target> target;
+std::vector<rt_capture::Ring> target_rings;
+fs::path target_path;
 fs::path output_base;
 constexpr size_t max_metadata = 16384;
 constexpr size_t max_shader_bytes = 16 * 1024 * 1024;
@@ -46,10 +52,16 @@ constexpr size_t max_metadata_bytes = 16 * 1024 * 1024;
 struct Metadata { uint64_t id; std::string json; };
 std::map<uint64_t, Metadata> resources, pipelines, layouts;
 std::map<uint64_t, std::vector<char>> shaders;
+struct BufferInfo { uint64_t va = 0, bytes = 0; };
+std::map<uint64_t, BufferInfo> buffer_info;
 struct TableBind { uint64_t handle = 0; };
 struct List {
     uint64_t id = 0, generation = 0, compute_layout = 0;
     std::array<TableBind, 64> compute_tables{};
+    uint64_t graphics_layout = 0, vb = 0, ib = 0, graphics_pipe = 0, compute_pipe = 0;
+    uint32_t vb_stride = 0, index_bytes = 0;
+    std::array<rt_capture::UploadRequest, 64> graphics_cb{}, compute_cb{};
+    std::vector<rt_capture::UploadRequest> pending_uploads;
 };
 struct Descriptor {
     uint64_t resource_id = 0, resource_handle = 0, offset = 0, bytes = 0, written = 0;
@@ -143,6 +155,7 @@ void ensure_buffer_metadata(resource res) // only callback-supplied resource han
     s << "\"kind\":\"resource\",\"type\":1,\"lazy\":true,\"va\":\"" << hex(native->GetGPUVirtualAddress())
       << "\",\"bytes\":" << desc.Width;
     remember(resources, res.handle, s.str());
+    if (resources.count(res.handle)) buffer_info[res.handle] = { native->GetGPUVirtualAddress(), desc.Width };
 }
 std::string address(resource res, uint64_t offset) // mutex held; never dereference a raw GPU VA
 {
@@ -151,6 +164,48 @@ std::string address(resource res, uint64_t offset) // mutex held; never derefere
     ensure_buffer_metadata(res);
     return "{\"resource_id\":" + std::to_string(id_of(resources, res.handle)) +
         ",\"resource\":\"" + hex(res.handle) + "\",\"offset\":\"" + hex(offset) + "\"}";
+}
+uint64_t gpu_address(resource res, uint64_t offset) // mutex held
+{
+    if (!res.handle) return offset;
+    ensure_buffer_metadata(res);
+    const auto it = buffer_info.find(res.handle);
+    if (it == buffer_info.end() || offset >= it->second.bytes || it->second.va > UINT64_MAX - offset) return 0;
+    return it->second.va + offset;
+}
+bool in_target_ring(uint64_t va)
+{
+    return std::any_of(target_rings.begin(), target_rings.end(), [&](const auto& ring) { return va == ring.vertices; });
+}
+void clear_recording_state()
+{
+    for (auto& [list, state] : lists) {
+        (void)list;
+        unsubmitted_windows += state.pending_uploads.size();
+        const auto id = state.id, generation = state.generation;
+        state = {}; state.id = id; state.generation = generation;
+    }
+}
+void queue_upload_windows(command_list* list, bool compute, uint32_t first, uint32_t count)
+{
+    auto it = lists.find(list);
+    if (it == lists.end()) return;
+    auto& state = it->second;
+    const auto& roots = compute ? state.compute_cb : state.graphics_cb;
+    for (uint32_t root = 0; root < roots.size(); ++root) {
+        const auto& cb = roots[root];
+        if (!cb.source) continue;
+        const bool duplicate = std::any_of(state.pending_uploads.begin(), state.pending_uploads.end(), [&](const auto& r) {
+            return r.source == cb.source && r.offset == cb.offset;
+        });
+        if (duplicate) continue;
+        if (state.pending_uploads.size() >= 128) { ++readbacks.skipped_budget; continue; }
+        auto request = cb;
+        request.root = root; request.first = first; request.count = count; request.compute = compute;
+        request.context = list_fields(list) + "\"observed_frame\":" + std::to_string(frame) + ",\"compute\":" + (compute ? "true" : "false") +
+            ",\"pipeline_handle\":\"" + hex(compute ? state.compute_pipe : state.graphics_pipe) + "\",";
+        state.pending_uploads.push_back(std::move(request));
+    }
 }
 bool compute_stage(shader_stage stages)
 {
@@ -195,7 +250,11 @@ void on_view(device* dev, resource res, resource_usage usage, const resource_vie
         if (desc.format == format::unknown) {
             d.structure_stride = desc.buffer.structured.stride;
             d.bytes = uint64_t(desc.buffer.structured.count) * d.structure_stride;
-        } else d.bytes = desc.buffer.size;
+        } else if (!rt_capture::typed_bytes(desc.buffer.offset, desc.buffer.size,
+            format_row_pitch(desc.format, 1), d.offset, d.bytes)) {
+            d.valid = false;
+            ++descriptor_dropped;
+        }
     }
     set_descriptor(view.handle, d);
 }
@@ -255,7 +314,7 @@ bool on_copy_tables(device* dev, uint32_t count, const descriptor_table_copy* co
     }
     return false;
 }
-std::string sample_compute_tables(command_list* list) // mutex held
+std::string sample_compute_tables(command_list* list, bool* touches_target = nullptr) // mutex held
 {
     const auto it = lists.find(list);
     if (it == lists.end()) return "[]";
@@ -274,6 +333,9 @@ std::string sample_compute_tables(command_list* list) // mutex held
             const auto d = descriptors.find(cpu + uint64_t(i) * stride);
             if (d == descriptors.end() || !d->second.buffer) continue;
             const auto& v = d->second;
+            const auto buffer = buffer_info.find(v.resource_handle);
+            if (touches_target && buffer != buffer_info.end() && v.offset < buffer->second.bytes &&
+                buffer->second.va <= UINT64_MAX - v.offset && in_target_ring(buffer->second.va + v.offset)) *touches_target = true;
             if (emitted++) s << ',';
             s << "{\"param\":" << p << ",\"slot_offset\":" << i << ",\"type\":" << v.type << ",\"format\":" << v.format
               << ",\"resource_id\":" << v.resource_id << ",\"offset\":\"" << hex(v.offset)
@@ -292,6 +354,9 @@ void on_destroy_device(device* dev)
     monitoring.store(false);
     recording.store(false);
     owner.store(nullptr);
+    saving_pending = false;
+    readbacks.abandon_unfinished();
+    buffer_info.clear(); target_rings.clear();
     resources.clear(); pipelines.clear(); layouts.clear(); shaders.clear(); lists.clear(); inventory.clear(); descriptors.clear();
     shader_bytes = metadata_dropped = 0;
     metadata_bytes = 0;
@@ -310,6 +375,7 @@ void on_init_resource(device* dev, const resource_desc& desc, const subresource_
     if (desc.type == resource_type::buffer) {
         const uint64_t va = reinterpret_cast<ID3D12Resource*>(res.handle)->GetGPUVirtualAddress();
         s << ",\"va\":\"" << hex(va) << "\",\"bytes\":" << desc.buffer.size;
+        if (buffer_info.size() < max_metadata) buffer_info[res.handle] = { va, desc.buffer.size };
     } else if (desc.type == resource_type::texture_2d) {
         s << ",\"width\":" << desc.texture.width << ",\"height\":" << desc.texture.height
           << ",\"format\":" << uint32_t(desc.texture.format);
@@ -324,6 +390,12 @@ void on_destroy_resource(device* dev, resource res)
     const auto old = resources.find(res.handle);
     if (old != resources.end()) metadata_bytes -= old->second.json.size();
     resources.erase(res.handle);
+    const auto buffer = buffer_info.find(res.handle);
+    if (buffer != buffer_info.end()) {
+        const auto begin = buffer->second.va, bytes = buffer->second.bytes;
+        std::erase_if(target_rings, [&](const auto& ring) { return ring.vertices >= begin && ring.vertices - begin < bytes; });
+        buffer_info.erase(buffer);
+    }
 }
 void on_init_pipeline(device* dev, pipeline_layout layout, uint32_t count, const pipeline_subobject* subobjects, pipeline pipe)
 {
@@ -432,9 +504,9 @@ void on_reset(command_list* list)
     list_fields(list);
     auto it = lists.find(list);
     if (it != lists.end()) {
-        ++it->second.generation;
-        it->second.compute_tables = {};
-        it->second.compute_layout = 0;
+        unsubmitted_windows += it->second.pending_uploads.size();
+        const auto id = it->second.id, generation = it->second.generation + 1;
+        it->second = {}; it->second.id = id; it->second.generation = generation;
     }
     add(list_fields(list) + "\"event\":\"reset\"");
 }
@@ -443,19 +515,27 @@ void on_destroy_list(command_list* list)
     if (!list || !ours(list->get_device())) return;
     std::lock_guard lock(mutex);
     add(list_fields(list) + "\"event\":\"destroy_list\"");
+    if (lists.count(list)) unsubmitted_windows += lists.at(list).pending_uploads.size();
     lists.erase(list);
 }
 void on_bind_pipeline(command_list* list, pipeline_stage stages, pipeline pipe)
 {
-    if (!active(list)) return;
+    if (!active(list, true)) return;
     std::lock_guard lock(mutex);
+    list_fields(list);
+    if (auto it = lists.find(list); it != lists.end()) {
+        if (uint32_t(stages & pipeline_stage::compute_shader)) it->second.compute_pipe = pipe.handle;
+        if (uint32_t(stages & pipeline_stage::all_graphics)) it->second.graphics_pipe = pipe.handle;
+    }
+    if (trace_full.load()) return;
     add(list_fields(list) + "\"event\":\"bind_pipeline\",\"stages\":" + std::to_string(uint32_t(stages)) +
         ",\"pipeline_id\":" + std::to_string(id_of(pipelines, pipe.handle)) + ",\"pipeline_handle\":\"" + hex(pipe.handle) + "\"");
 }
 void on_tables(command_list* list, shader_stage stages, pipeline_layout layout, uint32_t first, uint32_t count, const descriptor_table* tables)
 {
-    if (!active(list)) return;
+    if (!active(list, true)) return;
     std::lock_guard lock(mutex);
+    list_fields(list);
     std::ostringstream s;
     s << list_fields(list) << "\"event\":\"tables\",\"stages\":" << uint32_t(stages) << ",\"layout_id\":"
       << id_of(layouts, layout.handle) << ",\"compute\":" << (compute_stage(stages) ? "true" : "false")
@@ -465,35 +545,54 @@ void on_tables(command_list* list, shader_stage stages, pipeline_layout layout, 
     const auto lit = lists.find(list);
     if (compute_stage(stages) && lit != lists.end()) {
         auto& state = lit->second;
-        if (state.compute_layout != layout.handle) state.compute_tables = {};
+        if (state.compute_layout != layout.handle) { state.compute_tables = {}; state.compute_cb = {}; }
         state.compute_layout = layout.handle;
-        for (uint32_t i = 0; i < count && first < 64 && i < 64 - first; ++i)
+        for (uint32_t i = 0; i < count && first < 64 && i < 64 - first; ++i) {
             state.compute_tables[first + i].handle = tables[i].handle;
+            state.compute_cb[first + i] = {};
+        }
     }
-    add(s.str());
+    if (!compute_stage(stages) && lit != lists.end()) {
+        auto& state = lit->second;
+        if (state.graphics_layout != layout.handle) state.graphics_cb = {};
+        state.graphics_layout = layout.handle;
+        for (uint32_t i = 0; i < count && first < 64 && i < 64 - first; ++i) state.graphics_cb[first + i] = {};
+    }
+    if (!trace_full.load()) add(s.str());
 }
 void on_constants(command_list* list, shader_stage stages, pipeline_layout layout, uint32_t param, uint32_t first, uint32_t count, const void* values)
 {
-    if (!active(list) || !values) return;
+    if (!active(list, true) || !values) return;
     std::lock_guard lock(mutex);
+    list_fields(list);
     std::ostringstream s;
     s << list_fields(list) << "\"event\":\"constants\",\"stages\":" << uint32_t(stages) << ",\"layout_id\":"
       << id_of(layouts, layout.handle) << ",\"param\":" << param << ",\"first\":" << first << ",\"values\":[";
     const auto lit = lists.find(list);
     if (compute_stage(stages) && lit != lists.end()) {
         auto& state = lit->second;
-        if (state.compute_layout != layout.handle) state.compute_tables = {};
+        if (state.compute_layout != layout.handle) { state.compute_tables = {}; state.compute_cb = {}; }
         state.compute_layout = layout.handle;
         if (param < 64) state.compute_tables[param] = {};
     }
     for (uint32_t i = 0; i < count && i < 64; ++i) { if (i) s << ','; s << static_cast<const uint32_t*>(values)[i]; }
     s << ']';
-    add(s.str());
+    if (lit != lists.end()) {
+        auto& state = lit->second;
+        auto& cb = compute_stage(stages) ? state.compute_cb : state.graphics_cb;
+        if (!compute_stage(stages)) {
+            if (state.graphics_layout != layout.handle) cb = {};
+            state.graphics_layout = layout.handle;
+        }
+        if (param < 64) cb[param] = {};
+    }
+    if (!trace_full.load()) add(s.str());
 }
 void on_push(command_list* list, shader_stage stages, pipeline_layout layout, uint32_t param, const descriptor_table_update& u)
 {
-    if (!active(list) || !u.descriptors) return;
+    if (!active(list, true) || !u.descriptors) return;
     std::lock_guard lock(mutex);
+    list_fields(list);
     std::ostringstream s;
     s << list_fields(list) << "\"event\":\"root_descriptors\",\"stages\":" << uint32_t(stages) << ",\"layout_id\":"
       << id_of(layouts, layout.handle) << ",\"param\":" << param << ",\"type\":" << uint32_t(u.type)
@@ -501,7 +600,7 @@ void on_push(command_list* list, shader_stage stages, pipeline_layout layout, ui
     const auto lit = lists.find(list);
     if (compute_stage(stages) && lit != lists.end()) {
         auto& state = lit->second;
-        if (state.compute_layout != layout.handle) state.compute_tables = {};
+        if (state.compute_layout != layout.handle) { state.compute_tables = {}; state.compute_cb = {}; }
         state.compute_layout = layout.handle;
         if (param < 64) state.compute_tables[param] = {};
     }
@@ -519,12 +618,42 @@ void on_push(command_list* list, shader_stage stages, pipeline_layout layout, ui
         } else s << "null";
     }
     s << ']';
-    add(s.str());
+    if (lit != lists.end()) {
+        auto& state = lit->second;
+        auto& cb = compute_stage(stages) ? state.compute_cb : state.graphics_cb;
+        if (!compute_stage(stages)) {
+            if (state.graphics_layout != layout.handle) cb = {};
+            state.graphics_layout = layout.handle;
+        }
+        if (param < 64) {
+            cb[param] = {};
+            if (u.type == descriptor_type::constant_buffer && u.count == 1) {
+                const auto& b = *static_cast<const buffer_range*>(u.descriptors);
+                if (b.buffer.handle) {
+                    cb[param].source = rt_capture::retain(reinterpret_cast<ID3D12Resource*>(b.buffer.handle));
+                    cb[param].resource_id = id_of(resources, b.buffer.handle);
+                    cb[param].offset = b.offset;
+                    cb[param].source_va = gpu_address(b.buffer, b.offset);
+                    cb[param].requested = (std::min)(uint64_t(16384), b.size);
+                }
+            }
+        }
+    }
+    if (!trace_full.load()) add(s.str());
 }
 void on_vb(command_list* list, uint32_t first, uint32_t count, const resource* buffers, const uint64_t* offsets, const uint32_t* strides)
 {
-    if (!active(list)) return;
+    if (!active(list, true)) return;
     std::lock_guard lock(mutex);
+    list_fields(list);
+    if (first == 0) {
+        auto it = lists.find(list);
+        if (it != lists.end()) {
+            it->second.vb = count ? gpu_address(buffers[0], offsets ? offsets[0] : 0) : 0;
+            it->second.vb_stride = count && strides ? strides[0] : 0;
+        }
+    }
+    if (trace_full.load()) return;
     std::ostringstream s;
     s << list_fields(list) << "\"event\":\"vertex_buffers\",\"first\":" << first << ",\"buffers\":[";
     for (uint32_t i = 0; i < count && i < 32; ++i) {
@@ -535,14 +664,31 @@ void on_vb(command_list* list, uint32_t first, uint32_t count, const resource* b
 }
 void on_ib(command_list* list, resource buffer, uint64_t offset, uint32_t size)
 {
-    if (!active(list)) return;
+    if (!active(list, true)) return;
     std::lock_guard lock(mutex);
+    list_fields(list);
+    if (auto it = lists.find(list); it != lists.end()) { it->second.ib = gpu_address(buffer, offset); it->second.index_bytes = size; }
+    if (trace_full.load()) return;
     add(list_fields(list) + "\"event\":\"index_buffer\",\"address\":" + address(buffer, offset) + ",\"index_bytes\":" + std::to_string(size));
 }
 bool on_draw(command_list* list, uint32_t count, uint32_t instances, uint32_t first, int32_t base, uint32_t first_instance)
 {
-    if (!active(list)) return false;
+    if (!active(list, true)) return false;
     std::lock_guard lock(mutex);
+    const auto lit = lists.find(list);
+    if (target && instances && base == 0 && lit != lists.end() && lit->second.vb_stride == 12) {
+        const auto& state = lit->second;
+        const bool range = std::any_of(target->windows.begin(), target->windows.end(), [&](const auto& w) { return w.first == first && w.count == count; });
+        const bool ring = std::any_of(target_rings.begin(), target_rings.end(), [&](const auto& r) {
+            return r.vertices == state.vb && r.indices == state.ib && r.index_bytes == state.index_bytes;
+        });
+        if (range && ring) {
+            queue_upload_windows(list, false, first, count);
+            add(list_fields(list) + "\"event\":\"target_draw\",\"first_index\":" + std::to_string(first) +
+                ",\"count\":" + std::to_string(count) + ",\"vertex_va\":\"" + hex(state.vb) + "\"", true);
+        }
+    }
+    if (trace_full.load()) return false;
     add(list_fields(list) + "\"event\":\"draw_indexed\",\"count\":" + std::to_string(count) +
         ",\"instances\":" + std::to_string(instances) + ",\"first_index\":" + std::to_string(first) +
         ",\"base_vertex\":" + std::to_string(base) + ",\"first_instance\":" + std::to_string(first_instance));
@@ -550,10 +696,17 @@ bool on_draw(command_list* list, uint32_t count, uint32_t instances, uint32_t fi
 }
 bool on_dispatch(command_list* list, uint32_t x, uint32_t y, uint32_t z)
 {
-    if (!active(list)) return false;
+    if (!active(list, true)) return false;
     std::lock_guard lock(mutex);
+    bool touches_target = false;
+    const auto samples = sample_compute_tables(list, &touches_target);
+    if (touches_target) {
+        queue_upload_windows(list, true, 0, 0);
+        add(list_fields(list) + "\"event\":\"target_dispatch\",\"candidate_only\":true,\"pipeline_handle\":\"" + hex(lists.at(list).compute_pipe) + "\",\"x\":" + std::to_string(x) + ",\"y\":" + std::to_string(y) + ",\"z\":" + std::to_string(z) + ",\"buffer_table_samples\":" + samples, true);
+    }
+    if (trace_full.load()) return false;
     add(list_fields(list) + "\"event\":\"dispatch\",\"x\":" + std::to_string(x) + ",\"y\":" + std::to_string(y) + ",\"z\":" + std::to_string(z) +
-        ",\"buffer_table_samples\":" + sample_compute_tables(list));
+        ",\"buffer_table_samples\":" + samples);
     return false;
 }
 bool on_build(command_list* list, acceleration_structure_type type, acceleration_structure_build_flags flags,
@@ -563,6 +716,24 @@ bool on_build(command_list* list, acceleration_structure_type type, acceleration
     if (!active(list, true)) return false;
     boot_hook(16, "first acceleration structure capture entered\r\n");
     std::lock_guard lock(mutex);
+    if (target && type == acceleration_structure_type::bottom_level && inputs && count == target->windows.size()) {
+        std::vector<rt_capture::GeometrySlice> geometries;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (inputs[i].type != acceleration_structure_build_input_type::triangles) break;
+            const auto& t = inputs[i].triangles;
+            if (t.vertex_stride > UINT32_MAX) break;
+            geometries.push_back({ gpu_address(t.vertex_buffer, t.vertex_offset), gpu_address(t.index_buffer, t.index_offset),
+                t.vertex_count, t.index_count, uint32_t(t.vertex_stride), uint32_t(t.vertex_format), uint32_t(t.index_format),
+                t.transform_buffer.handle != 0 || t.transform_offset != 0 });
+        }
+        if (const auto ring = rt_capture::match_ring(*target, geometries); ring &&
+            !in_target_ring(ring->vertices) && target_rings.size() < 16) {
+            target_rings.push_back(*ring);
+            boot_hook(128, "target BLAS signature matched; upload collection eligible\r\n");
+            add(list_fields(list) + "\"event\":\"target_ring\",\"candidate_only\":true,\"vertex_va\":\"" +
+                hex(ring->vertices) + "\",\"index_va\":\"" + hex(ring->indices) + "\"", true);
+        }
+    }
     std::ostringstream s;
     s << list_fields(list) << "\"event\":\"as_build\",\"type\":" << uint32_t(type) << ",\"flags\":" << uint32_t(flags)
       << ",\"mode\":" << uint32_t(mode) << ",\"source_va\":\"" << hex(source.handle) << "\",\"dest_va\":\"" << hex(dest.handle)
@@ -609,8 +780,15 @@ bool on_rays(command_list* list, resource rg, uint64_t rgo, uint64_t rgs, resour
 }
 void on_execute(command_queue* queue, command_list* list)
 {
-    if (!active(list) || !ours(queue->get_device())) return;
+    if (!queue || !active(list, true) || !ours(queue->get_device())) return;
     std::lock_guard lock(mutex);
+    if (auto it = lists.find(list); it != lists.end() && !it->second.pending_uploads.empty()) {
+        readbacks.submit(reinterpret_cast<ID3D12Device*>(queue->get_device()->get_native()),
+            reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()), it->second.pending_uploads);
+        it->second.pending_uploads.clear();
+        if (readbacks.pending()) boot_hook(256, "upload readback submitted with independent completion fence\r\n");
+    }
+    if (trace_full.load()) return;
     add(list_fields(list) + "\"event\":\"execute\",\"queue\":\"" + hex(queue->get_native()) + "\"");
 }
 
@@ -624,18 +802,24 @@ bool write_capture() // render thread, after recording stopped; no other callbac
     const auto dir = output_base / name;
     std::error_code ec;
     fs::create_directories(dir / "shaders", ec);
+    if (!ec) fs::create_directories(dir / "upload_windows", ec);
     if (ec) return false;
     std::ofstream out(dir / "capture.json", std::ios::binary);
     if (!out) return false;
     LARGE_INTEGER frequency;
     QueryPerformanceFrequency(&frequency);
-    out << "{\"schema\":\"wwmi-rt-capture-v1\",\"probe_version\":\"0.1.2\",\"startup_mode\":\"dormant_until_F7\",\"base_commit\":\"845cec6\",\"full_rt_mesh_support\":false,"
+    out << "{\"schema\":\"wwmi-rt-capture-v1\",\"probe_version\":\"0.1.3\",\"descriptor_range_units\":\"bytes\",\"startup_mode\":\"dormant_until_F7\",\"base_commit\":\"845cec6\",\"full_rt_mesh_support\":false,"
         << "\"qpc_frequency\":" << frequency.QuadPart << ",\"dropped_events\":" << trace.dropped
         << ",\"dropped_metadata\":" << metadata_dropped
         << ",\"dropped_rt_events\":" << rt_trace.dropped
         << ",\"general_trace_truncated\":" << (trace_full.load() ? "true" : "false")
         << ",\"dropped_descriptors\":" << descriptor_dropped
-        << ",\"limitations\":[\"CPU callback order is not GPU execution order\",\"No GPU buffer contents or SBT local records\","
+        << ",\"upload_readback\":{\"target_loaded\":" << (target ? "true" : "false")
+        << ",\"samples\":" << readbacks.samples.size() << ",\"pending_at_save\":" << (readbacks.pending() ? "true" : "false")
+        << ",\"skipped_heap\":" << readbacks.skipped_heap << ",\"skipped_range\":" << readbacks.skipped_range
+        << ",\"skipped_budget\":" << readbacks.skipped_budget << ",\"failures\":" << readbacks.failures
+        << ",\"unsubmitted_windows\":" << unsubmitted_windows << "}"
+        << ",\"limitations\":[\"CPU callback order is not GPU execution order\",\"Only selected UPLOAD constants are copied before application submission; no DEFAULT skin output or SBT contents\","
         << "\"Bindings before capture starts are unknown\",\"Pre-F7 resources are queried lazily when a valid resource handle is bound; pre-F7 shader bytecode remains unknown\",\"Descriptor tables are sampled: first 64 slots/table, at most 64 buffer slots/dispatch\","
         << "\"Descriptor heap destruction is not observable; sampled associations are candidates\"],\"inventory\":[";
     for (size_t i = 0; i < inventory.size(); ++i) { if (i) out << ','; out << inventory[i]; }
@@ -646,9 +830,25 @@ bool write_capture() // render thread, after recording stopped; no other callbac
         comma = true;
         out << '\n' << row;
     });
+    out << "],\"upload_windows\":[";
+    for (size_t i = 0; i < readbacks.samples.size(); ++i) {
+        const auto& sample = readbacks.samples[i];
+        if (i) out << ',';
+        out << '{' << sample.context << "\"id\":" << sample.id << ",\"resource_id\":" << sample.resource_id
+            << ",\"source_va\":\"" << hex(sample.source_va) << "\",\"offset\":\"" << hex(sample.offset) << "\",\"bytes\":" << sample.bytes.size()
+            << ",\"root\":" << sample.root << ",\"first_index\":" << sample.first << ",\"index_count\":" << sample.count
+            << ",\"fnv1a64\":\"" << hex(rt_capture::fnv1a64(sample.bytes.data(), sample.bytes.size()))
+            << "\",\"file\":\"upload_windows/" << sample.id << ".bin\",\"extent_known\":false,\"verified_bone_palette\":false,\"source_heap\":\"UPLOAD\",\"copy_fence_completed\":true}";
+    }
     out << "]}\n";
     out.close();
     if (!out) return false;
+    for (const auto& sample : readbacks.samples) {
+        std::ofstream binary(dir / "upload_windows" / (std::to_string(sample.id) + ".bin"), std::ios::binary);
+        binary.write(sample.bytes.data(), static_cast<std::streamsize>(sample.bytes.size()));
+        binary.close();
+        if (!binary) return false;
+    }
     for (const auto& [hash, bytes] : shaders) {
         std::ofstream shader(dir / "shaders" / (hex(hash) + ".dxil"), std::ios::binary);
         shader.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
@@ -683,12 +883,15 @@ void on_present(command_queue* queue, swapchain*, const rect*, const rect*, uint
     const bool f8 = focused && (GetAsyncKeyState(VK_F8) & 0x8000), f9 = focused && (GetAsyncKeyState(VK_F9) & 0x8000);
     const bool enable = f7 && !last_f7, capture = f8 && !last_f8, stop = f9 && !last_f9;
     last_f7 = f7; last_f8 = f8; last_f9 = f9;
-    if (!enable && !capture && !stop && !recording.load()) return; // no capture lock on the dormant frame path
+    if (!enable && !capture && !stop && !recording.load() && !saving_pending && !readbacks.pending()) return; // no capture lock on the dormant frame path
     std::lock_guard lock(mutex);
     ++frame;
+    readbacks.poll();
+    if (!readbacks.samples.empty()) boot_hook(512, "upload windows read after completed copy fence\r\n");
     if (stop) {
         monitoring.store(false);
         recording.store(false);
+        saving_pending = false; clear_recording_state();
         trace.clear(); rt_trace.clear(); inventory.clear(); trace_full.store(false); trace_rt_full.store(false);
         for (auto& [list, state] : lists) { (void)list; state.compute_tables = {}; state.compute_layout = 0; }
         reshade::log::message(reshade::log::level::info, "WWMI RT Capture: cancelled.");
@@ -698,25 +901,38 @@ void on_present(command_queue* queue, swapchain*, const rect*, const rect*, uint
         // Destruction/reuse while dormant was deliberately unobserved. Never reuse
         // those associations when F7 starts a fresh monitoring interval.
         resources.clear(); pipelines.clear(); layouts.clear(); shaders.clear(); lists.clear(); inventory.clear(); descriptors.clear();
+        buffer_info.clear(); target_rings.clear();
+        std::ifstream target_file(target_path); target = rt_capture::read_target(target_file);
+        boot_line(target ? "target signature loaded\r\n" : "target signature missing/invalid; metadata capture only\r\n");
         shader_bytes = metadata_dropped = 0;
         metadata_bytes = 0;
         descriptor_writes = descriptor_dropped = 0;
         monitoring.store(true);
-        reshade::log::message(reshade::log::level::info, "WWMI RT Capture 0.1.2: metadata enabled. Change character, then F8 captures six frames. F9 disables monitoring.");
+        reshade::log::message(reshade::log::level::info, "WWMI RT Capture 0.1.3: metadata enabled. Change character, then F8 captures twelve presents and selected upload windows. F9 disables monitoring.");
     } else if (capture && !monitoring.load()) {
         boot_line("F8 ignored: press F7 to enable monitoring first\r\n");
+    } else if (capture && (saving_pending || readbacks.pending())) {
+        boot_line("F8 ignored: previous readback jobs are still pending\r\n");
     } else if (capture && !recording.load()) {
-        boot_line("F8: starting six-frame capture\r\n");
+        boot_line("F8: starting twelve-present capture with upload readback\r\n");
+        if (!readbacks.begin()) return;
+        clear_recording_state(); unsubmitted_windows = 0; target_rings.clear();
         trace.clear(); rt_trace.clear(); inventory.clear(); trace_full.store(false); trace_rt_full.store(false);
         for (auto& [list, state] : lists) { (void)list; state.compute_tables = {}; state.compute_layout = 0; }
         for (const auto* entries : { &resources, &pipelines, &layouts })
             for (const auto& [handle, metadata] : *entries) { (void)handle; inventory.push_back(metadata.json); }
-        end_frame = frame + 6;
+        end_frame = frame + 12;
         recording.store(true);
-        reshade::log::message(reshade::log::level::info, "WWMI RT Capture: recording six frames.");
+        reshade::log::message(reshade::log::level::info, "WWMI RT Capture: recording twelve presents; selected upload windows use asynchronous readback.");
     } else if (recording.load() && (frame >= end_frame || trace_rt_full.load())) {
         recording.store(false);
-        // One bounded file write after capture. No disk I/O occurs in draw/dispatch/build hooks.
+        clear_recording_state();
+        saving_pending = true; save_started = GetTickCount64();
+    }
+    if (saving_pending && (!readbacks.pending() || GetTickCount64() - save_started >= 5000)) {
+        saving_pending = false;
+        // Save after our copy fences complete, or report a timeout explicitly.
+        // Unfinished allocations remain retained; a timeout is never completion.
         const bool ok = write_capture();
         boot_line(ok ? "capture saved\r\n" : "capture save failed\r\n");
         reshade::log::message(ok ? reshade::log::level::info : reshade::log::level::error,
@@ -745,13 +961,16 @@ template <class R, class... Args, R (*Fn)(Args...), bool Always> struct SafeCall
 
 extern "C" {
 __declspec(dllexport) const char* NAME = "WWMI RT Capture";
-__declspec(dllexport) const char* DESCRIPTION = "RT Capture 0.1.2: dormant startup; dedicated RT budget and lazy resource metadata. F7 enables, F8 captures, F9 disables.";
+__declspec(dllexport) const char* DESCRIPTION = "RT Capture 0.1.3: dormant startup; targeted UPLOAD constant readback, own completion fences. F7 enables, F8 captures, F9 disables.";
 }
-extern "C" __declspec(dllexport) bool AddonInit(HMODULE, HMODULE)
+extern "C" __declspec(dllexport) bool AddonInit(HMODULE module, HMODULE)
 {
     try {
         open_boot_log();
-        boot_line("WWMI RT Capture 0.1.2 AddonInit entered outside DllMain\r\n");
+        wchar_t module_path[32768];
+        const auto module_size = GetModuleFileNameW(module, module_path, 32768);
+        if (module_size && module_size < 32768) target_path = fs::path(module_path).parent_path() / "wwmi_rt_target.txt";
+        boot_line("WWMI RT Capture 0.1.3 AddonInit entered outside DllMain\r\n");
 #define EVENT(e, f) reshade::register_event<reshade::addon_event::e>(SafeCallback<f>::call)
         reshade::register_event<reshade::addon_event::destroy_device>(SafeCallback<on_destroy_device, true>::call);
         EVENT(init_resource, on_init_resource); EVENT(destroy_resource, on_destroy_resource);
@@ -780,6 +999,11 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE, HMODULE)
 {
     monitoring.store(false);
     recording.store(false);
+    std::lock_guard lock(mutex);
+    saving_pending = false;
+    try { readbacks.poll(); } catch (...) {}
+    readbacks.abandon_unfinished();
+    clear_recording_state();
     boot_line("AddonUninit\r\n");
     const auto file = boot_log.exchange(INVALID_HANDLE_VALUE);
     if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
