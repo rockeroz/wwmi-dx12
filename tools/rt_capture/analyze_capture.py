@@ -65,9 +65,12 @@ def analyze(capture):
         if kind == "destroy_list":
             state = {k: v for k, v in state.items() if k[0] != key[0]}
             continue
-        current = state.setdefault(key, {"cs": None, "roots": {}, "layout": None})
+        current = state.setdefault(key, {"cs": None, "cs_pipeline_handle": None, "roots": {}, "layout": None})
         if kind == "bind_pipeline":
             pipe = metadata.get(event.get("pipeline_id"), {})
+            if event.get("stages", 0) & 0x800: # pipeline_stage::compute_shader
+                current["cs"] = None # unknown pipelines cannot inherit the previous shader's identity
+                current["cs_pipeline_handle"] = event.get("pipeline_handle")
             for shader in pipe.get("shaders", []):
                 if shader.get("stage_name") == "cs":
                     current["cs"] = shader.get("fnv1a64")
@@ -100,7 +103,7 @@ def analyze(capture):
                     candidates.append((sample["param"], va, "sampled_table_uav"))
             for param, va, source in candidates:
                 writes.append({"va": va, "shader": current["cs"], "param": param, "source": source,
-                               "seq": event["seq"], "list": key[0], "generation": key[1], "resource_id": resource_at(va)})
+                               "pipeline_handle": current["cs_pipeline_handle"], "seq": event["seq"], "list": key[0], "generation": key[1], "resource_id": resource_at(va)})
         elif kind == "as_build" and event.get("type") == 1:
             for geometry in event.get("inputs", []):
                 if geometry.get("type") != 0:  # triangles
@@ -130,7 +133,7 @@ def analyze(capture):
                 continue
             if write["resource_id"] and build["resource_id"] and write["resource_id"] != build["resource_id"]:
                 continue
-            identity = (write["shader"], write["param"], write["source"])
+            identity = (write["shader"], write["pipeline_handle"], write["param"], write["source"])
             if identity in unique:
                 continue
             unique.add(identity)
@@ -148,6 +151,8 @@ def analyze(capture):
             "candidate_links": links, "dropped_events": capture.get("dropped_events", 0),
             "dropped_metadata": capture.get("dropped_metadata", 0),
             "dropped_descriptors": capture.get("dropped_descriptors", 0),
+            "dropped_rt_events": capture.get("dropped_rt_events", 0),
+            "general_trace_truncated": capture.get("general_trace_truncated", bool(capture.get("dropped_events", 0))),
             "limitations": ["Candidate links do not prove writes, character ownership or bone palette layout.",
                             "Cross-list GPU order requires submission/fence analysis.",
                             "SBT local records, instance descriptors and skinned vertex contents need GPU readback.",

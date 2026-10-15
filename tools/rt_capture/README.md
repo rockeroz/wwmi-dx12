@@ -1,4 +1,4 @@
-# WWMI RT Capture 0.1.1 — arranque inactivo
+# WWMI RT Capture 0.1.2 — presupuesto RT independiente
 
 Companion ReShade add-on for developing **full native RT mesh support** in wwmi-dx12.
 This is a diagnostic prerequisite, **not an implementation of RT mesh replacement**.
@@ -10,7 +10,8 @@ La 0.1.0 impidió iniciar el juego en el equipo de prueba del usuario. El log
 disponible confirma que se registraba el capturador, pero no identifica la
 excepción ni demuestra una causa concreta. Esa versión se retira de las pruebas.
 
-La 0.1.1 es **una versión de prueba de arranque**, todavía sin validar en el juego:
+El usuario confirmó que la 0.1.1 inicia y capturó datos. La 0.1.2 conserva ese
+arranque inactivo, pero sus nuevos hooks todavía deben validarse en el juego:
 
 - `DllMain` solo registra/desregistra el add-on. La preparación se hace en
   `AddonInit`, fuera del bloqueo del cargador.
@@ -23,10 +24,13 @@ La 0.1.1 es **una versión de prueba de arranque**, todavía sin validar en el j
   antes de repetir una prueba fallida. Incluye marcas antes de activar hooks.
 - **F9** desactiva también el seguimiento, además de cancelar la captura.
 
-Primera prueba: reemplaza solo `wwmi_rt_capture.addon64` y comprueba que el juego
-abre **sin pulsar F7 ni F8**. Si falla, retira ese archivo y conserva
-`wwmi_rt_capture_boot.log` y `ReShade.log`. Que compile no demuestra que el fallo
-de arranque esté resuelto.
+La 0.1.2 reserva un segundo búfer para BLAS/TLAS y DispatchRays: llenar el
+registro de draws ya no termina la captura ni consume el espacio de RT. También
+consulta los metadatos de búferes anteriores a F7 al recibir un handle válido en
+un callback. No interpreta una dirección GPU absoluta como un objeto nativo.
+Los pipelines desconocidos conservan su handle, sin atribuirles otro shader.
+Reactivar F7 tras F9 descarta asociaciones antiguas: durante la pausa podrían
+haberse destruido o reutilizado sus handles.
 
 ## Capturar en el juego
 
@@ -34,19 +38,17 @@ de arranque esté resuelto.
 2. Copia `wwmi_rt_capture.addon64` al mismo directorio de add-ons que ya utiliza
    `wwmi_dx12.addon64`. Si ReShade.ini tiene `AddonPath`, usa esa carpeta.
 3. Inicia el juego. En `wwmi_rt_capture_boot.log` debe aparecer
-   `WWMI RT Capture 0.1.1 AddonInit`.
-4. Una vez comprobado el inicio, con RT **desactivado**, pulsa **F7**. Cambia al
-   personaje de prueba para provocar nuevos recursos y pipelines. Muévelo y
-   pulsa **F8** una vez. Se capturan seis fotogramas.
-5. Activa RT y reinicia si el juego lo solicita. Muestra el mismo personaje,
-   pulsa **F7** si reiniciaste, muévelo y vuelve a pulsar **F8**. El add-on original puede desactivar los mods;
-   esta captura independiente sigue funcionando.
+   `WWMI RT Capture 0.1.2 AddonInit`.
+4. La referencia recibida no contiene eventos RT. La siguiente prueba pendiente
+   es con **RT activado** en los ajustes del juego; reinicia si lo solicita.
+5. Muestra el mismo personaje en mundo abierto. Pulsa **F7**, cambia al personaje
+   de prueba para provocar recursos nuevos, muévelo y pulsa **F8** una vez.
+   El add-on original puede desactivar los mods; esta captura es independiente.
 6. Espera el mensaje `saved to wwmi_rt_captures` en ReShade.log. Encontrarás
    una carpeta por captura en `Win64/wwmi_rt_captures`, junto al ejecutable.
    Cada carpeta contiene `capture.json` y `shaders/*.dxil`.
-7. Comparte ambas carpetas comprimidas, el mod de prueba y su nombre de personaje.
-   Conserva el .ini y los .buf del mod: hacen falta para contrastar los índices
-   de huesos y los componentes con la captura.
+7. Comparte la nueva carpeta comprimida e indica que RT estaba activado.
+   El mod y la referencia anterior ya se recibieron; no hace falta reenviarlos.
 
 **F9** cancela una captura pendiente y desactiva el seguimiento. Mantén el juego en primer plano para usar
 las teclas. Se escriben archivos solamente al terminar la captura; puede haber
@@ -71,10 +73,15 @@ callbacks con retorno booleano devuelven false. No hace readback GPU, ni espera
 fences, ni llama Map sobre buffers del juego. Los shaders retenidos se copian
 del bytecode CPU recibido en los eventos de creación de pipeline.
 
-La memoria está limitada: 8 MiB/32768 eventos, 16 MiB de metadatos, 16 MiB de
-shaders (máximo 2048) y 131072 descriptores. La captura termina anticipadamente si se llena
-el búfer de eventos. Los contadores `dropped_*` exponen las pérdidas; una captura
-truncada no se presenta como completa. Un fallo de guardado se comunica en el log.
+La memoria de filas está limitada a 8 MiB/32768 eventos generales y otros
+8 MiB/32768 eventos RT, más sus índices/objetos de almacenamiento; los metadatos
+tienen un límite de 16 MiB, los shaders de 16 MiB (máximo 2048) y hay hasta
+131072 descriptores. Se capturan seis fotogramas o hasta llenar el presupuesto
+RT. Llenar el registro general deja incompletos los enlaces generales posteriores,
+pero los eventos RT siguen registrándose. `general_trace_truncated` y los
+contadores `dropped_*` exponen pérdidas; estos contadores no cuentan callbacks
+que ya no entraron por estar lleno su presupuesto. Un fallo de guardado se
+comunica en el log.
 
 ## Análisis offline
 
@@ -90,9 +97,10 @@ no prueban que un shader escriba ese rango ni que pertenezca al personaje.
 Las tablas pueden contener descriptores no utilizados por el shader. El orden
 de callbacks CPU tampoco demuestra el orden GPU entre listas distintas.
 
-Los recursos y shaders creados antes de F7 no forman parte del inventario; las
-direcciones RT absolutas siguen registrándose. Los metadatos faltantes quedan
-sin resolver. Cambiar de personaje puede crear recursos nuevos, pero no garantiza
+Los búferes anteriores a F7 se identifican de forma diferida cuando un callback
+proporciona un handle válido; los shaders anteriores a F7 siguen desconocidos.
+Las direcciones RT absolutas se registran sin desreferenciarlas. Los metadatos
+faltantes quedan sin resolver. Cambiar de personaje puede crear recursos nuevos, pero no garantiza
 la recreación de shaders. Esta limitación impide usar la captura como prueba de
 que se hayan identificado todos los enlaces del modelo.
 
@@ -136,9 +144,21 @@ Pruebas de lógica CPU:
 ```sh
 g++ -std=c++20 -Wall -Wextra -Werror tests/rt_capture_test.cpp -o /tmp/rt_capture_test
 /tmp/rt_capture_test
-python -m unittest discover -s tests -p 'test_rt_capture_analysis.py'
+python -m unittest discover -s tests -p 'test_rt_*py'
 ```
 
 El compilado de desarrollo entregado fue compilado para Windows x64 con GCC
 MinGW-w64 13-posix y el SDK ReShade `05c95f4a`. Aún no se ha ejecutado dentro del
 juego. Compilarlo no valida el comportamiento del driver ni el resultado visual.
+
+## Preparación de geometría
+
+`inspect_mod.py carpeta_mod --output perfil.json` valida tamaños reales, índices,
+posiciones y pesos sin editar el mod. Separa los rangos originales usados para
+matching de los `drawindexed` reales del mod y conserva sus condiciones como
+texto, sin ejecutar la lógica INI. No resuelve automáticamente huesos nativos RT.
+
+`reshade_addon/rt/shaders/SkinModPositions.hlsl` y `skin_reference.py` preparan
+el skinning canónico de cuatro u ocho influencias. El kernel se compila por
+separado con DXC; **no se ejecuta desde el capturador ni desde el módulo RT**.
+Ver el README de shaders para contratos de recursos y límites de validación.

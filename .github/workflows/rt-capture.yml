@@ -3,9 +3,9 @@ name: RT capture tool
 on:
   workflow_dispatch:
   push:
-    paths: ['tools/rt_capture/**', 'tests/*rt_capture*', '.github/workflows/rt-capture.yml']
+    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'reshade_addon/rt/shaders/**', '.github/workflows/rt-capture.yml']
   pull_request:
-    paths: ['tools/rt_capture/**', 'tests/*rt_capture*', '.github/workflows/rt-capture.yml']
+    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'reshade_addon/rt/shaders/**', '.github/workflows/rt-capture.yml']
 
 permissions:
   contents: read
@@ -29,7 +29,7 @@ jobs:
           if errorlevel 1 exit /b 1
           build_addon\rt_capture\rt_capture_test.exe
       - name: Test offline analysis
-        run: python -m unittest discover -s tests -p "test_rt_capture_analysis.py"
+        run: python -m unittest discover -s tests -p "test_rt_*py"
       - uses: actions/upload-artifact@v4
         with:
           name: wwmi-rt-capture-development

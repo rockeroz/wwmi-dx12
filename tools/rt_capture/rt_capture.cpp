@@ -27,10 +27,11 @@ std::mutex mutex;
 std::atomic<device*> owner{ nullptr };
 std::atomic<bool> recording{ false };
 std::atomic<bool> monitoring{ false }; // starts dormant; F7 enables metadata AFTER the game is running
-std::atomic<bool> trace_full{ false }, probe_failed{ false };
+std::atomic<bool> trace_full{ false }, trace_rt_full{ false }, probe_failed{ false };
 std::atomic<HANDLE> boot_log{ INVALID_HANDLE_VALUE };
 std::atomic<uint32_t> boot_hooks_seen{ 0 };
 rt_capture::TraceBuffer trace;
+rt_capture::TraceBuffer rt_trace; // separate budget: raster bindings cannot consume the RT records' space
 uint64_t sequence = 0, frame = 0, next_id = 1, end_frame = 0;
 uint64_t metadata_dropped = 0, shader_bytes = 0;
 size_t metadata_bytes = 0;
@@ -87,22 +88,25 @@ void open_boot_log() noexcept
         nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
 }
 bool ours(device* dev) { return monitoring.load() && dev && !probe_failed.load() && owner.load(std::memory_order_acquire) == dev; }
-bool active(command_list* list)
+bool active(command_list* list, bool rt_priority = false)
 {
-    return recording.load(std::memory_order_relaxed) && !trace_full.load(std::memory_order_relaxed) && list && ours(list->get_device());
+    return recording.load(std::memory_order_relaxed) && !(rt_priority ? trace_rt_full.load() : trace_full.load()) && list && ours(list->get_device());
 }
 uint64_t id_of(const std::map<uint64_t, Metadata>& entries, uint64_t key)
 {
     const auto it = entries.find(key);
     return it == entries.end() ? 0 : it->second.id;
 }
-void add(std::string row) // mutex held
+void add(std::string row, bool rt_priority = false) // mutex held
 {
     if (!recording.load(std::memory_order_relaxed)) return;
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    if (!trace.append("{\"seq\":" + std::to_string(++sequence) + ",\"frame\":" + std::to_string(frame) +
-        ",\"qpc\":" + std::to_string(now.QuadPart) + "," + row + "}")) trace_full.store(true);
+    const uint64_t seq = ++sequence;
+    auto& target = rt_priority ? rt_trace : trace;
+    if (!target.append("{\"seq\":" + std::to_string(seq) + ",\"frame\":" + std::to_string(frame) +
+        ",\"qpc\":" + std::to_string(now.QuadPart) + "," + row + "}", seq))
+        (rt_priority ? trace_rt_full : trace_full).store(true);
 }
 std::string list_fields(command_list* list) // mutex held
 {
@@ -128,10 +132,23 @@ void remember(std::map<uint64_t, Metadata>& entries, uint64_t handle, std::strin
     entries[handle] = m;
     add("\"event\":\"metadata\",\"value\":" + m.json);
 }
+void ensure_buffer_metadata(resource res) // only callback-supplied resource handles; never raw GPU VAs
+{
+    if (!res.handle || resources.count(res.handle)) return;
+    boot_hook(64, "first lazy metadata query for a live callback resource\r\n");
+    auto* native = reinterpret_cast<ID3D12Resource*>(res.handle);
+    const auto desc = native->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return;
+    std::ostringstream s;
+    s << "\"kind\":\"resource\",\"type\":1,\"lazy\":true,\"va\":\"" << hex(native->GetGPUVirtualAddress())
+      << "\",\"bytes\":" << desc.Width;
+    remember(resources, res.handle, s.str());
+}
 std::string address(resource res, uint64_t offset) // mutex held; never dereference a raw GPU VA
 {
     // Native DX12 AS and root SRV/UAV events use a null resource + an absolute GPU address.
     if (!res.handle) return "{\"resource_id\":0,\"va\":\"" + hex(offset) + "\"}";
+    ensure_buffer_metadata(res);
     return "{\"resource_id\":" + std::to_string(id_of(resources, res.handle)) +
         ",\"resource\":\"" + hex(res.handle) + "\",\"offset\":\"" + hex(offset) + "\"}";
 }
@@ -166,6 +183,7 @@ void on_view(device* dev, resource res, resource_usage usage, const resource_vie
     if (!ours(dev) || !view.handle || desc.type == resource_view_type::acceleration_structure) return;
     std::lock_guard lock(mutex);
     Descriptor d;
+    if (desc.type == resource_view_type::buffer) ensure_buffer_metadata(res);
     d.resource_id = id_of(resources, res.handle);
     d.resource_handle = res.handle;
     d.valid = res.handle != 0;
@@ -198,6 +216,7 @@ bool on_update_tables(device* dev, uint32_t count, const descriptor_table_update
             Descriptor d;
             if (update.type == descriptor_type::constant_buffer) {
                 const auto& b = static_cast<const buffer_range*>(update.descriptors)[i];
+                ensure_buffer_metadata(b.buffer);
                 d.resource_id = id_of(resources, b.buffer.handle); d.resource_handle = b.buffer.handle;
                 d.offset = b.offset; d.bytes = b.size; d.type = uint32_t(update.type);
                 d.buffer = true; d.valid = b.buffer.handle != 0;
@@ -278,6 +297,7 @@ void on_destroy_device(device* dev)
     metadata_bytes = 0;
     descriptor_writes = descriptor_dropped = 0;
     trace.clear();
+    rt_trace.clear();
 }
 void on_init_resource(device* dev, const resource_desc& desc, const subresource_data*, resource_usage state, resource res)
 {
@@ -430,7 +450,7 @@ void on_bind_pipeline(command_list* list, pipeline_stage stages, pipeline pipe)
     if (!active(list)) return;
     std::lock_guard lock(mutex);
     add(list_fields(list) + "\"event\":\"bind_pipeline\",\"stages\":" + std::to_string(uint32_t(stages)) +
-        ",\"pipeline_id\":" + std::to_string(id_of(pipelines, pipe.handle)));
+        ",\"pipeline_id\":" + std::to_string(id_of(pipelines, pipe.handle)) + ",\"pipeline_handle\":\"" + hex(pipe.handle) + "\"");
 }
 void on_tables(command_list* list, shader_stage stages, pipeline_layout layout, uint32_t first, uint32_t count, const descriptor_table* tables)
 {
@@ -540,7 +560,7 @@ bool on_build(command_list* list, acceleration_structure_type type, acceleration
     uint32_t count, const acceleration_structure_build_input* inputs, resource scratch, uint64_t scratch_offset,
     resource_view source, resource_view dest, acceleration_structure_build_mode mode)
 {
-    if (!active(list)) return false;
+    if (!active(list, true)) return false;
     boot_hook(16, "first acceleration structure capture entered\r\n");
     std::lock_guard lock(mutex);
     std::ostringstream s;
@@ -568,14 +588,14 @@ bool on_build(command_list* list, acceleration_structure_type type, acceleration
         s << '}';
     }
     s << "],\"inputs_truncated\":" << (count > 128 ? "true" : "false");
-    add(s.str());
+    add(s.str(), true);
     return false; // Always let the original build (and post-build queries) execute unchanged.
 }
 bool on_rays(command_list* list, resource rg, uint64_t rgo, uint64_t rgs, resource miss, uint64_t mo, uint64_t ms, uint64_t mst,
     resource hit, uint64_t ho, uint64_t hs, uint64_t hst, resource call, uint64_t co, uint64_t cs, uint64_t cst,
     uint32_t x, uint32_t y, uint32_t z)
 {
-    if (!active(list)) return false;
+    if (!active(list, true)) return false;
     std::lock_guard lock(mutex);
     std::ostringstream s;
     s << list_fields(list) << "\"event\":\"dispatch_rays\",\"x\":" << x << ",\"y\":" << y << ",\"z\":" << z << ",\"tables\":[";
@@ -585,7 +605,7 @@ bool on_rays(command_list* list, resource rg, uint64_t rgo, uint64_t rgs, resour
         if (i) s << ',';
         s << "{\"address\":" << address(buffers[i], offsets[i]) << ",\"bytes\":" << sizes[i] << ",\"stride\":" << strides[i] << '}';
     }
-    s << ']'; add(s.str()); return false;
+    s << ']'; add(s.str(), true); return false;
 }
 void on_execute(command_queue* queue, command_list* list)
 {
@@ -609,16 +629,23 @@ bool write_capture() // render thread, after recording stopped; no other callbac
     if (!out) return false;
     LARGE_INTEGER frequency;
     QueryPerformanceFrequency(&frequency);
-    out << "{\"schema\":\"wwmi-rt-capture-v1\",\"probe_version\":\"0.1.1\",\"startup_mode\":\"dormant_until_F7\",\"base_commit\":\"845cec6\",\"full_rt_mesh_support\":false,"
+    out << "{\"schema\":\"wwmi-rt-capture-v1\",\"probe_version\":\"0.1.2\",\"startup_mode\":\"dormant_until_F7\",\"base_commit\":\"845cec6\",\"full_rt_mesh_support\":false,"
         << "\"qpc_frequency\":" << frequency.QuadPart << ",\"dropped_events\":" << trace.dropped
         << ",\"dropped_metadata\":" << metadata_dropped
+        << ",\"dropped_rt_events\":" << rt_trace.dropped
+        << ",\"general_trace_truncated\":" << (trace_full.load() ? "true" : "false")
         << ",\"dropped_descriptors\":" << descriptor_dropped
         << ",\"limitations\":[\"CPU callback order is not GPU execution order\",\"No GPU buffer contents or SBT local records\","
-        << "\"Bindings before capture starts are unknown\",\"Resources and shaders created before F7 are not inventoried\",\"Descriptor tables are sampled: first 64 slots/table, at most 64 buffer slots/dispatch\","
+        << "\"Bindings before capture starts are unknown\",\"Pre-F7 resources are queried lazily when a valid resource handle is bound; pre-F7 shader bytecode remains unknown\",\"Descriptor tables are sampled: first 64 slots/table, at most 64 buffer slots/dispatch\","
         << "\"Descriptor heap destruction is not observable; sampled associations are candidates\"],\"inventory\":[";
     for (size_t i = 0; i < inventory.size(); ++i) { if (i) out << ','; out << inventory[i]; }
     out << "],\"events\":[";
-    for (size_t i = 0; i < trace.events.size(); ++i) { if (i) out << ','; out << '\n' << trace.events[i]; }
+    bool comma = false;
+    rt_capture::visit_sequenced(trace, rt_trace, [&](const std::string& row) {
+        if (comma) out << ',';
+        comma = true;
+        out << '\n' << row;
+    });
     out << "]}\n";
     out.close();
     if (!out) return false;
@@ -662,26 +689,32 @@ void on_present(command_queue* queue, swapchain*, const rect*, const rect*, uint
     if (stop) {
         monitoring.store(false);
         recording.store(false);
-        trace.clear(); inventory.clear(); trace_full.store(false);
+        trace.clear(); rt_trace.clear(); inventory.clear(); trace_full.store(false); trace_rt_full.store(false);
         for (auto& [list, state] : lists) { (void)list; state.compute_tables = {}; state.compute_layout = 0; }
         reshade::log::message(reshade::log::level::info, "WWMI RT Capture: cancelled.");
         boot_line("F9: all capture hooks dormant\r\n");
     } else if (enable && !monitoring.load()) {
         boot_line("F7: enabling metadata hooks after game startup\r\n");
+        // Destruction/reuse while dormant was deliberately unobserved. Never reuse
+        // those associations when F7 starts a fresh monitoring interval.
+        resources.clear(); pipelines.clear(); layouts.clear(); shaders.clear(); lists.clear(); inventory.clear(); descriptors.clear();
+        shader_bytes = metadata_dropped = 0;
+        metadata_bytes = 0;
+        descriptor_writes = descriptor_dropped = 0;
         monitoring.store(true);
-        reshade::log::message(reshade::log::level::info, "WWMI RT Capture 0.1.1: metadata enabled. Change character, then F8 captures six frames. F9 disables monitoring.");
+        reshade::log::message(reshade::log::level::info, "WWMI RT Capture 0.1.2: metadata enabled. Change character, then F8 captures six frames. F9 disables monitoring.");
     } else if (capture && !monitoring.load()) {
         boot_line("F8 ignored: press F7 to enable monitoring first\r\n");
     } else if (capture && !recording.load()) {
         boot_line("F8: starting six-frame capture\r\n");
-        trace.clear(); inventory.clear(); trace_full.store(false);
+        trace.clear(); rt_trace.clear(); inventory.clear(); trace_full.store(false); trace_rt_full.store(false);
         for (auto& [list, state] : lists) { (void)list; state.compute_tables = {}; state.compute_layout = 0; }
         for (const auto* entries : { &resources, &pipelines, &layouts })
             for (const auto& [handle, metadata] : *entries) { (void)handle; inventory.push_back(metadata.json); }
         end_frame = frame + 6;
         recording.store(true);
         reshade::log::message(reshade::log::level::info, "WWMI RT Capture: recording six frames.");
-    } else if (recording.load() && (frame >= end_frame || trace.dropped)) {
+    } else if (recording.load() && (frame >= end_frame || trace_rt_full.load())) {
         recording.store(false);
         // One bounded file write after capture. No disk I/O occurs in draw/dispatch/build hooks.
         const bool ok = write_capture();
@@ -712,13 +745,13 @@ template <class R, class... Args, R (*Fn)(Args...), bool Always> struct SafeCall
 
 extern "C" {
 __declspec(dllexport) const char* NAME = "WWMI RT Capture";
-__declspec(dllexport) const char* DESCRIPTION = "RT Capture 0.1.1: dormant startup. F7 enables metadata, F8 captures, F9 disables. Not full RT mesh support.";
+__declspec(dllexport) const char* DESCRIPTION = "RT Capture 0.1.2: dormant startup; dedicated RT budget and lazy resource metadata. F7 enables, F8 captures, F9 disables.";
 }
 extern "C" __declspec(dllexport) bool AddonInit(HMODULE, HMODULE)
 {
     try {
         open_boot_log();
-        boot_line("WWMI RT Capture 0.1.1 AddonInit entered outside DllMain\r\n");
+        boot_line("WWMI RT Capture 0.1.2 AddonInit entered outside DllMain\r\n");
 #define EVENT(e, f) reshade::register_event<reshade::addon_event::e>(SafeCallback<f>::call)
         reshade::register_event<reshade::addon_event::destroy_device>(SafeCallback<on_destroy_device, true>::call);
         EVENT(init_resource, on_init_resource); EVENT(destroy_resource, on_destroy_resource);

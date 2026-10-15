@@ -83,6 +83,14 @@ class AnalysisTest(unittest.TestCase):
                                       "compute": False, "layout_id": 5, "first": 4, "tables": ["0x5000"]})
         self.assertEqual(len(module.analyze(capture)["candidate_links"]), 1)
 
+    def test_unknown_compute_pipeline_does_not_inherit_known_shader(self):
+        capture = fixture()
+        capture["events"].insert(2, {"seq": 2, "event": "bind_pipeline", "list": 1, "generation": 1,
+                                      "stages": 0x800, "pipeline_id": 0, "pipeline_handle": "0x9999"})
+        candidate = module.analyze(capture)["candidate_links"][0]["candidates"][0]
+        self.assertIsNone(candidate["shader"])
+        self.assertEqual(candidate["pipeline_handle"], "0x9999")
+
 
 if __name__ == "__main__":
     unittest.main()
