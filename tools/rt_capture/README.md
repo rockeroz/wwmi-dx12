@@ -162,3 +162,31 @@ texto, sin ejecutar la lógica INI. No resuelve automáticamente huesos nativos 
 el skinning canónico de cuatro u ocho influencias. El kernel se compila por
 separado con DXC; **no se ejecuta desde el capturador ni desde el módulo RT**.
 Ver el README de shaders para contratos de recursos y límites de validación.
+
+## Correlacionar componentes con BLAS
+
+```sh
+python tools/rt_capture/match_rt_geometry.py captura/capture.json perfil.json --output candidatos.json
+```
+
+Compara todos los componentes en orden, sus conteos originales y las direcciones
+relativas de sus ventanas de índices. Exige posiciones FLOAT3 compartidas y un
+mismo búfer base de índices; busca además draws con los mismos VB/IB y rangos.
+Devuelve todas las variantes compatibles sin elegir una ni activar reemplazos.
+No compara solo el número total de índices. Las coincidencias siguen siendo
+candidatos de metadatos CPU: la reutilización de VA, el tiempo de vida, el orden
+GPU, la paleta nativa y los materiales requieren verificación independiente.
+
+La captura RT recibida de 0.1.2 contiene 300 eventos BLAS, 3 TLAS y 12
+DispatchRays. Los ocho rangos del personaje y el accesorio tienen candidatos
+con correlaciones raster. **Esto no habilita el módulo RT:** `rt_stub.cpp`
+continúa devolviendo false en `RtModulePresent()` y el add-on bloquea los mods.
+
+Los descriptores de tablas de 0.1.2 pueden haberse perdido por su límite de
+capacidad. Además, en la conversión nativa D3D12 del SDK fijado, los offsets y
+tamaños de vistas typed/raw se expresan en elementos aunque la estructura API
+los documente como bytes. La 0.1.2 los guardó directamente con nombres de bytes.
+Sus asociaciones UAV no deben usarse para deducir una paleta de huesos ni un
+rango exacto sin normalizar las unidades según formato y versión. El correlador
+de geometría usa únicamente las direcciones VB/IB/AS y no depende de esas
+muestras de descriptores.
