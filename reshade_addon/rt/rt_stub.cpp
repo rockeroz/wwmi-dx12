@@ -51,6 +51,7 @@ bool RtHoldVanilla()
 void RtNoteRays() {}
 void RtObserveDraw(reshade::api::command_list*, uint32_t, uint32_t, int32_t, uint64_t) {}
 void RtPresentTick() {}
+void RtNoteDrawOutcome(int, int, int) {}
 void RtDrawOverlay()
 {
     ImGui::TextDisabled("  ray tracing: this build has no RT module (WWMI_RT=0)");

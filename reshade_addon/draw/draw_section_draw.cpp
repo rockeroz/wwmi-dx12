@@ -124,7 +124,14 @@ void SectionDrawIndexed(SectionDraw& sd, uint32_t c, uint32_t s2, uint32_t b2)
     MigotoPort::StateDesc*           cs_blend =
         MigotoPort::AsStateDesc(MigotoPort::State().blend);
     if (cs_blend) {
-        if (!g_custom_subdraw) return;
+        if (!g_custom_subdraw) { // RTFETCH: nothing of the module's may outlive this section
+            if (vf_restore.param != 0xFF) d3d12_cl->SetGraphicsRootConstantBufferView(vf_restore.param, vf_restore.va);
+            if (vf_restore.shadow_bind || vf_restore.skip) {
+                SetShadowExtraSlots(nullptr, 0);
+                RtNoteDrawOutcome(dm, wc ? (int)wc->index : -1, 4);
+            }
+            return;
+        }
         ++g_custom_blend_count;
         if (g_custom_blend && !layout_ovr.count) {
             {
@@ -265,8 +272,32 @@ void SectionDrawIndexed(SectionDraw& sd, uint32_t c, uint32_t s2, uint32_t b2)
             sect_ps.StampInPlace();
         }
     }
+    // RTFETCH: the module's VS slots need a shadow table bind; when nothing above made one, make it here. Without it
+    // the draw would fetch the game's buffers for the mod's vertices: then the section is not drawn.
+    RfxBindState rt_bind{};
+    bool         rt_skip = vf_restore.skip;
+    int          rt_outcome = vf_restore.skip ? 1 : 0;
+    if (vf_restore.shadow_bind && !rt_skip) {
+        if (!tbind.applied) {
+            rt_bind = ApplyDrawBindings(cmd_list, d3d12_cl, {}, /*guard_bindless*/ false);
+            if (!rt_bind.applied) {
+                rt_skip = true;
+                rt_outcome = 2;
+            }
+        }
+        if (!rt_skip) { // every table a fetch slot lives in must be one of the shadow copies just bound
+            uint64_t have = 0;
+            for (const auto& t : (tbind.applied ? tbind : rt_bind).tables)
+                if (t.first < 64) have |= 1ull << t.first;
+            if (vf_restore.shadow_params & ~have) {
+                rt_skip = true;
+                rt_outcome = 3;
+            }
+        }
+    }
+    if (vf_restore.shadow_bind || vf_restore.skip) RtNoteDrawOutcome(dm, wc ? (int)wc->index : -1, rt_outcome);
     SetShadowExtraSlots(nullptr, 0); // RTFETCH's slots belonged to this draw's shadow bind only
-    {
+    if (!rt_skip) {
         auto*        odev = reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native());
         const CmdRT& ort = draw_rt;
         const int    oq = g_occl.Begin(d3d12_cl, odev, wc ? (int)wc->index : -1, c,
@@ -454,6 +485,8 @@ void SectionDrawIndexed(SectionDraw& sd, uint32_t c, uint32_t s2, uint32_t b2)
         ++did;
         g_occl.End(d3d12_cl, oq);
     }
+    if (rt_skip && vf_restore.param != 0xFF) d3d12_cl->SetGraphicsRootConstantBufferView(vf_restore.param, vf_restore.va);
+    if (rt_bind.bound) RfxRestore(d3d12_cl, rt_bind);
     if (tbind.bound) RfxRestore(d3d12_cl, tbind);
     if (rfxp_pso && rfxp_restore) // the patched PS wrote the glow / cutout; back to the game's PSO
         d3d12_cl->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(CmdGfx(cmd_list).gfx_restore()));

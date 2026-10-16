@@ -49,7 +49,13 @@ bool RtOnBlasBuild(reshade::api::command_list* cmd_list, reshade::api::accelerat
 struct VfRestore {
     uint8_t  param = 0xFF;
     uint64_t va = 0;
+    bool     skip = false;        // the module cannot draw this section correctly: no draw, every restore still runs
+    bool     shadow_bind = false; // the module set ShadowExtraSlots (the VS's fetch buffers): a shadow table bind is required
+    uint64_t shadow_params = 0;   // ...in these root parameters (bit per param): each must be among the bound shadow tables
 };
+// What became of a section the module handled (draw_section_draw.cpp): 0 drawn, 1 the module declined it, 2 no shadow
+// table bind could be made, 3 a fetch slot's table was not among the bound shadow tables, 4 dropped by the core.
+void RtNoteDrawOutcome(int dm, int comp, int outcome);
 // PTSKIN + RTFETCH + H27 on a pass-through draw of component `wc`; any other draw is left alone.
 VfRestore RtSkinDraw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* d3d12_cl, int dm,
     const WwmiMod::Component* wc, uint32_t c, uint32_t s2, uint32_t first_index, uint32_t index_count,
@@ -59,6 +65,7 @@ struct RtPalResult {
     bool tried = false;
     bool published = false;
     bool no_merge = false;
+    bool no_cb3 = false; // the draw's vs-cb3 is not a skeleton either: the mod's vs-cb3 binding goes nowhere
 };
 RtPalResult RtPalPublish(uint64_t draw_pso, int dm, const WwmiMod::Component* wc, uint64_t port_cb4_va);
 

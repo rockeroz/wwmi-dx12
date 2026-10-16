@@ -139,8 +139,9 @@ exit /b 0</Command>
   <ItemGroup Label="RT stub" Condition="'$(WwmiRT)' == '0'">
     <ClCompile Include="reshade_addon\rt\rt_stub.cpp" />
   </ItemGroup>
-  <ItemGroup Label="RT observe module (M1): msbuild /p:WwmiRT=observe" Condition="'$(WwmiRT)' == 'observe'">
+  <ItemGroup Label="RT module (M1 observe + M2 draw): msbuild /p:WwmiRT=observe" Condition="'$(WwmiRT)' == 'observe'">
     <ClCompile Include="reshade_addon\rt\rt_module.cpp" />
+    <ClCompile Include="reshade_addon\rt\rt_skin.cpp" />
   </ItemGroup>
   <ItemGroup Label="Debug" Condition="'$(Configuration)' == 'Debug'">
     <ClCompile Include="reshade_addon\instrumentation\chain_trace.cpp" />
@@ -168,6 +169,7 @@ exit /b 0</Command>
     <ClInclude Include="reshade_addon\config.h" />
     <ClInclude Include="reshade_addon\rt\rt_hooks.h" />
     <ClInclude Include="reshade_addon\rt\rt_registry.h" />
+    <ClInclude Include="reshade_addon\rt\rt_skin.h" />
     <ClInclude Include="src\buffer_view_fit.h" />
     <ClInclude Include="src\d3d12_barrier.h" />
     <ClInclude Include="src\d3d12_buffer.h" />
@@ -195,6 +197,7 @@ exit /b 0</Command>
   <ItemGroup Label="Shaders">
     <WwmiShader Include="$(WwmiRoot)reshade_addon\shaders\BufCopy.hlsl" />
     <WwmiShader Include="$(WwmiRoot)shaders_src\IbVbHash.hlsl" />
+    <WwmiShader Include="$(WwmiRoot)reshade_addon\rt\shaders\RtSkinMod.hlsl" />
   </ItemGroup>
   <Target Name="WwmiShaders" BeforeTargets="ClCompile"
           Inputs="@(WwmiShader);$(MSBuildProjectFullPath)"

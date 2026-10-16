@@ -777,6 +777,7 @@ bool DrawComponent(InjectFrame& fr, int dm, const WwmiMod::Component* wc)
                 t_cb4_root = -1;
                 rtpal_no_merge = pal.no_merge;
             }
+            if (pal.no_cb3) t_cb3_root = -1; // RT M2: b3 is the pass-through VS's material buffer
             constexpr unsigned kNotSkeletonWidth = 256;
             if (!pal.published) PortApi::PushGameConstantBuffer('v', 4, port_cb4_res, port_cb4_va,
                 pal.tried ? kNotSkeletonWidth : cb_width(4));
@@ -791,7 +792,7 @@ bool DrawComponent(InjectFrame& fr, int dm, const WwmiMod::Component* wc)
                         parsed ? "read" : "declarations NOT read", kNotSkeletonWidth);
                 w3 = kNotSkeletonWidth;
             }
-            PortApi::PushGameConstantBuffer('v', 3, port_cb3_res, port_cb3_va, w3);
+            if (!pal.no_cb3) PortApi::PushGameConstantBuffer('v', 3, port_cb3_res, port_cb3_va, w3);
             {
                 const RootCbvBind obj = ObjectCbOf(cmd_list);
                 if (obj.res && obj.va) PortApi::PushGameConstantBuffer('v', 2, obj.res, obj.va, kDx11ObjectCbByteWidth);

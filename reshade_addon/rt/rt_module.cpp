@@ -17,6 +17,12 @@
 // build's behaviour (the add-on switches itself off while the game ray traces).
 //
 // It does NOT replace BLAS/TLAS, read DEFAULT-heap buffers, publish a palette or skin the mod: M2+.
+//
+// M2 (rt_mode=2, the default of this build; rt_skin.cpp): instead of holding, a claimed draw that reads a skin-cache
+// ring is drawn with the mod -- its vertices posed by our own compute pass with the palette the game's skin cache
+// used for that section this frame, through the game's pass-through VS. A claim that cannot be drawn that way
+// (mesh not loaded yet, no palette for the section, a non-ring draw) stays the game's own, as in M1.
+// rt_mode=1 is M1 (observe and hold), rt_mode=0 the public build's behaviour.
 #include "../addon_common.h"
 #include "../hooks/resource_tracker.h"
 #include "../mods/layout_registry.h" // TableStartOf
@@ -24,6 +30,7 @@
 #include "../textures/texture_module.h" // TexHoldForRetry / TexRetryMissed
 #include "rt_hooks.h"
 #include "rt_registry.h"
+#include "rt_skin.h"
 #include <cstdarg>
 #include <map>
 #include <set>
@@ -50,7 +57,7 @@ constexpr uint32_t kSectionsPerFrame = 16;
 std::mutex            g_m; // registry, judge, sample state, draw-vb map
 rtm::Registry         g_reg;
 rtm::CsJudge          g_judge;
-std::atomic<int>      g_mode{ -1 }; // -1 unread, 0 off, 1 observe
+std::atomic<int>      g_mode{ -1 }; // -1 unread, 0 off, 1 observe (hold), 2 draw (M2)
 std::atomic<uint32_t> g_last_rt_frame{ 0 };
 std::atomic<uint32_t> g_ring_count{ 0 };
 std::atomic<uint32_t> g_ring_gen{ 0 };
@@ -60,7 +67,8 @@ std::atomic<uint64_t> g_sig_rings{ 0 }, g_rt_draws{ 0 }; // rings learned from a
 struct Counters {
     std::atomic<uint64_t> blas_builds{ 0 }, blas_bottom{ 0 }, rays{ 0 }, claims{ 0 }, claims_identified{ 0 }, claims_held{ 0 },
         ring_dispatches{ 0 }, pal_records{ 0 }, snapshots{ 0 }, snapshot_upload{ 0 }, snapshot_faults{ 0 }, bins{ 0 },
-        bin_bytes{ 0 }, inspect_us{ 0 }, dropped_lines{ 0 }, dropped_bins{ 0 }, unstamped{ 0 }, skin_records{ 0 };
+        bin_bytes{ 0 }, inspect_us{ 0 }, dropped_lines{ 0 }, dropped_bins{ 0 }, unstamped{ 0 }, skin_records{ 0 }, claims_drawn{ 0 },
+        sections{ 0 }, section_misses{ 0 }, m2_drawn{ 0 }, m2_not_drawn{ 0 };
     std::atomic<uint32_t> best_bone_run{ 0 };
     std::atomic<uint64_t> best_bone_cs{ 0 };
     std::atomic<uint32_t> best_bone_param{ 0 };
@@ -70,8 +78,9 @@ int Mode()
 {
     int m = g_mode.load(std::memory_order_relaxed);
     if (m >= 0) return m;
-    if (g_addon_ini_path.empty()) return 1; // not read yet: observe, re-read later
-    m = GetPrivateProfileIntW(L"wwmi-dx12", L"rt_mode", 1, g_addon_ini_path.c_str()) != 0 ? 1 : 0;
+    if (g_addon_ini_path.empty()) return 2; // not read yet: the default, re-read later
+    const int v = int(GetPrivateProfileIntW(L"wwmi-dx12", L"rt_mode", 2, g_addon_ini_path.c_str()));
+    m = v <= 0 ? 0 : v >= 2 ? 2 : 1;
     g_mode.store(m, std::memory_order_relaxed);
     return m;
 }
@@ -236,7 +245,7 @@ private:
             return false;
         }
         ReshadeLog(reshade::log::level::info, "wwmi-dx12 RT module: writing %s", Utf8(path).c_str());
-        fprintf(f_, "wwmi-dx12 %s (build %s) RT module M1 observe; rt_mode=%d\n", WWMI_VERSION, WWMI_BUILD_SHA, g_mode.load());
+        fprintf(f_, "wwmi-dx12 %s (build %s) RT module M2; rt_mode=%d\n", WWMI_VERSION, WWMI_BUILD_SHA, g_mode.load());
         fflush(f_);
         return true;
     }
@@ -253,8 +262,16 @@ private:
 };
 ObserveLog g_log;
 
+const char* ModeText(int m)
+{
+    return m == 2 ? "M2: mods drawn with the game's skin cache palettes while the game ray traces"
+         : m == 1 ? "M1: mods held (vanilla) while the game ray traces, observing"
+                  : "off: the add-on stops while the game ray traces";
+}
+
 void Summary()
 {
+    const std::string m2 = Mode() == 2 ? rtskin::Status() : std::string("m2 off");
     std::string rings;
     {
         std::lock_guard l(g_m);
@@ -268,7 +285,8 @@ void Summary()
     g_log.Line(true,
         "RTSUM active=%d blas=%llu bottom=%llu rays=%llu claims=%llu identified=%llu held=%llu ring_dispatches=%llu "
         "pal_records=%llu snapshots=%llu upload=%llu faults=%llu bins=%llu dropped_lines=%llu dropped_bins=%llu "
-        "unstamped=%llu best_bone_run=%u (cs=%016llx param=%u) inspect_us=%llu components=%zu sig_rings=%llu rt_draws=%llu skin_records=%llu rings=%u:%s",
+        "unstamped=%llu best_bone_run=%u (cs=%016llx param=%u) inspect_us=%llu components=%zu sig_rings=%llu rt_draws=%llu skin_records=%llu "
+        "claims_drawn=%llu sections=%llu section_misses=%llu m2_drawn=%llu m2_not_drawn=%llu | %s | rings=%u:%s",
         RtActive() ? 1 : 0, (unsigned long long)g_c.blas_builds.load(), (unsigned long long)g_c.blas_bottom.load(),
         (unsigned long long)g_c.rays.load(), (unsigned long long)g_c.claims.load(), (unsigned long long)g_c.claims_identified.load(),
         (unsigned long long)g_c.claims_held.load(), (unsigned long long)g_c.ring_dispatches.load(),
@@ -278,7 +296,8 @@ void Summary()
         (unsigned long long)g_c.unstamped.load(), g_c.best_bone_run.load(), (unsigned long long)g_c.best_bone_cs.load(),
         g_c.best_bone_param.load(), (unsigned long long)g_c.inspect_us.load(), g_comps_n.load(),
         (unsigned long long)g_sig_rings.load(), (unsigned long long)g_rt_draws.load(), (unsigned long long)g_c.skin_records.load(),
-        g_ring_count.load(), rings.c_str());
+        (unsigned long long)g_c.claims_drawn.load(), (unsigned long long)g_c.sections.load(), (unsigned long long)g_c.section_misses.load(),
+        (unsigned long long)g_c.m2_drawn.load(), (unsigned long long)g_c.m2_not_drawn.load(), m2.c_str(), g_ring_count.load(), rings.c_str());
 }
 
 uint64_t BufferVa(resource res, uint64_t offset) // ReShade DX12: a null resource carries the VA in `offset`
@@ -428,6 +447,75 @@ const rtm::CompWindow* CompAt(uint32_t first, uint32_t count) // g_m held
     return nullptr;
 }
 
+std::atomic<bool> g_palfmt_told{ false };
+
+// M2: every skin cache dispatch of a ring, every frame -- its bone palette (t0: the view's window into the frame's
+// upload buffer) and its tangent output (u0), in dispatch order = section order (rtskin::NoteSection).
+void NoteSkinSection(command_list* cmd_list, const CmdState& state, uint64_t cs_hash)
+{
+    thread_local uint64_t t_cs = 0;
+    thread_local bool     t_skin = false;
+    if (cs_hash != t_cs) {
+        t_cs = cs_hash;
+        t_skin = IsSkinCs(cs_hash);
+    }
+    if (!t_skin) return;
+    RegBind t0{ 0, 0, true }, u0{ 2, 0, true }, u1{ 2, 1, true }; // as observed, when the root signature has no map
+    {
+        std::lock_guard l(g_layout_regmap_mtx);
+        auto            it = g_layout_regmap.find(CmdCmpLayout(cmd_list));
+        if (it != g_layout_regmap.end() && it->second.built && it->second.t_cs[0].param != 0xFF && it->second.u_cs[1].param != 0xFF) {
+            t0 = it->second.t_cs[0];
+            u0 = it->second.u_cs[0];
+            u1 = it->second.u_cs[1];
+        }
+    }
+    device* dev = cmd_list->get_device();
+    auto    resolve = [&](const RegBind& b, ResInfo& ri) -> bool {
+        if (b.param == 0xFF || b.param >= 64) return false;
+        if (!b.is_table) {
+            ri = ResInfo{};
+            ri.cached_va = state.root[b.param].va;
+            ri.res = state.root[b.param].res;
+            return ri.cached_va != 0;
+        }
+        const TableStart ts = TableStartOf(dev, state.root[b.param].compute_table());
+        return ts && g_heap_to_res.find({ ts.heap, ts.base + b.offset }, ri) && ri.cached_va;
+    };
+    ResInfo rring{}, rpal{}, rtan{};
+    if (!resolve(u1, rring)) return;
+    uint64_t ring = 0;
+    {
+        std::lock_guard l(g_m);
+        if (const rtm::Ring* r = g_reg.RingAt(rring.cached_va, rring.size ? rring.size : 1)) ring = r->va;
+    }
+    if (!ring) return; // not a character the module knows
+    uint64_t pal = 0;
+    uint32_t bones = 0;
+    if (resolve(t0, rpal)) {
+        if (!t0.is_table) {
+            pal = rpal.cached_va; // a root SRV: the address is the palette's
+            bones = 256;
+        } else if (rpal.view_handle) {
+            const resource_view_desc vd = dev->get_resource_view_desc(resource_view{ rpal.view_handle });
+            if (vd.type == resource_view_type::buffer && (vd.format == format::r32g32b32a32_float || vd.format == format::r32g32b32a32_uint ||
+                                                             vd.format == format::r32g32b32a32_typeless)) {
+                pal = rpal.cached_va + vd.buffer.offset * 16;
+                bones = vd.buffer.size == UINT64_MAX ? 0u : uint32_t((std::min)(vd.buffer.size / 3, uint64_t(1024)));
+            } else if (!g_palfmt_told.exchange(true))
+                g_log.Line(true, "RTM2 skin cache t0 view is not float4 (type %u fmt %u): sections not recorded", uint32_t(vd.type),
+                    uint32_t(vd.format));
+        }
+    }
+    if (!pal || !bones) {
+        g_c.section_misses.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const uint64_t tan_va = resolve(u0, rtan) ? rtan.cached_va : 0;
+    rtskin::NoteSection(ring, pal, bones, tan_va, g_frame_id);
+    g_c.sections.fetch_add(1, std::memory_order_relaxed);
+}
+
 } // namespace
 
 // ==== rt_hooks.h =================================================================================
@@ -438,7 +526,7 @@ bool RtModulePresent()
 
 bool RtHoldVanilla()
 {
-    return RtActive() && Mode() == 1;
+    return RtActive() && Mode() == 1; // M2 holds per draw (RtClaimNote), never the whole frame
 }
 
 void RtNoteRays()
@@ -455,9 +543,8 @@ void RtPresentTick()
     static uint32_t s_last_summary = 0;
     if (!s_started) {
         s_started = true;
-        ReshadeLog(reshade::log::level::info, "wwmi-dx12 RT module M1 (observe) is in this build; rt_mode=%d (%s)", Mode(),
-            Mode() ? "mods held while the game ray traces" : "off: the add-on stops while the game ray traces");
-        g_log.Line(true, "RTSTART module M1 observe, rt_mode=%d; waiting for ray tracing (BLAS builds / DispatchRays)", Mode());
+        ReshadeLog(reshade::log::level::info, "wwmi-dx12 RT module M2 is in this build; rt_mode=%d (%s)", Mode(), ModeText(Mode()));
+        g_log.Line(true, "RTSTART module M2, rt_mode=%d (%s); waiting for ray tracing (BLAS builds / DispatchRays)", Mode(), ModeText(Mode()));
     }
     {
         static size_t s_comps_seen = SIZE_MAX;
@@ -535,6 +622,18 @@ void RtPresentTick()
         ReshadeLog(reshade::log::level::info, "wwmi-dx12 RT module: ray tracing stopped -- mods draw again");
     }
     s_held = held;
+    {
+        static bool s_drawing = false; // M2: ray tracing on and the module drawing
+        const bool  drawing = RtActive() && Mode() == 2;
+        if (drawing != s_drawing) {
+            g_log.Line(true, drawing ? "RTDRAW ON: the game ray traces -- mod sections drawn with the skin cache palettes"
+                                     : "RTDRAW OFF: no ray tracing -- the core draws the mods as always");
+            ReshadeLog(reshade::log::level::info, drawing ? "wwmi-dx12 RT module: the game ray traces -- drawing mods with its skin cache (M2)"
+                                                          : "wwmi-dx12 RT module: ray tracing stopped");
+        }
+        s_drawing = drawing;
+    }
+    if (Mode() == 2) rtskin::PresentTick();
     if (!s_last_summary || g_frame_id - s_last_summary >= kSummaryEvery) { // a heartbeat, ray tracing or not
         s_last_summary = g_frame_id;
         Summary();
@@ -696,6 +795,7 @@ void LogPassThroughDraw(const RtClaimInfo& in)
 
 bool RtClaimNote(const RtClaimInfo& in)
 {
+    rtskin::SetClaim({}); // this claim is the thread's current one, whatever it was before
     if (!RtActive() || Mode() == 0) return false;
     g_c.claims.fetch_add(1, std::memory_order_relaxed);
     if (in.identified) g_c.claims_identified.fetch_add(1, std::memory_order_relaxed);
@@ -720,6 +820,36 @@ bool RtClaimNote(const RtClaimInfo& in)
         if (e && e->is_new) LogRing(*e, "draw");
     }
     if (in.cmd_list && in.identified) LogPassThroughDraw(in);
+    if (Mode() == 2 && in.identified && in.cmd_list && width) {
+        // M2: a draw reading a known ring is ours to draw when the mesh and the section's palette are at hand
+        const uint64_t vb0 = uint64_t(int64_t(in.vb0) + int64_t(in.vertex_offset) * int64_t(in.vb0_stride));
+        const uint64_t vb4 = CmdGfx(in.cmd_list).vb[4].va;
+        uint64_t       ring = 0, prev = 0;
+        {
+            std::lock_guard l(g_m);
+            if (const rtm::Ring* r = g_reg.RingAt(vb0, 1)) ring = r->va;
+            if (vb4 && g_reg.RingAt(vb4, 1)) prev = vb4;
+        }
+        if (ring) {
+            rtskin::RequestMesh(in.mod);
+            if (rtskin::MeshReady(in.mod) && rtskin::SectionKnown(ring, in.comp)) {
+                rtskin::ClaimCtx c;
+                c.cmd_list = in.cmd_list;
+                c.gen = CmdGen(in.cmd_list);
+                c.ring = ring;
+                c.prev_ring = prev;
+                c.mod = in.mod;
+                c.comp = in.comp;
+                c.first_index = in.first_index;
+                c.index_count = in.index_count;
+                c.vs_hash = in.vs_hash;
+                c.frame = g_frame_id;
+                rtskin::SetClaim(c);
+                g_c.claims_drawn.fetch_add(1, std::memory_order_relaxed);
+                return false; // the core draws the mod; RtSkinDraw poses it
+            }
+        }
+    }
     // M1 never draws the mod while the game ray traces: the core would hand the mod's bind-pose vertices to the
     // game's pass-through VS (with RT on, the skin cache has already posed vb0).
     if (in.identified) g_c.claims_held.fetch_add(1, std::memory_order_relaxed);
@@ -857,6 +987,7 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
     uint32_t groups_z)
 {
     if (!cmd_list || !g_ring_count.load(std::memory_order_relaxed) || Mode() == 0) return;
+    if (Mode() == 2 && RtActive()) NoteSkinSection(cmd_list, state, cs_hash);
     const uint32_t frame = g_frame_id;
     const uint32_t gen = g_ring_gen.load(std::memory_order_relaxed);
     {
@@ -1118,23 +1249,50 @@ void RtBonesLog(command_list*, const CmdState&, uint32_t groups_x, uint64_t cs_h
 void RtSkinReadDrain() {}
 void RtSkinReadRecord(command_list*, const CmdState&, uint64_t, uint32_t) {}
 
-// M2+: skinning the mod and publishing a palette. M1 holds every such draw (RtClaimNote), so these are not reached
-// while the game ray traces; with RT off they must leave the draw alone.
-VfRestore RtSkinDraw(command_list*, ID3D12GraphicsCommandList*, int, const WwmiMod::Component*, uint32_t, uint32_t, uint32_t,
-    uint32_t, int32_t, uint64_t, uint64_t, int, bool)
+// M2: a mod section of a claim RtClaimNote took (a pass-through draw reading a ring) is posed and bound by
+// rt_skin.cpp; every other draw -- RT off, M1, a claim left to the game -- is left alone.
+VfRestore RtSkinDraw(command_list* cmd_list, ID3D12GraphicsCommandList* d3d12_cl, int dm, const WwmiMod::Component* wc, uint32_t c,
+    uint32_t s2, uint32_t, uint32_t, int32_t, uint64_t, uint64_t, int, bool)
 {
-    return {};
+    if (!wc || !d3d12_cl || Mode() != 2 || !rtskin::ClaimIsPassThrough(cmd_list)) return {};
+    return rtskin::Draw(cmd_list, d3d12_cl, dm, int(wc->index), c, s2);
 }
+void RtNoteDrawOutcome(int dm, int comp, int outcome)
+{
+    static std::mutex                         s_m;
+    static std::set<std::tuple<int, int, int>> s_seen;
+    static const char*                        kWhat[] = { "drawn", "declined by the module (see RTM2 skip)",
+                                               "NOT drawn: no shadow table bind could be made for the fetch slots",
+                                               "NOT drawn: a fetch slot's table is not among the shadow tables the core binds",
+                                               "dropped by the core (custom blend sub-draws off)" };
+    if (outcome == 0) g_c.m2_drawn.fetch_add(1, std::memory_order_relaxed);
+    else g_c.m2_not_drawn.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard l(s_m);
+        if (s_seen.size() >= 512 || !s_seen.insert({ dm, comp, outcome }).second) return;
+    }
+    g_log.Line(true, "RTM2 section mod=%d comp=%d: %s", dm, comp, outcome >= 0 && outcome <= 4 ? kWhat[outcome] : "?");
+}
+
+// The pass-through VS's b3 / b4 are material constant buffers, not skeletons: nothing of the mod's goes there.
 RtPalResult RtPalPublish(uint64_t, int, const WwmiMod::Component*, uint64_t)
 {
-    return {};
+    RtPalResult r;
+    if (Mode() != 2 || !rtskin::ClaimActive()) return r;
+    r.tried = r.published = r.no_merge = r.no_cb3 = true;
+    return r;
 }
 
 void RtDrawOverlay()
 {
     const int m = Mode();
-    ImGui::TextColored({ 0.6f, 0.9f, 1, 1 }, "RT module M1 (observe) -- rt_mode=%d (%s)", m,
-        m ? "mods held back while the game ray traces" : "off: the add-on stops while the game ray traces");
+    ImGui::TextColored({ 0.6f, 0.9f, 1, 1 }, "RT module -- rt_mode=%d (%s)", m, ModeText(m));
+    if (m == 2) {
+        ImGui::TextDisabled("  %s", rtskin::Status().c_str());
+        ImGui::TextDisabled("  claims taken: %llu  sections drawn: %llu (not drawn %llu)  skin cache sections recorded: %llu (misses %llu)",
+            (unsigned long long)g_c.claims_drawn.load(), (unsigned long long)g_c.m2_drawn.load(), (unsigned long long)g_c.m2_not_drawn.load(),
+            (unsigned long long)g_c.sections.load(), (unsigned long long)g_c.section_misses.load());
+    }
     const uint32_t last = g_last_rt_frame.load();
     if (!last) {
         ImGui::TextDisabled("  ray tracing: not seen yet (no BLAS build or DispatchRays)");
@@ -1174,3 +1332,16 @@ void RtDrawOverlay()
     if (!dir.empty()) ImGui::TextDisabled("  log: %ls\\rt_observe.log", dir.c_str());
     else ImGui::TextDisabled("  log: not open (see ReShade.log)");
 }
+
+// rt_skin.cpp's lines go to the same log (buffered, written at present).
+namespace rtskin {
+void Log(bool essential, _Printf_format_string_ const char* fmt, ...)
+{
+    char    buf[1024];
+    va_list a;
+    va_start(a, fmt);
+    vsnprintf(buf, sizeof buf, fmt, a);
+    va_end(a);
+    g_log.Line(essential, "%s", buf);
+}
+} // namespace rtskin
