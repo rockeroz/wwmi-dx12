@@ -1314,22 +1314,29 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
         }
     }
     for (auto& [game, mb] : g_m3) {
-        // redirected = that TLAS's instance names our BLAS (what its build reads, final once its list was submitted)
-        bool redirected = false;
-        if (t && mb.blas && int32_t(frame - mb.patched) <= int32_t(kM3Window) && !mb.patched_contribs.empty())
-            for (const ModBlas::Written& w : mb.written)
-                if (w.res == t->res && w.frame == t->frame && w.index < t->count) {
-                    uint64_t as = 0;
-                    GuardedPrivateRead(t->res, t->va + uint64_t(w.index) * 64 + 56, reinterpret_cast<uint8_t*>(&as), 8);
-                    redirected = redirected || as == mb.blas->GetGPUVirtualAddress();
-                }
-        if (!mb.ok && !redirected) continue;
+        if (!mb.ok && int32_t(frame - mb.patched) > int32_t(kM3Window)) continue;
+        if (!mb.blas || !mb.ib || !t) continue;
+        // the instance as that TLAS's build reads it (its list is submitted: final), and the contribution it gives
+        const uint64_t ours = mb.blas->GetGPUVirtualAddress();
+        const uint32_t idx = FindInstance(t->res, t->va, t->count, game, ours, mb, frame);
+        if (idx == UINT32_MAX) continue;
+        uint8_t inst[64];
+        if (GuardedPrivateRead(t->res, t->va + uint64_t(idx) * 64, inst, 64) != 64) continue;
+        uint64_t as;
+        uint32_t w13;
+        memcpy(&as, inst + 56, 8);
+        memcpy(&w13, inst + 52, 4);
+        const uint32_t contrib = w13 & 0xffffff;
+        const bool     redirected = as == ours;
+        if (contrib != mb.contrib) {
+            static std::atomic<uint32_t> s_c{ 0 };
+            if (s_c.fetch_add(1) < 12)
+                g_log.Line(true, "RTM3 contrib f=%u game=%llx instance #%u: %d at the TLAS build, %u at the rays (TLAS f%u)", frame,
+                    (unsigned long long)game, idx, mb.contrib == UINT32_MAX ? -1 : int(mb.contrib), contrib, t->frame);
+        }
         if (redirected) {
-            // a TLAS of the frame names our BLAS: its records must name our buffers
-            bool done = src;
-            for (uint32_t c : mb.patched_contribs)
-                done = done && M3Records(mb, rd, rd_va, hit_size, hit_stride, c, true);
-            if (!done) {
+            // that TLAS names our BLAS: its records must name our buffers
+            if (!src || !M3Records(mb, rd, rd_va, hit_size, hit_stride, contrib, true)) {
                 mb.streak = 0;
                 M3Refuse(src ? "records of a redirected instance are not the character's" : why);
                 static std::atomic<uint32_t> s_warn{ 0 };
@@ -1339,13 +1346,34 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
             }
             continue;
         }
-        if (mb.contrib == UINT32_MAX || mb.streak_frame == frame) continue;
+        if (mb.streak_frame == frame) continue;
         mb.streak_frame = frame;
-        if (src && M3Records(mb, rd, rd_va, hit_size, hit_stride, mb.contrib, false))
+        if (src && M3Records(mb, rd, rd_va, hit_size, hit_stride, contrib, false))
             ++mb.streak;
         else {
             mb.streak = 0;
             M3Refuse(src ? "the records at the instance's contribution are not the character's" : why);
+            // where the character's records really are (the first few times): its geometry 0 IB at +32, offset 0
+            static std::atomic<uint32_t> s_scan{ 0 };
+            if (src && hit_size <= (8u << 20) && s_scan.fetch_add(1) < 6) {
+                std::vector<uint8_t> all(static_cast<size_t>(hit_size));
+                const uint32_t       got = GuardedPrivateRead(rd, rd_va, all.data(), uint32_t(all.size()));
+                std::string          at;
+                uint32_t             hits = 0;
+                for (uint64_t o = 0; o + 56 <= got && hits < 8; o += hit_stride) {
+                    uint64_t ib;
+                    uint32_t off;
+                    memcpy(&ib, all.data() + o + 32, 8);
+                    memcpy(&off, all.data() + o + 52, 4);
+                    if (ib == mb.game_ib && off == 0) {
+                        at += " " + std::to_string(o / hit_stride);
+                        ++hits;
+                    }
+                }
+                g_log.Line(true, "RTM3 scan f=%u game=%llx ib=%llx: instance #%u contrib %u (mask %02x flags %02x id %u); records naming its IB at:%s",
+                    frame, (unsigned long long)game, (unsigned long long)mb.game_ib, idx, contrib, inst[51], inst[55],
+                    unsigned(inst[48] | inst[49] << 8 | inst[50] << 16), at.empty() ? " none" : at.c_str());
+            }
         }
     }
 }
