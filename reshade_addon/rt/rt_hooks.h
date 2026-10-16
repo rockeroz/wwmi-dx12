@@ -33,6 +33,8 @@ void RtPalRecord(reshade::api::command_list* cmd_list, const CmdState& state, ui
 // A compute pipeline's shader at creation (pipeline_hooks.cpp), by the core's hash: the module keeps a copy so
 // the shaders it sees binding a ring can be dumped for offline disassembly. Records only.
 void RtNoteShader(uint64_t cs_hash, const void* code, size_t code_size);
+// The same for a graphics pipeline's vertex shader (dumped when a held RT draw of a mod component uses it).
+void RtNoteVertexShader(uint64_t vs_hash, const void* code, size_t code_size);
 // RTBONES / RTSKINREAD (g_debug): what her skin-cache dispatches bind, read once.
 bool RtBonesWindowOpen();
 void RtBonesLog(reshade::api::command_list* cmd_list, const CmdState& state, uint32_t groups_x, uint64_t cs_hash, bool learned);
@@ -65,6 +67,7 @@ RtPalResult RtPalPublish(uint64_t draw_pso, int dm, const WwmiMod::Component* wc
 // The module pairs it with the BLAS geometry reading the same index range to learn the character's ring.
 // true = leave this draw to the game: the module cannot draw the mod here (M1 observes only).
 struct RtClaimInfo {
+    reshade::api::command_list* cmd_list = nullptr; // the draw's list (its bindings: CmdGfx / CmdCbv)
     int      mod = -1;
     int      comp = -1;
     bool     identified = false;

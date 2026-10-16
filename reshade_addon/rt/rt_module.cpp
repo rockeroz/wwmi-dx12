@@ -391,24 +391,27 @@ bool IsSkinCs(uint64_t cs)
     return g_skin_cs.count(cs) != 0;
 }
 
-void DumpShader(uint64_t cs_hash) // any thread; once per hash
+std::unordered_map<uint64_t, std::vector<uint8_t>> g_vs_code; // g_shader_m: vertex shaders, same budget
+
+void DumpShader(uint64_t cs_hash, bool vertex = false) // any thread; once per hash
 {
     std::vector<uint8_t> code;
     {
         std::lock_guard l(g_shader_m);
-        if (!g_cs_dumped.insert(cs_hash).second) return;
-        auto it = g_cs_code.find(cs_hash);
-        if (it == g_cs_code.end()) {
-            g_log.Line(true, "RTSHADER cs=%016llx: bytecode not kept (created before the module saw it, or over budget)",
-                (unsigned long long)cs_hash);
+        if (!g_cs_dumped.insert(cs_hash ^ (vertex ? 0x5653000000000000ull : 0)).second) return;
+        auto& store = vertex ? g_vs_code : g_cs_code;
+        auto  it = store.find(cs_hash);
+        if (it == store.end()) {
+            g_log.Line(true, "RTSHADER %s=%016llx: bytecode not kept (created before the module saw it, or over budget)",
+                vertex ? "vs" : "cs", (unsigned long long)cs_hash);
             return;
         }
         code = it->second;
     }
     char name[64];
-    snprintf(name, sizeof name, "cs_%016llx.dxil", (unsigned long long)cs_hash);
+    snprintf(name, sizeof name, "%s_%016llx.dxil", vertex ? "vs" : "cs", (unsigned long long)cs_hash);
     const std::string queued = g_log.Bin(name, code.data(), code.size(), true);
-    g_log.Line(true, "RTSHADER cs=%016llx bytes=%zu -> %s", (unsigned long long)cs_hash, code.size(),
+    g_log.Line(true, "RTSHADER %s=%016llx bytes=%zu -> %s", vertex ? "vs" : "cs", (unsigned long long)cs_hash, code.size(),
         queued.empty() ? "(not written: budget)" : queued.c_str());
 }
 
@@ -468,6 +471,25 @@ void RtPresentTick()
                 g_merged_enable ? 1 : 0, g_geomods.size(), comps.size());
             ReshadeLog(reshade::log::level::info, "wwmi-dx12 RT module: %zu mod(s), %zu component window(s) loaded", g_geomods.size(),
                 comps.size());
+            for (size_t gi = 0; gi < g_geomods.size() && gi < 16; ++gi) {
+                const WwmiMod::Mod& mod = g_geomods[gi].mod;
+                g_log.Line(true, "  geomod %zu ns=%s mesh_vertex_count=%u object_guid=%d comps=%zu resources=%zu", gi,
+                    Utf8(g_geomods[gi].wcl_ns).c_str(), mod.mesh_vertex_count, mod.object_guid, mod.comps.size(), mod.resources.size());
+                for (const WwmiMod::Component& wc : mod.comps) {
+                    std::string draws;
+                    for (const WwmiMod::SubDraw& d : wc.draws) {
+                        char b[64];
+                        snprintf(b, sizeof b, " %u@%u%s", d.count, d.start, d.cond.empty() ? "" : "?");
+                        draws += b;
+                    }
+                    g_log.Line(true, "    comp %d %s match=%u+%u vg_offset=%u vg_count=%u remapped=%d remap_id=%d remap_vg=%u draws:%s", wc.index,
+                        Utf8(wc.tail).c_str(), wc.match_first_index, wc.match_index_count, wc.vg_offset, wc.vg_count, wc.remapped ? 1 : 0,
+                        wc.remap_id, wc.remap_vg, draws.c_str());
+                }
+                for (const WwmiMod::Resource& r : mod.resources)
+                    g_log.Line(true, "    res %s stride=%u size=%u va=%llx file=%s", Utf8(r.name).c_str(), r.stride, r.size,
+                        (unsigned long long)r.gpu_va, Utf8(r.filename).c_str());
+            }
             for (size_t i = 0; i < g_merged_comps.size() && i < 96; ++i) {
                 const MergedComp& c = g_merged_comps[i];
                 const std::string ns = c.mod_id >= 0 && size_t(c.mod_id) < g_geomods.size() ? Utf8(g_geomods[c.mod_id].wcl_ns) : std::string();
@@ -531,6 +553,68 @@ void RtObserveDraw(command_list* cmd_list, uint32_t index_count, uint32_t first_
         vertex_offset, (unsigned long long)vs_hash, comp_mod >= 0 ? "IS a component window" : "no component window", comp_mod, comp_idx);
 }
 
+// RTPSO: a held draw of a mod component, once per (VS, PSO, component): what the pass-through VS reads -- its input
+// layout, every vertex buffer (ring = the skin cache's posed positions), root CBVs (UE's LocalVF / Primitive / View
+// uniform buffers), root SRVs -- and its VS bytecode for offline disassembly.
+void LogPassThroughDraw(const RtClaimInfo& in)
+{
+    static std::mutex                                       s_m;
+    static std::set<std::tuple<uint64_t, uint64_t, int, int>> s_seen;
+    const CmdState&                                         st = CmdGfx(in.cmd_list);
+    const uint64_t                                          pso = st.gfx_pso;
+    {
+        std::lock_guard l(s_m);
+        if (s_seen.size() >= 256 || !s_seen.insert({ in.vs_hash, pso, in.mod, in.comp }).second) return;
+    }
+    char layout[1024] = {};
+    MigotoPort::DescribeInputLayout(pso, layout, sizeof layout);
+    std::string vbs;
+    for (unsigned i = 0; i < 8; ++i) {
+        if (!st.vb[i].va) continue;
+        bool ring = false;
+        {
+            std::lock_guard l(g_m);
+            ring = g_reg.IsSkinOut(st.vb[i].va, 1);
+        }
+        char b[160];
+        snprintf(b, sizeof b, " vb%u=%llx/%u/s%u%s", i, (unsigned long long)st.vb[i].va, st.vb[i].size, st.vb[i].stride, ring ? "(ring)" : "");
+        vbs += b;
+    }
+    g_log.Line(true, "RTPSO mod=%d comp=%d first=%u count=%u vertex_offset=%d vs=%016llx pso=%llx ib=%llx w=%u layout=[%s]%s",
+        in.mod, in.comp, in.first_index, in.index_count, in.vertex_offset, (unsigned long long)in.vs_hash, (unsigned long long)pso,
+        (unsigned long long)st.ib.va, st.ib.index_bytes, layout, vbs.c_str());
+    const CmdCbvBinds& cb = CmdCbv(in.cmd_list);
+    std::string        roots;
+    for (uint32_t p = 0; p < 64; ++p) {
+        char b[96];
+        if (cb.binds[p].va) {
+            snprintf(b, sizeof b, " cbv%u=%llx/%u", p, (unsigned long long)cb.binds[p].va, cb.binds[p].size);
+            roots += b;
+        }
+        if (st.root[p].va && (st.root[p].desc_type == 2 || st.root[p].desc_type == 3)) {
+            snprintf(b, sizeof b, " %s%u=%llx", st.root[p].desc_type == 3 ? "uav" : "srv", p, (unsigned long long)st.root[p].va);
+            roots += b;
+        }
+        if (st.root[p].table.handle) {
+            snprintf(b, sizeof b, " tbl%u", p);
+            roots += b;
+        }
+    }
+    g_log.Line(true, "  roots:%s", roots.c_str());
+    // small root CBVs in full (LocalVF / Primitive uniform buffers): 256 bytes each, priority bins
+    std::vector<uint8_t> buf(256);
+    for (uint32_t p = 0; p < 64; ++p) {
+        const RootCbvBind& r = cb.binds[p];
+        if (!r.res || !r.va || !BufferLive(r.res)) continue;
+        const uint32_t n = GuardedSnapshot(r.res, r.va, buf.data(), 256);
+        if (!n) continue;
+        char name[128];
+        snprintf(name, sizeof name, "pso_m%d_c%d_vs%016llx_cbv%u.bin", in.mod, in.comp, (unsigned long long)in.vs_hash, p);
+        g_log.Bin(name, buf.data(), n, true);
+    }
+    DumpShader(in.vs_hash, true);
+}
+
 bool RtClaimNote(const RtClaimInfo& in)
 {
     if (!RtActive() || Mode() == 0) return false;
@@ -556,6 +640,7 @@ bool RtClaimNote(const RtClaimInfo& in)
         }
         if (e && e->is_new) LogRing(*e, "draw");
     }
+    if (in.cmd_list && in.identified) LogPassThroughDraw(in);
     // M1 never draws the mod while the game ray traces: the core would hand the mod's bind-pose vertices to the
     // game's pass-through VS (with RT on, the skin cache has already posed vb0).
     if (in.identified) g_c.claims_held.fetch_add(1, std::memory_order_relaxed);
@@ -663,6 +748,16 @@ bool RtDrawVbOf(int mod_id, int comp_idx, RtDrawVb* out)
     if (it == g_draw_vb.end()) return false;
     if (out) *out = it->second;
     return true;
+}
+
+void RtNoteVertexShader(uint64_t vs_hash, const void* code, size_t code_size)
+{
+    if (!vs_hash || !code || !code_size || code_size > (4u << 20) || Mode() == 0) return;
+    std::lock_guard l(g_shader_m);
+    if (g_vs_code.count(vs_hash) || g_cs_code_bytes + code_size > kCsCodeCap) return;
+    const auto* p = static_cast<const uint8_t*>(code);
+    g_vs_code.emplace(vs_hash, std::vector<uint8_t>(p, p + code_size));
+    g_cs_code_bytes += code_size;
 }
 
 void RtNoteShader(uint64_t cs_hash, const void* code, size_t code_size)

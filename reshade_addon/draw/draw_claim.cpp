@@ -365,6 +365,7 @@ std::optional<bool> ClaimDraw(const DrawArgs& da, BoneRoots& roots, DrawClaim& d
             bool rt_hold = false; // RTHOLD (rt_hooks.h): the RT module keeps this draw the game's own
             {
                 RtClaimInfo ri;
+                ri.cmd_list = cmd_list;
                 ri.mod = md;
                 ri.comp = ci;
                 ri.identified = is_mod_char || char_vb || char_ibset;
