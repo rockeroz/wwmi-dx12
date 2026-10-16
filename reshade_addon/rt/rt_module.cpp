@@ -869,8 +869,11 @@ bool RtClaimNote(const RtClaimInfo& in)
         uint64_t    ring = 0;
         const char* why = nullptr;
         const bool  seen = rtskin::RingSeen(vb0) || (reg_ring && rtskin::RingSeen(reg_ring));
-        if (!seen && !reg_ring) why = "VB0 is not a skin cache ring the module saw posed";
-        else {
+        if (!seen && !reg_ring) {
+            // a ring whose dispatches the module did not see (they ran before it looked): our last pose, if any
+            if (rtskin::MeshReady(in.mod) && rtskin::PoseCached(in.mod, in.comp)) ring = vb0;
+            else why = "VB0 is not a skin cache ring the module saw posed, and no earlier pose";
+        } else {
             rtskin::RequestMesh(in.mod);
             if (!rtskin::MeshReady(in.mod)) why = "the mod's mesh is not loaded (yet)";
             else if (rtskin::SectionKnown(vb0, in.comp)) ring = vb0;
@@ -1034,8 +1037,10 @@ void RtNoteShader(uint64_t cs_hash, const void* code, size_t code_size)
 void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash, uint32_t groups_x, uint32_t groups_y,
     uint32_t groups_z)
 {
-    if (!cmd_list || !g_ring_count.load(std::memory_order_relaxed) || Mode() == 0) return;
-    if (Mode() == 2 && RtActive()) NoteSkinSection(cmd_list, state, cs_hash);
+    if (!cmd_list || Mode() == 0) return;
+    // M2: every frame, ray tracing seen yet or not (the first frames after RT resumes pose before its BLAS builds)
+    if (Mode() == 2) NoteSkinSection(cmd_list, state, cs_hash);
+    if (!g_ring_count.load(std::memory_order_relaxed)) return;
     const uint32_t frame = g_frame_id;
     const uint32_t gen = g_ring_gen.load(std::memory_order_relaxed);
     {
