@@ -87,6 +87,42 @@ void SyncAtomics() // g_m held
     g_ring_gen.store(g_reg.Gen(), std::memory_order_relaxed);
 }
 
+std::string Utf8(const std::wstring& w)
+{
+    if (w.empty()) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), int(w.size()), nullptr, 0, nullptr, nullptr);
+    std::string s(size_t(n > 0 ? n : 0), '\0');
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), int(w.size()), s.data(), n, nullptr, nullptr);
+    return s;
+}
+// ReShade.log is written in every configuration (the core's own log only with its debug switch on): the
+// module's must-know lines go there too, so a user can always tell whether the module is in the build.
+void ReshadeLog(reshade::log::level lvl, _Printf_format_string_ const char* fmt, ...)
+{
+    char    buf[768];
+    va_list a;
+    va_start(a, fmt);
+    vsnprintf(buf, sizeof buf, fmt, a);
+    va_end(a);
+    reshade::log::message(lvl, buf);
+}
+// Where the add-on keeps its data; <this add-on's folder>\wwmi_dx12 when the core has none (no wwmi_dir).
+std::wstring DataDir()
+{
+    if (!g_data_dir.empty()) return g_data_dir;
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&DataDir), &self))
+        return {};
+    wchar_t path[MAX_PATH] = {};
+    const DWORD n = GetModuleFileNameW(self, path, MAX_PATH);
+    if (!n || n >= MAX_PATH) return {};
+    std::wstring dir(path, n);
+    const size_t slash = dir.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return {};
+    return dir.substr(0, slash + 1) + L"wwmi_dx12";
+}
+
 // ---- log + bins: buffered by the hooks, written by the present path ------------------------------
 class ObserveLog {
 public:
@@ -167,14 +203,24 @@ private:
         if (f_) return true;
         if (tried_) return false;
         tried_ = true;
-        if (g_data_dir.empty()) return false;
-        CreateDirectoryW(g_data_dir.c_str(), nullptr);
-        dir_ = g_data_dir + L"\\rt_observe";
+        const std::wstring data = DataDir();
+        if (data.empty()) {
+            ReshadeLog(reshade::log::level::warning, "wwmi-dx12 RT module: no data folder known -- rt_observe.log not written");
+            return false;
+        }
+        CreateDirectoryW(data.c_str(), nullptr);
+        dir_ = data + L"\\rt_observe";
         CreateDirectoryW(dir_.c_str(), nullptr);
         const std::wstring path = dir_ + L"\\rt_observe.log";
         MoveFileExW(path.c_str(), (path + L".prev").c_str(), MOVEFILE_REPLACE_EXISTING);
         f_ = _wfsopen(path.c_str(), L"wb", _SH_DENYWR);
-        if (!f_) return false;
+        if (!f_) {
+            ReshadeLog(reshade::log::level::warning, "wwmi-dx12 RT module: cannot create %s (error %lu)", Utf8(path).c_str(),
+                GetLastError());
+            dir_.clear();
+            return false;
+        }
+        ReshadeLog(reshade::log::level::info, "wwmi-dx12 RT module: writing %s", Utf8(path).c_str());
         fprintf(f_, "wwmi-dx12 %s (build %s) RT module M1 observe; rt_mode=%d\n", WWMI_VERSION, WWMI_BUILD_SHA, g_mode.load());
         fflush(f_);
         return true;
@@ -335,19 +381,28 @@ void RtNoteRays()
 void RtPresentTick()
 {
     static bool     s_held = false;
+    static bool     s_started = false;
     static uint32_t s_last_summary = 0;
-    const bool      held = RtHoldVanilla();
+    if (!s_started) {
+        s_started = true;
+        ReshadeLog(reshade::log::level::info, "wwmi-dx12 RT module M1 (observe) is in this build; rt_mode=%d (%s)", Mode(),
+            Mode() ? "mods held while the game ray traces" : "off: the add-on stops while the game ray traces");
+        g_log.Line(true, "RTSTART module M1 observe, rt_mode=%d; waiting for ray tracing (BLAS builds / DispatchRays)", Mode());
+    }
+    const bool held = RtHoldVanilla();
     if (held && !s_held) {
         const UnstampTally t = UnstampAll(TexHoldForRetry); // as C1/C2 off does: the game's textures back, kept for retry
         g_c.unstamped.fetch_add(t.recorded, std::memory_order_relaxed);
         g_log.Line(true, "RTHOLD ON: the game ray traces -- mod held, %u stamped slot(s) given back (+%u in CPU-only heaps, %zu still stamped there)",
             t.recorded, t.cpu_only, t.cpu_only_stamped);
+        ReshadeLog(reshade::log::level::info, "wwmi-dx12 RT module: the game ray traces -- mods held (vanilla), observing");
     } else if (!held && s_held) {
         TexRetryMissed("RT hold ended"); // what UnstampAll and the held RestampResource calls set aside
         g_log.Line(true, "RTHOLD OFF: no ray tracing for %d frames -- mods draw again, held texture swaps retried", kActiveFrames);
+        ReshadeLog(reshade::log::level::info, "wwmi-dx12 RT module: ray tracing stopped -- mods draw again");
     }
     s_held = held;
-    if (g_last_rt_frame.load(std::memory_order_relaxed) && (!s_last_summary || g_frame_id - s_last_summary >= kSummaryEvery)) {
+    if (!s_last_summary || g_frame_id - s_last_summary >= kSummaryEvery) { // a heartbeat, ray tracing or not
         s_last_summary = g_frame_id;
         Summary();
     }
@@ -675,6 +730,8 @@ void RtDrawOverlay()
     const uint32_t last = g_last_rt_frame.load();
     if (!last) {
         ImGui::TextDisabled("  ray tracing: not seen yet (no BLAS build or DispatchRays)");
+        const std::wstring d = g_log.Dir();
+        ImGui::TextDisabled("  log: %ls", d.empty() ? L"not open (see ReShade.log)" : (d + L"\\rt_observe.log").c_str());
         return;
     }
     ImGui::TextDisabled("  ray tracing: %s (last seen %d frames ago)   BLAS builds: %llu (bottom %llu)  DispatchRays: %llu",
@@ -707,4 +764,5 @@ void RtDrawOverlay()
         double(g_c.inspect_us.load()) / 1000.0, (unsigned long long)g_c.dropped_lines.load(), (unsigned long long)g_c.dropped_bins.load());
     const std::wstring dir = g_log.Dir();
     if (!dir.empty()) ImGui::TextDisabled("  log: %ls\\rt_observe.log", dir.c_str());
+    else ImGui::TextDisabled("  log: not open (see ReShade.log)");
 }
