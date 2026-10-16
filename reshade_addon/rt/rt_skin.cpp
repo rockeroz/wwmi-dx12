@@ -68,9 +68,22 @@ struct RingSecs {
     std::map<uint32_t, SecRec> by_start;
     uint32_t                   expected = 0; // sections the ring's BLAS has (0 = not known)
     uint32_t                   frame = 0;    // last dispatch seen
+    uint64_t                   bytes = 0;    // the ring buffer's size (a VB0 inside it finds it)
     std::string                layout;       // the starts last logged
 };
 std::unordered_map<uint64_t, RingSecs> g_rings;
+// A mod's section layout (start vertex per component) once seen complete: the same mesh lays its sections out the same
+// way in every ring the pool gives it, so a new ring is usable from its first dispatches.
+std::map<int, std::vector<uint32_t>> g_mod_layout;
+
+uint64_t FindRingKey(uint64_t va) // g_m held; 0 = no ring written by the skin cache contains va
+{
+    if (!va) return 0;
+    if (g_rings.count(va)) return va;
+    for (const auto& [key, r] : g_rings)
+        if (va >= key && va < key + (r.bytes ? r.bytes : 1)) return key;
+    return 0;
+}
 constexpr uint32_t                     kStartForget = 1800; // frames a start not posed again stays in the layout
 // (the skin cache can leave a section unposed for long stretches; a ring the pool gives to another mesh is told apart
 // by its section count, see LookupSection)
@@ -95,6 +108,7 @@ struct Mesh {
     uint32_t                                        verts = 0, indices = 0, influences = 0, blend_stride = 0, uv_stride = 0;
     bool                                            has_color = false;
     std::vector<Slot>                               slots;
+    uint32_t                                        ncomps = 0; // the mod's components (= the game mesh's sections)
     std::map<uint32_t, D3D12_CPU_DESCRIPTOR_HANDLE> uv_views, color_views;
     std::map<int, std::pair<Pose, Pose>>            poses; // component -> (latest pose, the one before): velocity history
     // WWMI merged skeleton ($\WWMIv1\vg_offset / vg_count): the mod's bone indices address every section's palette
@@ -139,7 +153,7 @@ thread_local ClaimCtx t_claim;
 
 void LogOnce(const std::string& key, const char* line) // g_m held
 {
-    if (g_logged.size() < 512 && g_logged.insert(key).second) Log(true, "%s", line);
+    if (g_logged.size() < 4096 && g_logged.insert(key).second) Log(true, "%s", line);
 }
 
 void SkipLocked(const char* why, int mod, int comp) // g_m held
@@ -252,6 +266,7 @@ bool LoadMesh(Mesh& m) // g_m NOT held (file and GPU work); the caller publishes
     m.blend_stride = blend.stride;
     m.influences = blend.stride / 2;
     m.uv_stride = uv.stride;
+    m.ncomps = uint32_t(mod.comps.size());
     for (const WwmiMod::Component& wc : mod.comps) {
         if (wc.remapped) {
             m.why = "remapped skeleton (BlendRemap) not supported yet";
@@ -395,11 +410,28 @@ void Transition(ID3D12GraphicsCommandList* cl, ID3D12Resource* a, ID3D12Resource
 constexpr D3D12_RESOURCE_STATES kRead =
     D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
-bool LookupSection(uint64_t ring, int comp, uint32_t frame, Sec* out) // g_m held
+bool LookupSection(uint64_t ring_va, int comp, uint32_t frame, Sec* out, int mod) // g_m held
 {
-    auto it = g_rings.find(ring);
-    if (it == g_rings.end() || comp < 0) return false;
+    const uint64_t ring = FindRingKey(ring_va);
+    auto           it = g_rings.find(ring);
+    if (!ring || it == g_rings.end() || comp < 0) return false;
     const RingSecs& r = it->second;
+    // the mod's remembered layout: its start for this component, when the ring has posed it
+    if (mod >= 0) {
+        const auto lm = g_mod_layout.find(mod);
+        if (lm != g_mod_layout.end() && size_t(comp) < lm->second.size()) {
+            const auto rs = r.by_start.find(lm->second[size_t(comp)]);
+            if (rs != r.by_start.end() && int32_t(frame - rs->second.frame) <= int32_t(kSectionAge)) {
+                if (out) *out = rs->second.s;
+                return true;
+            }
+        }
+    }
+    uint32_t ncomps = 0;
+    if (mod >= 0) {
+        const auto mi = g_meshes.find(mod);
+        if (mi != g_meshes.end()) ncomps = mi->second.ncomps;
+    }
     std::vector<std::pair<uint32_t, const SecRec*>> live; // (start, record), by start
     for (const auto& [start, rec] : r.by_start)
         if (frame - rec.frame <= kStartForget) live.push_back({ start, &rec });
@@ -411,7 +443,17 @@ bool LookupSection(uint64_t ring, int comp, uint32_t frame, Sec* out) // g_m hel
         live.resize(r.expected);
         std::sort(live.begin(), live.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     }
+    // without the BLAS's count, at least as many sections as the mod has components (a partial layout would shift them)
+    if (!r.expected && ncomps && live.size() < ncomps) return false;
     if (size_t(comp) >= live.size()) return false;
+    // complete: remember it for this mod
+    if (mod >= 0 && (r.expected ? live.size() == r.expected : ncomps && live.size() == ncomps)) {
+        std::vector<uint32_t>& lay = g_mod_layout[mod];
+        if (lay.size() != live.size()) {
+            lay.clear();
+            for (const auto& [start, rec] : live) lay.push_back(start);
+        }
+    }
     const SecRec& rec = *live[size_t(comp)].second;
     if (int32_t(frame - rec.frame) > int32_t(kSectionAge)) return false; // posed too long ago: its palette is gone
     if (out) *out = rec.s;
@@ -433,7 +475,7 @@ bool BuildMerged(Mesh& m, Slot& sl, Bind& bind, int self_slot, uint64_t ring, ui
     std::vector<std::pair<const Mesh::MergedComp*, Sec>> fresh;
     for (const Mesh::MergedComp& mc : m.merged) {
         Sec x;
-        if (LookupSection(ring, mc.index, frame, &x) && x.pal_res) fresh.push_back({ &mc, x });
+        if (LookupSection(ring, mc.index, frame, &x, m.mod) && x.pal_res) fresh.push_back({ &mc, x });
     }
     if (!base && fresh.size() != m.merged.size()) return false;
     if (fresh.empty() && !base) return false;
@@ -480,8 +522,8 @@ bool Overlaps(const ResInfo& ri, uint64_t va)
 
 } // namespace
 
-void NoteSection(uint64_t ring_va, uint32_t start, uint64_t palette_va, uint32_t bones, uint64_t tangent_ring_va, uint32_t expected,
-    uint32_t frame, ID3D12Resource* palette_res, uint64_t palette_off)
+void NoteSection(uint64_t ring_va, uint64_t ring_bytes, uint32_t start, uint64_t palette_va, uint32_t bones, uint64_t tangent_ring_va,
+    uint32_t expected, uint32_t frame, ID3D12Resource* palette_res, uint64_t palette_off)
 {
     std::lock_guard l(g_m);
     if (g_rings.size() >= 64 && !g_rings.count(ring_va))
@@ -489,6 +531,7 @@ void NoteSection(uint64_t ring_va, uint32_t start, uint64_t palette_va, uint32_t
             it = frame - it->second.frame > kStartForget ? g_rings.erase(it) : std::next(it);
     RingSecs& r = g_rings[ring_va];
     if (expected) r.expected = expected;
+    if (ring_bytes) r.bytes = ring_bytes;
     r.frame = frame;
     // the pool gave this ring to another mesh: starts not posed for a while leave the layout
     for (auto it = r.by_start.begin(); it != r.by_start.end();)
@@ -512,10 +555,17 @@ void NoteSection(uint64_t ring_va, uint32_t start, uint64_t palette_va, uint32_t
     }
 }
 
-bool SectionKnown(uint64_t ring, int comp)
+bool SectionKnown(uint64_t ring, int comp, int mod)
 {
     std::lock_guard l(g_m);
-    return LookupSection(ring, comp, g_frame_id, nullptr);
+    return LookupSection(ring, comp, g_frame_id, nullptr, mod);
+}
+
+uint64_t RingKey(uint64_t va)
+{
+    std::lock_guard l(g_m);
+    const uint64_t  key = FindRingKey(va);
+    return key && g_frame_id - g_rings[key].frame <= kStartForget ? key : 0;
 }
 
 bool MeshFailed(int mod)
@@ -534,9 +584,7 @@ bool PoseCached(int mod, int comp)
 
 bool RingSeen(uint64_t ring)
 {
-    std::lock_guard l(g_m);
-    const auto      it = g_rings.find(ring);
-    return it != g_rings.end() && g_frame_id - it->second.frame <= kStartForget;
+    return RingKey(ring) != 0;
 }
 
 void SetClaim(const ClaimCtx& c)
@@ -653,12 +701,12 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
             return out;
         }
         Sec  sec;
-        bool fresh = LookupSection(ctx.ring, comp, frame, &sec);
+        bool fresh = LookupSection(ctx.ring, comp, frame, &sec, mod);
         if (!m.merged.empty()) { // merged skeleton: any section posed this frame, or last frame's palettes, will do
             bool any = false;
             for (const Mesh::MergedComp& mc : m.merged) {
                 Sec x;
-                any = any || LookupSection(ctx.ring, mc.index, frame, &x);
+                any = any || LookupSection(ctx.ring, mc.index, frame, &x, mod);
             }
             fresh = any;
         }

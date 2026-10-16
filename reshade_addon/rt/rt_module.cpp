@@ -550,7 +550,7 @@ void NoteSkinSection(command_list* cmd_list, const CmdState& state, uint64_t cs_
         return;
     }
     const uint64_t tan_va = resolve(u0, rtan) ? rtan.cached_va : 0;
-    rtskin::NoteSection(ring, start, pal, bones, tan_va, expected, g_frame_id, pal_res, pal_off);
+    rtskin::NoteSection(ring, rring.size, start, pal, bones, tan_va, expected, g_frame_id, pal_res, pal_off);
     g_c.sections.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -870,22 +870,16 @@ bool RtClaimNote(const RtClaimInfo& in)
         }
         // the ring: VB0 itself when the skin cache wrote it (no need to wait for the registry to learn it), else the
         // registry's ring around it
-        uint64_t    ring = 0;
-        const char* why = nullptr;
-        const bool  seen = rtskin::RingSeen(vb0) || (reg_ring && rtskin::RingSeen(reg_ring));
-        if (!seen && !reg_ring) {
-            // a ring whose dispatches the module did not see (they ran before it looked): our last pose, if any
-            if (rtskin::MeshReady(in.mod) && rtskin::PoseCached(in.mod, in.comp)) ring = vb0;
-            else why = "VB0 is not a skin cache ring the module saw posed, and no earlier pose";
-        } else {
-            rtskin::RequestMesh(in.mod);
-            if (rtskin::MeshFailed(in.mod)) why = "the module cannot draw this mod (see RTM2 mesh FAILED)";
-            else if (!rtskin::MeshReady(in.mod)) why = "the mod's mesh is not loaded (yet)";
-            else if (rtskin::SectionKnown(vb0, in.comp)) ring = vb0;
-            else if (reg_ring && rtskin::SectionKnown(reg_ring, in.comp)) ring = reg_ring;
-            else if (rtskin::PoseCached(in.mod, in.comp)) ring = seen && rtskin::RingSeen(vb0) ? vb0 : (reg_ring ? reg_ring : vb0);
-            else why = "no complete skin cache layout / palette for this section this frame, and no earlier pose";
-        }
+        uint64_t       ring = 0;
+        const char*    why = nullptr;
+        const uint64_t key = rtskin::RingKey(vb0) ? rtskin::RingKey(vb0) : (reg_ring ? rtskin::RingKey(reg_ring) : 0);
+        rtskin::RequestMesh(in.mod);
+        if (rtskin::MeshFailed(in.mod)) why = "the module cannot draw this mod (see RTM2 mesh FAILED)";
+        else if (!rtskin::MeshReady(in.mod)) why = "the mod's mesh is not loaded (yet)";
+        else if (key && rtskin::SectionKnown(key, in.comp, in.mod)) ring = key;
+        else if (rtskin::PoseCached(in.mod, in.comp)) ring = key ? key : vb0; // our last pose of it
+        else if (!key && !reg_ring) why = "VB0 is not a skin cache ring the module saw posed, and no earlier pose";
+        else why = "no complete skin cache layout / palette for this section this frame, and no earlier pose";
         if (why) NoteHeld(in.mod, in.comp, why);
         if (!why) {
             {
