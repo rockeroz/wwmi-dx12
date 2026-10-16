@@ -28,7 +28,11 @@ struct RtDrawVb {
 void RtNoteDrawVb(int mod_id, int comp_idx, const RtDrawVb& v);
 bool RtDrawVbOf(int mod_id, int comp_idx, RtDrawVb* out);
 
-void RtPalRecord(reshade::api::command_list* cmd_list, const CmdState& state, uint64_t cs_hash);
+void RtPalRecord(reshade::api::command_list* cmd_list, const CmdState& state, uint64_t cs_hash, uint32_t groups_x,
+    uint32_t groups_y, uint32_t groups_z);
+// A compute pipeline's shader at creation (pipeline_hooks.cpp), by the core's hash: the module keeps a copy so
+// the shaders it sees binding a ring can be dumped for offline disassembly. Records only.
+void RtNoteShader(uint64_t cs_hash, const void* code, size_t code_size);
 // RTBONES / RTSKINREAD (g_debug): what her skin-cache dispatches bind, read once.
 bool RtBonesWindowOpen();
 void RtBonesLog(reshade::api::command_list* cmd_list, const CmdState& state, uint32_t groups_x, uint64_t cs_hash, bool learned);

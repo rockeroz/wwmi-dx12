@@ -31,7 +31,7 @@ bool on_dispatch(command_list* cmd_list, uint32_t group_count_x, uint32_t group_
     }
 
     const CmdState& state = CmdGfx(cmd_list);
-    RtPalRecord(cmd_list, state, cs_hash); // RTPAL: a character's skin-cache sections' bone palettes (rt/rt_config.h g_rt_palette)
+    RtPalRecord(cmd_list, state, cs_hash, group_count_x, group_count_y, group_count_z); // RTPAL: a character's skin-cache sections' bone palettes (rt/rt_config.h g_rt_palette)
 
     DispatchDiagMorph(da);
     DispatchVerdict verdict;

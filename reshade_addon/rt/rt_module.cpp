@@ -27,6 +27,7 @@
 #include <cstdarg>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <share.h>
 #include <tuple>
 
@@ -41,7 +42,7 @@ constexpr uint64_t kLogCap = 16ull << 20;       // ...RTRING / RTSUM / hold line
 constexpr size_t   kPendingText = 1u << 20;     // log text buffered between presents
 constexpr uint64_t kPendingBins = 2ull << 20;   // bin bytes buffered between presents (written at present)
 constexpr uint64_t kBinCap = 64ull << 20;       // all bins together
-constexpr uint32_t kBinFiles = 4000;
+constexpr uint32_t kBinFiles = 1500; // snapshots (shader dumps have their own budget)
 constexpr uint32_t kSummaryEvery = 600; // frames
 constexpr uint32_t kLinesPerDispatch = 40;
 constexpr uint32_t kSectionsPerFrame = 16;
@@ -153,9 +154,20 @@ public:
         text_.push_back('\n');
     }
     // Queue a raw snapshot; returns the name it will be written under ("" = not queued).
-    std::string Bin(const char* name, const uint8_t* data, size_t n)
+    // priority = a shader dump: its own budget, never crowded out by snapshots.
+    std::string Bin(const char* name, const uint8_t* data, size_t n, bool priority = false)
     {
         std::lock_guard l(m_);
+        if (priority) {
+            if (prio_files_ >= 256 || prio_bytes_ + n > (48ull << 20)) {
+                g_c.dropped_bins.fetch_add(1, std::memory_order_relaxed);
+                return {};
+            }
+            ++prio_files_;
+            prio_bytes_ += n;
+            bins_.emplace_back(name, std::vector<uint8_t>(data, data + n));
+            return name;
+        }
         if (g_c.bins.load() + bins_.size() >= kBinFiles || g_c.bin_bytes.load() + pending_bin_bytes_ + n > kBinCap ||
             pending_bin_bytes_ + n > kPendingBins) {
             g_c.dropped_bins.fetch_add(1, std::memory_order_relaxed);
@@ -232,6 +244,8 @@ private:
     std::string                                               text_;
     std::vector<std::pair<std::string, std::vector<uint8_t>>> bins_;
     uint64_t                                                  pending_bin_bytes_ = 0;
+    uint32_t                                                  prio_files_ = 0;
+    uint64_t                                                  prio_bytes_ = 0;
     uint64_t                                                  written_ = 0;
     FILE*                                                     f_ = nullptr;
     bool                                                      tried_ = false;
@@ -361,6 +375,34 @@ std::map<SnapKey, std::pair<uint32_t, std::vector<uint8_t>>> g_prev_snap; // fra
 constexpr size_t                                             kMaxPrevSnaps = 512;
 
 std::map<int, RtDrawVb> g_draw_vb;
+
+// Compute shader bytecode by the core's hash, copied at pipeline creation (any thread). g_shader_m.
+std::mutex                                       g_shader_m;
+std::unordered_map<uint64_t, std::vector<uint8_t>> g_cs_code;
+uint64_t                                         g_cs_code_bytes = 0;
+constexpr uint64_t                               kCsCodeCap = 64ull << 20;
+std::set<uint64_t>                               g_cs_dumped; // g_shader_m
+
+void DumpShader(uint64_t cs_hash) // any thread; once per hash
+{
+    std::vector<uint8_t> code;
+    {
+        std::lock_guard l(g_shader_m);
+        if (!g_cs_dumped.insert(cs_hash).second) return;
+        auto it = g_cs_code.find(cs_hash);
+        if (it == g_cs_code.end()) {
+            g_log.Line(true, "RTSHADER cs=%016llx: bytecode not kept (created before the module saw it, or over budget)",
+                (unsigned long long)cs_hash);
+            return;
+        }
+        code = it->second;
+    }
+    char name[64];
+    snprintf(name, sizeof name, "cs_%016llx.dxil", (unsigned long long)cs_hash);
+    const std::string queued = g_log.Bin(name, code.data(), code.size(), true);
+    g_log.Line(true, "RTSHADER cs=%016llx bytes=%zu -> %s", (unsigned long long)cs_hash, code.size(),
+        queued.empty() ? "(not written: budget)" : queued.c_str());
+}
 
 // The loaded mods' component windows, copied on the present thread (where the core loads them) for the
 // BLAS-signature match on other threads. g_m.
@@ -615,8 +657,19 @@ bool RtDrawVbOf(int mod_id, int comp_idx, RtDrawVb* out)
     return true;
 }
 
+void RtNoteShader(uint64_t cs_hash, const void* code, size_t code_size)
+{
+    if (!cs_hash || !code || !code_size || code_size > (4u << 20) || Mode() == 0) return;
+    std::lock_guard l(g_shader_m);
+    if (g_cs_code.count(cs_hash) || g_cs_code_bytes + code_size > kCsCodeCap) return;
+    const auto* p = static_cast<const uint8_t*>(code);
+    g_cs_code.emplace(cs_hash, std::vector<uint8_t>(p, p + code_size));
+    g_cs_code_bytes += code_size;
+}
+
 // RTPAL (observe): a dispatch binding a ring; what else it binds, and what the UPLOAD ones hold.
-void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash)
+void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash, uint32_t groups_x, uint32_t groups_y,
+    uint32_t groups_z)
 {
     if (!cmd_list || !g_ring_count.load(std::memory_order_relaxed) || Mode() == 0) return;
     const uint32_t frame = g_frame_id;
@@ -658,10 +711,11 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
         }
     }
 
-    uint64_t ring_va = 0, ring_bytes = 0;
-    int      ring_mod = -1;
-    bool     sample = false;
-    uint32_t section = 0;
+    uint64_t        ring_va = 0, ring_bytes = 0;
+    int             ring_mod = -1;
+    bool            sample = false, first_hit = false;
+    uint32_t        section = 0;
+    const Bound*    ring_bind = nullptr;
     {
         std::lock_guard l(g_m);
         for (const Bound& b : bound)
@@ -670,9 +724,12 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
                     ring_va = r->va;
                     ring_bytes = r->bytes;
                     ring_mod = r->mod;
+                    ring_bind = &b;
                     break;
                 }
+        const uint32_t hits_before = g_judge.Hits(cs_hash);
         g_judge.Verdict(cs_hash, ring_va != 0);
+        first_hit = ring_va && hits_before == 0;
         if (ring_va) {
             auto it = g_samples.find({ cs_hash, ring_va });
             if (it == g_samples.end() && g_samples.size() < kMaxSampleKeys)
@@ -693,7 +750,19 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
     QueryPerformanceFrequency(&fq);
     if (fq.QuadPart) g_c.inspect_us.fetch_add(uint64_t((t1.QuadPart - t0.QuadPart) * 1000000 / fq.QuadPart), std::memory_order_relaxed);
     if (!ring_va) return;
+    if (first_hit) DumpShader(cs_hash);
     g_c.ring_dispatches.fetch_add(1, std::memory_order_relaxed);
+    // Does this dispatch WRITE the ring? Evidence: the ring's resource was transitioned to UNORDERED_ACCESS on
+    // this list (this frame or the previous one), and/or the core's last tracked state for it includes UAV.
+    bool barrier_uav = false, state_uav = false;
+    if (ring_bind && ring_bind->res) {
+        const uint64_t rh = reinterpret_cast<uint64_t>(ring_bind->res);
+        if (const CmdBlock* blk = g_cmd_blocks.get(reinterpret_cast<uintptr_t>(cmd_list)))
+            for (const UavNote& n : blk->uav_recent)
+                if (n.res == rh && n.frame + 1 >= g_frame_id) barrier_uav = true;
+        const uint32_t st = ResourceStateOf(ring_bind->res);
+        state_uav = st != MigotoPort::kResStateUnknown && (st & uint32_t(resource_usage::unordered_access)) != 0;
+    }
     if (!sample) return;
     g_c.pal_records.fetch_add(1, std::memory_order_relaxed);
 
@@ -727,9 +796,12 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
     });
 
     g_log.Line(false,
-        "RTPAL cs=%016llx ring=%llx mod=%d section=%u bound=%zu readable=%llu (UPLOAD heap only, CPU-mapped at record time; "
-        "root CBVs = this recording's most recent per param; section = dispatch order within the frame)",
-        (unsigned long long)cs_hash, (unsigned long long)ring_va, ring_mod, section, seen.size(),
+        "RTPAL cs=%016llx ring=%llx mod=%d section=%u groups=%u,%u,%u ring_at=%s%u.%u ring_uav_barrier=%d ring_state_uav=%d bound=%zu "
+        "readable=%llu (UPLOAD heap only, CPU-mapped at record time; root CBVs = this recording's most recent per param; section "
+        "= dispatch order within the frame)",
+        (unsigned long long)cs_hash, (unsigned long long)ring_va, ring_mod, section, groups_x, groups_y, groups_z,
+        ring_bind ? (ring_bind->kind == 3 ? "tbl" : ring_bind->kind == 2 ? "uav" : "srv") : "?", ring_bind ? ring_bind->param : 0u,
+        ring_bind ? ring_bind->slot : 0u, barrier_uav ? 1 : 0, state_uav ? 1 : 0, seen.size(),
         (unsigned long long)std::count_if(seen.begin(), seen.end(), [](const Seen& s) { return !s.bytes.empty(); }));
     static const char* kKind[] = { "cbv", "srv", "uav", "tbl" };
     uint32_t           lines = 0, unlisted = 0;

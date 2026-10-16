@@ -4,6 +4,7 @@
 #include "../mods/shader_alias.h" // AliasShaderHashAlways -- shader identity is registered at creation
 #include "../hud/uid_hide.h"
 #include "../../src/dxil_cb.h"    // DxilCbuffers -- the VS's declared cbuffer sizes, from the DXIL metadata
+#include "../rt/rt_hooks.h"      // RtNoteShader
 #include <array>
 
 static std::unordered_map<uint64_t, DxilSrvRegs> g_pipeline_ps_regs;
@@ -312,6 +313,7 @@ void on_init_pipeline(device*, pipeline_layout layout, uint32_t subobject_count,
     if (vs_code) CacheShaderBytecode(vs_hash, vs_code, vs_size, "vs");
     if (ps_code) CacheShaderBytecode(ps_hash, ps_code, ps_size, "ps");
     if (cs_code) CacheShaderBytecode(cs_hash, cs_code, cs_size, "cs");
+    if (cs_code) RtNoteShader(cs_hash, cs_code, cs_size); // RT module: kept for the ring dispatches' disassembly
     if (g_debug && vs_hash) { // log every distinct VS input layout (capped) -- incl. the depth VS
         static std::set<uint64_t> s_il_seen;
         bool                      fresh;
