@@ -486,9 +486,30 @@ void RtPresentTick()
                         Utf8(wc.tail).c_str(), wc.match_first_index, wc.match_index_count, wc.vg_offset, wc.vg_count, wc.remapped ? 1 : 0,
                         wc.remap_id, wc.remap_vg, draws.c_str());
                 }
-                for (const WwmiMod::Resource& r : mod.resources)
+                for (const WwmiMod::Resource& r : mod.resources) {
                     g_log.Line(true, "    res %s stride=%u size=%u va=%llx file=%s", Utf8(r.name).c_str(), r.stride, r.size,
                         (unsigned long long)r.gpu_va, Utf8(r.filename).c_str());
+                    // the first bytes of each mesh buffer (to confirm formats), when it lives in an UPLOAD heap
+                    if (r.res && r.gpu_va && r.size && r.stride) {
+                        D3D12_HEAP_PROPERTIES hp = {};
+                        D3D12_HEAP_FLAGS      hf = {};
+                        const bool            ok = SUCCEEDED(r.res->GetHeapProperties(&hp, &hf));
+                        uint32_t              w[12] = {};
+                        const uint32_t        n = ok && hp.Type == D3D12_HEAP_TYPE_UPLOAD ? GuardedPrivateRead(r.res, r.gpu_va, reinterpret_cast<uint8_t*>(w), sizeof w) : 0;
+                        g_log.Line(true, "      heap=%d read=%u head=%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", ok ? int(hp.Type) : -1, n, w[0],
+                            w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11]);
+                    }
+                    if (!r.filename.empty() && r.stride) { // the same from the file the engine loaded
+                        uint32_t fw[12] = {};
+                        size_t   fn = 0;
+                        if (FILE* f = _wfsopen(r.filename.c_str(), L"rb", _SH_DENYNO)) {
+                            fn = fread(fw, 1, sizeof fw, f);
+                            fclose(f);
+                        }
+                        g_log.Line(true, "      file read=%zu head=%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", fn, fw[0], fw[1], fw[2], fw[3],
+                            fw[4], fw[5], fw[6], fw[7], fw[8], fw[9], fw[10], fw[11]);
+                    }
+                }
             }
             for (size_t i = 0; i < g_merged_comps.size() && i < 96; ++i) {
                 const MergedComp& c = g_merged_comps[i];
@@ -601,6 +622,64 @@ void LogPassThroughDraw(const RtClaimInfo& in)
         }
     }
     g_log.Line(true, "  roots:%s", roots.c_str());
+    // The VS's registers through the layout's register map: t0..t3 (UE's manual vertex fetch buffers) with the view
+    // the game put there, and b0..b4 (b2 = LocalVF: VertexFetch_Parameters) with b2's bytes.
+    {
+        const uint64_t layh = CmdGfxLayout(in.cmd_list);
+        RegBind        t_vs[4], b_vs[5];
+        bool           have = false;
+        {
+            std::lock_guard l(g_layout_regmap_mtx);
+            auto            it = g_layout_regmap.find(layh);
+            if (it != g_layout_regmap.end() && it->second.built) {
+                memcpy(t_vs, it->second.t_vs, sizeof t_vs);
+                memcpy(b_vs, it->second.b_vs, sizeof b_vs);
+                have = true;
+            }
+        }
+        if (!have)
+            g_log.Line(true, "  vs registers: no register map for layout %llx", (unsigned long long)layh);
+        else {
+            device* dv = in.cmd_list->get_device();
+            for (unsigned r = 0; r < 4; ++r) {
+                const RegBind& b = t_vs[r];
+                if (b.param == 0xFF || b.param >= 64) continue;
+                if (!b.is_table) {
+                    g_log.Line(true, "  vs t%u: root p%u va=%llx", r, b.param, (unsigned long long)st.root[b.param].va);
+                    continue;
+                }
+                const TableStart ts = TableStartOf(dv, st.root[b.param].table);
+                ResInfo          ri{};
+                if (!ts || !g_heap_to_res.find({ ts.heap, ts.base + b.offset }, ri)) {
+                    g_log.Line(true, "  vs t%u: table p%u+%u (slot not tracked)", r, b.param, b.offset);
+                    continue;
+                }
+                const resource_view_desc vd = ri.view_handle ? dv->get_resource_view_desc(resource_view{ ri.view_handle }) : resource_view_desc{};
+                bool ring = false;
+                {
+                    std::lock_guard l(g_m);
+                    ring = ri.cached_va && g_reg.IsSkinOut(ri.cached_va, 1);
+                }
+                g_log.Line(true, "  vs t%u: table p%u+%u res=%llx bytes=%u buffer=%d view type=%u fmt=%u raw_off=%llu raw_size=%llu%s", r, b.param,
+                    b.offset, (unsigned long long)ri.cached_va, ri.size, ri.is_buffer ? 1 : 0, uint32_t(vd.type), uint32_t(vd.format),
+                    (unsigned long long)vd.buffer.offset, (unsigned long long)vd.buffer.size, ring ? " (ring)" : "");
+            }
+            for (unsigned r = 0; r < 5; ++r) {
+                const RegBind& b = b_vs[r];
+                if (b.param == 0xFF || b.param >= 64) continue;
+                if (b.is_table) {
+                    g_log.Line(true, "  vs b%u: table p%u+%u", r, b.param, b.offset);
+                    continue;
+                }
+                const RootCbvBind& rc = cb.binds[b.param];
+                uint32_t           w[8] = {};
+                uint32_t           n = 0;
+                if (rc.res && rc.va && BufferLive(rc.res)) n = GuardedSnapshot(rc.res, rc.va, reinterpret_cast<uint8_t*>(w), sizeof w);
+                g_log.Line(true, "  vs b%u: root p%u va=%llx size=%u read=%u words=%08x %08x %08x %08x %08x %08x %08x %08x", r, b.param,
+                    (unsigned long long)rc.va, rc.size, n, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            }
+        }
+    }
     // small root CBVs in full (LocalVF / Primitive uniform buffers): 256 bytes each, priority bins
     std::vector<uint8_t> buf(256);
     for (uint32_t p = 0; p < 64; ++p) {
