@@ -511,7 +511,8 @@ Slot* CachedPose(Mesh& m, int comp, uint32_t frame) // g_m held
     const auto it = m.poses.find(comp);
     if (it == m.poses.end()) return nullptr;
     const Pose& p = it->second.first;
-    if (p.slot < 0 || size_t(p.slot) >= m.slots.size() || p.frame >= frame || frame - p.frame > kCachedPose) return nullptr;
+    // a pose from this very frame (another list's) will do as well: same palette
+    if (p.slot < 0 || size_t(p.slot) >= m.slots.size() || p.frame > frame || frame - p.frame > kCachedPose) return nullptr;
     return &m.slots[size_t(p.slot)];
 }
 
@@ -566,6 +567,34 @@ uint64_t RingKey(uint64_t va)
     std::lock_guard l(g_m);
     const uint64_t  key = FindRingKey(va);
     return key && g_frame_id - g_rings[key].frame <= kStartForget ? key : 0;
+}
+
+std::string Explain(uint64_t va, int comp, int mod)
+{
+    std::lock_guard l(g_m);
+    const uint32_t  frame = g_frame_id;
+    char            b[512];
+    const uint64_t  key = FindRingKey(va);
+    if (!key) {
+        snprintf(b, sizeof b, "va=%llx: in no recorded ring (%zu rings)", (unsigned long long)va, g_rings.size());
+        return b;
+    }
+    const RingSecs& r = g_rings[key];
+    std::string     starts;
+    for (const auto& [st, rec] : r.by_start) starts += " " + std::to_string(st) + "@-" + std::to_string(frame - rec.frame);
+    const auto  lm = g_mod_layout.find(mod);
+    std::string lay = lm == g_mod_layout.end() ? std::string(" none") : std::string();
+    if (lm != g_mod_layout.end())
+        for (uint32_t st : lm->second) lay += " " + std::to_string(st);
+    std::string pose = "none";
+    const auto  mi = g_meshes.find(mod);
+    if (mi != g_meshes.end()) {
+        const auto pi = mi->second.poses.find(comp);
+        if (pi != mi->second.poses.end()) pose = "slot " + std::to_string(pi->second.first.slot) + " @-" + std::to_string(int64_t(frame) - pi->second.first.frame);
+    }
+    snprintf(b, sizeof b, "ring %llx (va %llx) last dispatch @-%u expected=%u starts(age):%s | mod layout:%s | last pose: %s",
+        (unsigned long long)key, (unsigned long long)va, frame - r.frame, r.expected, starts.c_str(), lay.c_str(), pose.c_str());
+    return b;
 }
 
 bool MeshFailed(int mod)

@@ -45,5 +45,6 @@ void PresentTick(); // loads requested meshes, retires bindings
 VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* cl, int mod, int comp, uint32_t c, uint32_t s2);
 
 std::string Status(); // one line for RTSUM / the overlay
+std::string Explain(uint64_t va, int comp, int mod); // why a section of this ring is (not) usable: for the held lines
 
 } // namespace rtskin

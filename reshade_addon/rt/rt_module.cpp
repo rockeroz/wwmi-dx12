@@ -880,7 +880,14 @@ bool RtClaimNote(const RtClaimInfo& in)
         else if (rtskin::PoseCached(in.mod, in.comp)) ring = key ? key : vb0; // our last pose of it
         else if (!key && !reg_ring) why = "VB0 is not a skin cache ring the module saw posed, and no earlier pose";
         else why = "no complete skin cache layout / palette for this section this frame, and no earlier pose";
-        if (why) NoteHeld(in.mod, in.comp, why);
+        if (why) {
+            NoteHeld(in.mod, in.comp, why);
+            // the first holds in detail (what the module knew of the ring at that moment)
+            static std::atomic<uint32_t> s_detail{ 0 };
+            if (!strstr(why, "not loaded") && s_detail.fetch_add(1, std::memory_order_relaxed) < 400)
+                g_log.Line(true, "RTM2 held detail mod=%d comp=%d vb0=%llx reg_ring=%llx: %s -- %s", in.mod, in.comp, (unsigned long long)vb0,
+                    (unsigned long long)reg_ring, why, rtskin::Explain(vb0, in.comp, in.mod).c_str());
+        }
         if (!why) {
             {
                 rtskin::ClaimCtx c;
