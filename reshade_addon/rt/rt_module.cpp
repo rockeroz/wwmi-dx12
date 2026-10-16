@@ -60,7 +60,7 @@ std::atomic<uint64_t> g_sig_rings{ 0 }, g_rt_draws{ 0 }; // rings learned from a
 struct Counters {
     std::atomic<uint64_t> blas_builds{ 0 }, blas_bottom{ 0 }, rays{ 0 }, claims{ 0 }, claims_identified{ 0 }, claims_held{ 0 },
         ring_dispatches{ 0 }, pal_records{ 0 }, snapshots{ 0 }, snapshot_upload{ 0 }, snapshot_faults{ 0 }, bins{ 0 },
-        bin_bytes{ 0 }, inspect_us{ 0 }, dropped_lines{ 0 }, dropped_bins{ 0 }, unstamped{ 0 };
+        bin_bytes{ 0 }, inspect_us{ 0 }, dropped_lines{ 0 }, dropped_bins{ 0 }, unstamped{ 0 }, skin_records{ 0 };
     std::atomic<uint32_t> best_bone_run{ 0 };
     std::atomic<uint64_t> best_bone_cs{ 0 };
     std::atomic<uint32_t> best_bone_param{ 0 };
@@ -159,7 +159,7 @@ public:
     {
         std::lock_guard l(m_);
         if (priority) {
-            if (prio_files_ >= 256 || prio_bytes_ + n > (48ull << 20)) {
+            if (prio_files_ >= 3000 || prio_bytes_ + n > (96ull << 20)) {
                 g_c.dropped_bins.fetch_add(1, std::memory_order_relaxed);
                 return {};
             }
@@ -268,7 +268,7 @@ void Summary()
     g_log.Line(true,
         "RTSUM active=%d blas=%llu bottom=%llu rays=%llu claims=%llu identified=%llu held=%llu ring_dispatches=%llu "
         "pal_records=%llu snapshots=%llu upload=%llu faults=%llu bins=%llu dropped_lines=%llu dropped_bins=%llu "
-        "unstamped=%llu best_bone_run=%u (cs=%016llx param=%u) inspect_us=%llu components=%zu sig_rings=%llu rt_draws=%llu rings=%u:%s",
+        "unstamped=%llu best_bone_run=%u (cs=%016llx param=%u) inspect_us=%llu components=%zu sig_rings=%llu rt_draws=%llu skin_records=%llu rings=%u:%s",
         RtActive() ? 1 : 0, (unsigned long long)g_c.blas_builds.load(), (unsigned long long)g_c.blas_bottom.load(),
         (unsigned long long)g_c.rays.load(), (unsigned long long)g_c.claims.load(), (unsigned long long)g_c.claims_identified.load(),
         (unsigned long long)g_c.claims_held.load(), (unsigned long long)g_c.ring_dispatches.load(),
@@ -277,7 +277,8 @@ void Summary()
         (unsigned long long)g_c.bins.load(), (unsigned long long)g_c.dropped_lines.load(), (unsigned long long)g_c.dropped_bins.load(),
         (unsigned long long)g_c.unstamped.load(), g_c.best_bone_run.load(), (unsigned long long)g_c.best_bone_cs.load(),
         g_c.best_bone_param.load(), (unsigned long long)g_c.inspect_us.load(), g_comps_n.load(),
-        (unsigned long long)g_sig_rings.load(), (unsigned long long)g_rt_draws.load(), g_ring_count.load(), rings.c_str());
+        (unsigned long long)g_sig_rings.load(), (unsigned long long)g_rt_draws.load(), (unsigned long long)g_c.skin_records.load(),
+        g_ring_count.load(), rings.c_str());
 }
 
 uint64_t BufferVa(resource res, uint64_t offset) // ReShade DX12: a null resource carries the VA in `offset`
@@ -382,6 +383,13 @@ std::unordered_map<uint64_t, std::vector<uint8_t>> g_cs_code;
 uint64_t                                         g_cs_code_bytes = 0;
 constexpr uint64_t                               kCsCodeCap = 64ull << 20;
 std::set<uint64_t>                               g_cs_dumped; // g_shader_m
+std::set<uint64_t>                               g_skin_cs;   // g_shader_m: entry point SkinCacheUpdateBatchCS (UE GPU skin cache)
+
+bool IsSkinCs(uint64_t cs)
+{
+    std::lock_guard l(g_shader_m);
+    return g_skin_cs.count(cs) != 0;
+}
 
 void DumpShader(uint64_t cs_hash) // any thread; once per hash
 {
@@ -463,8 +471,8 @@ void RtPresentTick()
             for (size_t i = 0; i < g_merged_comps.size() && i < 96; ++i) {
                 const MergedComp& c = g_merged_comps[i];
                 const std::string ns = c.mod_id >= 0 && size_t(c.mod_id) < g_geomods.size() ? Utf8(g_geomods[c.mod_id].wcl_ns) : std::string();
-                g_log.Line(true, "  mod=%d comp=%d first=%u count=%u hide=%d ns=%s", c.mod_id, c.comp_idx, c.first_index, c.match_count,
-                    c.hide ? 1 : 0, ns.c_str());
+                g_log.Line(true, "  mod=%d comp=%d first=%u count=%u remap_bones=%d hide=%d ns=%s", c.mod_id, c.comp_idx, c.first_index,
+                    c.match_count, c.remap_size, c.hide ? 1 : 0, ns.c_str());
             }
             std::lock_guard l(g_m);
             g_comps.swap(comps);
@@ -665,6 +673,9 @@ void RtNoteShader(uint64_t cs_hash, const void* code, size_t code_size)
     const auto* p = static_cast<const uint8_t*>(code);
     g_cs_code.emplace(cs_hash, std::vector<uint8_t>(p, p + code_size));
     g_cs_code_bytes += code_size;
+    // The entry name is stored as plain text in the container's PSV0 string table.
+    static const char kSkin[] = "SkinCacheUpdateBatchCS";
+    if (std::search(p, p + code_size, kSkin, kSkin + sizeof kSkin - 1) != p + code_size) g_skin_cs.insert(cs_hash);
 }
 
 // RTPAL (observe): a dispatch binding a ring; what else it binds, and what the UPLOAD ones hold.
@@ -678,6 +689,7 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
         std::lock_guard l(g_m);
         if (!g_judge.ShouldInspect(cs_hash, gen, frame)) return;
     }
+    const bool is_skin = IsSkinCs(cs_hash); // g_shader_m, never under g_m
     LARGE_INTEGER t0, t1, fq;
     QueryPerformanceCounter(&t0);
 
@@ -687,7 +699,8 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
         uint64_t        va;
         uint32_t        size;
         ID3D12Resource* res;
-        uint32_t        age = 0; // table slots: frames since the descriptor was written
+        uint32_t        age = 0;  // table slots: frames since the descriptor was written
+        uint64_t        view = 0; // table slots: the descriptor's view handle
     };
     std::vector<Bound> bound;
     bound.reserve(96);
@@ -707,7 +720,7 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
         for (uint32_t i = 0; i < 32; ++i) {
             ResInfo ri;
             if (!g_heap_to_res.find({ ts.heap, ts.base + i }, ri)) continue;
-            if (ri.is_buffer && ri.cached_va) bound.push_back({ 3u, p, i, ri.cached_va, ri.size, ri.res, frame - ri.wrote_frame });
+            if (ri.is_buffer && ri.cached_va) bound.push_back({ 3u, p, i, ri.cached_va, ri.size, ri.res, frame - ri.wrote_frame, ri.view_handle });
         }
     }
 
@@ -741,8 +754,9 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
                     s.in_frame = 0;
                 }
                 section = s.in_frame++;
-                sample = section < kSectionsPerFrame;
-                if (sample) ++s.records;
+                // Skin cache: every section on observation frames. Anything else binding a ring: two records only.
+                sample = is_skin ? section < 48u : (section < kSectionsPerFrame && s.records < 2);
+                if (sample && s.in_frame == 1) ++s.records;
             }
         }
     }
@@ -762,6 +776,68 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
                 if (n.res == rh && n.frame + 1 >= g_frame_id) barrier_uav = true;
         const uint32_t st = ResourceStateOf(ring_bind->res);
         state_uav = st != MigotoPort::kResStateUnknown && (st & uint32_t(resource_usage::unordered_access)) != 0;
+    }
+    if (sample && is_skin) {
+        // RTSKIN: UE's GPU skin cache, one dispatch per mesh section. Every table slot with its VIEW range (the
+        // bone matrices are a typed view into a shared per-frame upload buffer: the view offset IS the section's
+        // palette), the UPLOAD ones read at that range; root CBVs read in full up to 256 bytes ($Globals carries the
+        // section's start/count/offsets). All bins go to the priority budget.
+        g_c.skin_records.fetch_add(1, std::memory_order_relaxed);
+        g_log.Line(false, "RTSKIN cs=%016llx ring=%llx mod=%d section=%u groups=%u (x64 threads = %u vertices max) ring_at=%s%u.%u",
+            (unsigned long long)cs_hash, (unsigned long long)ring_va, ring_mod, section, groups_x, groups_x * 64u,
+            ring_bind ? (ring_bind->kind == 3 ? "tbl" : "root") : "?", ring_bind ? ring_bind->param : 0u, ring_bind ? ring_bind->slot : 0u);
+        device* dv = cmd_list->get_device();
+        std::vector<uint8_t> sbuf(kSnapBytes);
+        for (const Bound& b : bound) {
+            const bool is_ring = rtm::Overlaps(b.va, b.size ? b.size : 1, ring_va, ring_bytes);
+            if (b.kind == 3) {
+                if ((b.age > 2 || b.slot >= 16) && !is_ring) continue; // stale or far slot of a bindless table
+                const resource_view_desc vd = b.view ? dv->get_resource_view_desc(resource_view{ b.view }) : resource_view_desc{};
+                const uint32_t           elem = vd.format != format::unknown ? format_row_pitch(vd.format, 1) : 0u;
+                const bool               structured = vd.type == resource_view_type::buffer && vd.format == format::unknown && vd.buffer.structured.stride;
+                // ReShade's pinned D3D12 conversion keeps FirstElement / NumElements for typed and raw views.
+                uint64_t off = 0, bytes = 0;
+                if (structured) {
+                    off = vd.buffer.offset * vd.buffer.structured.stride;
+                    bytes = uint64_t(vd.buffer.structured.count) * vd.buffer.structured.stride;
+                } else if (elem) {
+                    off = vd.buffer.offset * elem;
+                    bytes = vd.buffer.size == UINT64_MAX ? 0 : vd.buffer.size * elem;
+                }
+                std::string queued;
+                uint32_t    n = 0;
+                rtm::BoneRun run;
+                if (!is_ring && b.res && BufferLive(b.res) && off < b.size) {
+                    const uint32_t want = uint32_t((std::min)(bytes ? bytes : uint64_t(kSnapBytes), uint64_t(kSnapBytes)));
+                    n = GuardedPrivateRead(b.res, b.va + off, sbuf.data(), want);
+                    if (n) {
+                        run = rtm::BestBoneRun(sbuf.data(), n);
+                        char name[160];
+                        snprintf(name, sizeof name, "skin_f%u_cs%016llx_r%llx_s%u_tbl%u_%u.bin", frame, (unsigned long long)cs_hash,
+                            (unsigned long long)ring_va, section, b.param, b.slot);
+                        queued = g_log.Bin(name, sbuf.data(), n, true);
+                    }
+                }
+                g_log.Line(false, "  tbl p%u s%u va=%llx res_bytes=%u view type=%u fmt=%u raw_off=%llu raw_size=%llu elem=%u -> off=%llu bytes=%llu%s read=%u bone_run=%u@%u %s",
+                    b.param, b.slot, (unsigned long long)b.va, b.size, uint32_t(vd.type), uint32_t(vd.format), (unsigned long long)vd.buffer.offset,
+                    (unsigned long long)vd.buffer.size, elem, (unsigned long long)off, (unsigned long long)bytes, is_ring ? " <RING" : "", n,
+                    run.count, run.offset, queued.empty() ? "" : queued.c_str());
+            } else if (b.kind == 0 && b.res && BufferLive(b.res)) {
+                const uint32_t want = b.size && b.size < 256 ? b.size : 256;
+                const uint32_t n = GuardedSnapshot(b.res, b.va, sbuf.data(), want);
+                if (!n) continue;
+                uint32_t w[8] = {};
+                memcpy(w, sbuf.data(), n < sizeof w ? n : sizeof w);
+                char name[160];
+                snprintf(name, sizeof name, "skin_f%u_cs%016llx_r%llx_s%u_cbv%u.bin", frame, (unsigned long long)cs_hash,
+                    (unsigned long long)ring_va, section, b.param);
+                const std::string queued = g_log.Bin(name, sbuf.data(), n, true);
+                g_log.Line(false, "  cbv p%u va=%llx size=%u read=%u words=%08x %08x %08x %08x %08x %08x %08x %08x %s", b.param,
+                    (unsigned long long)b.va, b.size, n, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], queued.c_str());
+            } else if (b.kind != 0)
+                g_log.Line(false, "  %s p%u va=%llx%s", b.kind == 2 ? "uav" : "srv", b.param, (unsigned long long)b.va, is_ring ? " <RING" : "");
+        }
+        return;
     }
     if (!sample) return;
     g_c.pal_records.fetch_add(1, std::memory_order_relaxed);
