@@ -1306,7 +1306,7 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
     const uint32_t  frame = g_frame_id;
     std::lock_guard l(g_m3_m);
     bool            any = false;
-    for (const auto& [game, mb] : g_m3) any = any || (mb.ok && mb.contrib != UINT32_MAX);
+    for (const auto& [game, mb] : g_m3) any = any || mb.ok || int32_t(frame - mb.patched) <= int32_t(kM3Window);
     if (!any) return;
     ID3D12Resource* rd = nullptr;
     uint64_t        rd_va = 0;
@@ -1339,6 +1339,7 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
             memcpy(&as, inst + 56, 8);
             const uint32_t contrib = inst[52] | inst[53] << 8 | inst[54] << 16;
             const int      sig = inst[51] << 8 | inst[55];
+            mb.contrib = contrib; // (RTSUM)
             if (as == ours) {
                 // that TLAS names our BLAS here: these records must name our buffers
                 if (!src || !M3Records(mb, rd, rd_va, hit_size, hit_stride, contrib, true)) {
