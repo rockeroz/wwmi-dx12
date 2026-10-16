@@ -113,9 +113,10 @@ void on_init_resource(device*, const resource_desc& desc, const subresource_data
     }
 }
 
-bool on_copy_buffer_region(command_list*, resource, uint64_t, resource dest, uint64_t dest_offset, uint64_t size)
+bool on_copy_buffer_region(command_list* cmd_list, resource source, uint64_t source_offset, resource dest, uint64_t dest_offset, uint64_t size)
 {
     PROF(PROF_CopyBufRegion);
+    RtNoteCopy(cmd_list, source, source_offset, dest, dest_offset, size); // RT M3: where the shader tables come from
     if (!dest.handle || !size) return false;
     if (const uint64_t va = reinterpret_cast<ID3D12Resource*>(dest.handle)->GetGPUVirtualAddress())
         IbHash::ForgetRange(va + dest_offset, size); // a mesh streamed over this region replaces the hashes taken inside it

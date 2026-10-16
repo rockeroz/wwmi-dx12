@@ -569,6 +569,17 @@ std::mutex                   g_as_m; // the three below
 std::map<uint64_t, CharBlas> g_char_blas; // BLAS dest VA -> what it was built from
 std::vector<CharInst>        g_char_inst;  // the last TLAS's instances naming one
 uint32_t                     g_tlas_logged = 0, g_rays_logged = 0;
+std::atomic<bool>            g_have_char_inst{ false };
+
+// Buffer copies into DEFAULT memory (the shader tables live there): where each region was filled from.
+struct CopyRec {
+    uint64_t        dst_va = 0, size = 0, src_va = 0;
+    ID3D12Resource* src = nullptr;
+    uint32_t        frame = 0;
+};
+std::mutex g_copy_m;
+CopyRec    g_copies[256];
+uint32_t   g_copy_next = 0;
 
 // The buffer holding a GPU address (resource handle when ReShade gave one, else the core's address map).
 bool ResOfVa(resource r, uint64_t off, ID3D12Resource** res, uint64_t* va)
@@ -643,7 +654,10 @@ void ObserveTlas(acceleration_structure_build_flags flags, const acceleration_st
                 (unsigned long long)as, ci.id, ci.mask, ci.contrib, ci.flags, t[3], t[7], t[11]);
     }
     g_log.Line(true, "  %zu instance(s) name a mod character's BLAS (of %u read)", hits.size(), got / 64);
-    if (!hits.empty()) g_char_inst = hits;
+    if (!hits.empty()) {
+        g_char_inst = hits;
+        g_have_char_inst.store(true, std::memory_order_relaxed);
+    }
 }
 
 void ObserveRays(resource rg_res, uint64_t rg_off, uint64_t rg_size, resource miss_res, uint64_t miss_off, uint64_t miss_size,
@@ -671,7 +685,28 @@ void ObserveRays(resource rg_res, uint64_t rg_off, uint64_t rg_size, resource mi
         frame, w, h, d, (unsigned long long)rg_va, (unsigned long long)rg_size, HeapTypeOf(rg), (unsigned long long)ms_va,
         (unsigned long long)miss_size, (unsigned long long)miss_stride, HeapTypeOf(ms), (unsigned long long)hg_va, (unsigned long long)hit_size,
         (unsigned long long)hit_stride, have_hit ? hheap : -2);
-    if (!have_hit || !hit_stride || hheap != int(D3D12_HEAP_TYPE_UPLOAD)) return;
+    if (!have_hit || !hit_stride) return;
+    // where the records can be read: the table itself (UPLOAD), or the UPLOAD buffer a copy filled it from
+    ID3D12Resource* rd = hheap == int(D3D12_HEAP_TYPE_UPLOAD) ? hg : nullptr;
+    uint64_t        rd_va = hg_va;
+    if (!rd) {
+        CopyRec c{};
+        {
+            std::lock_guard l(g_copy_m);
+            for (const CopyRec& r : g_copies)
+                if (r.src && hg_va >= r.dst_va && hg_va + hit_size <= r.dst_va + r.size && frame - r.frame <= 2 && r.frame >= c.frame) c = r;
+        }
+        if (!c.src) {
+            g_log.Line(true, "  hit table: no buffer copy filled it (in the last 2 frames) -- records not readable");
+            return;
+        }
+        const int sheap = HeapTypeOf(c.src);
+        g_log.Line(true, "  hit table filled by a copy of %llu bytes from %llx (heap %d) at f%u", (unsigned long long)c.size,
+            (unsigned long long)c.src_va, sheap, c.frame);
+        if (sheap != int(D3D12_HEAP_TYPE_UPLOAD)) return;
+        rd = c.src;
+        rd_va = c.src_va + (hg_va - c.dst_va);
+    }
     std::set<uint32_t> done;
     for (const CharInst& ci : insts) {
         if (!done.insert(ci.contrib).second || done.size() > 3) continue;
@@ -682,7 +717,7 @@ void ObserveRays(resource rg_res, uint64_t rg_off, uint64_t rg_size, resource mi
         }
         const uint32_t       want = uint32_t((std::min)(hit_size - first, uint64_t(64) * hit_stride));
         std::vector<uint8_t> rec(want);
-        const uint32_t       got = GuardedPrivateRead(hg, hg_va + first, rec.data(), want);
+        const uint32_t       got = GuardedPrivateRead(rd, rd_va + first, rec.data(), want);
         if (!got) continue;
         char name[96];
         snprintf(name, sizeof name, "sbt_f%u_contrib%u_stride%llu.bin", frame, ci.contrib, (unsigned long long)hit_stride);
@@ -733,6 +768,19 @@ bool RtModulePresent()
 bool RtHoldVanilla()
 {
     return RtActive() && Mode() == 1; // M2 holds per draw (RtClaimNote), never the whole frame
+}
+
+void RtNoteCopy(command_list*, resource src, uint64_t src_off, resource dst, uint64_t dst_off, uint64_t size)
+{
+    if (Mode() != 2 || !g_have_char_inst.load(std::memory_order_relaxed) || size < 256 || size > (8ull << 20) || !src.handle) return;
+    CopyRec r;
+    r.dst_va = BufferVa(dst, dst_off);
+    r.size = size;
+    r.src = reinterpret_cast<ID3D12Resource*>(src.handle);
+    r.src_va = BufferVa(src, src_off);
+    r.frame = g_frame_id;
+    std::lock_guard l(g_copy_m);
+    g_copies[g_copy_next++ & 255] = r;
 }
 
 void RtNoteRays(command_list*, resource rg_res, uint64_t rg_off, uint64_t rg_size, resource miss_res, uint64_t miss_off,
