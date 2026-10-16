@@ -48,7 +48,10 @@ bool RtHoldVanilla()
 {
     return false;
 }
-void RtNoteRays() {}
+void RtNoteRays(reshade::api::command_list*, reshade::api::resource, uint64_t, uint64_t, reshade::api::resource, uint64_t, uint64_t,
+    uint64_t, reshade::api::resource, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t)
+{
+}
 void RtObserveDraw(reshade::api::command_list*, uint32_t, uint32_t, int32_t, uint64_t) {}
 void RtPresentTick() {}
 void RtNoteDrawOutcome(int, int, int) {}

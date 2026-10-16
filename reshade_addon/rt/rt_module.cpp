@@ -554,6 +554,174 @@ void NoteSkinSection(command_list* cmd_list, const CmdState& state, uint64_t cs_
     g_c.sections.fetch_add(1, std::memory_order_relaxed);
 }
 
+// ---- M3 observe: the character's BLAS, the TLAS instances that name it, the hit group records they use ----------
+struct CharBlas {
+    uint64_t              ring = 0;
+    uint32_t              frame = 0, build_flags = 0, mode = 0;
+    std::vector<uint64_t> ibs, vbs;
+    std::vector<uint32_t> tris, verts, flags, index_width;
+};
+struct CharInst {
+    uint32_t index = 0, id = 0, mask = 0, contrib = 0, flags = 0;
+    uint64_t blas = 0;
+};
+std::mutex                   g_as_m; // the three below
+std::map<uint64_t, CharBlas> g_char_blas; // BLAS dest VA -> what it was built from
+std::vector<CharInst>        g_char_inst;  // the last TLAS's instances naming one
+uint32_t                     g_tlas_logged = 0, g_rays_logged = 0;
+
+// The buffer holding a GPU address (resource handle when ReShade gave one, else the core's address map).
+bool ResOfVa(resource r, uint64_t off, ID3D12Resource** res, uint64_t* va)
+{
+    *va = BufferVa(r, off);
+    *res = r.handle ? reinterpret_cast<ID3D12Resource*>(r.handle) : nullptr;
+    if (*res) return true;
+    std::lock_guard l(g_mem_mutex);
+    for (const auto& [base, ri] : g_va_to_res)
+        if (ri.res && *va >= base && *va < base + (ri.size ? ri.size : 1)) {
+            *res = ri.res;
+            return true;
+        }
+    return false;
+}
+int HeapTypeOf(ID3D12Resource* res)
+{
+    D3D12_HEAP_PROPERTIES hp = {};
+    D3D12_HEAP_FLAGS      hf = {};
+    return res && SUCCEEDED(res->GetHeapProperties(&hp, &hf)) ? int(hp.Type) : -1;
+}
+
+void ObserveTlas(acceleration_structure_build_flags flags, const acceleration_structure_build_input& in, resource_view dest,
+    acceleration_structure_build_mode mode)
+{
+    const uint32_t frame = g_frame_id;
+    {
+        std::lock_guard l(g_as_m);
+        if (g_char_blas.empty()) return;
+        const bool want = g_tlas_logged < 6 || (rtm::IsObservationFrame(frame) && g_tlas_logged < 40);
+        if (!want) return;
+        ++g_tlas_logged;
+    }
+    ID3D12Resource* res = nullptr;
+    uint64_t        va = 0;
+    const bool      found = ResOfVa(in.instances.buffer, in.instances.offset, &res, &va);
+    const int       heap = HeapTypeOf(res);
+    const uint32_t  count = in.instances.count;
+    g_log.Line(true, "RTTLAS f=%u instances=%u va=%llx res=%p heap=%d array_of_pointers=%d build_flags=%x mode=%u dest=%llx", frame, count,
+        (unsigned long long)va, (void*)res, found ? heap : -2, in.instances.array_of_pointers ? 1 : 0, uint32_t(flags), uint32_t(mode),
+        (unsigned long long)dest.handle);
+    if (!found || in.instances.array_of_pointers || !count) return;
+    const uint32_t       n = (std::min)(count, 16384u);
+    std::vector<uint8_t> buf(size_t(n) * 64);
+    const uint32_t       got = heap == int(D3D12_HEAP_TYPE_UPLOAD) ? GuardedPrivateRead(res, va, buf.data(), uint32_t(buf.size())) : 0;
+    if (!got) {
+        g_log.Line(true, "  instances not CPU-readable (heap %d): not inspected", heap);
+        return;
+    }
+    std::vector<CharInst> hits;
+    std::lock_guard       l(g_as_m);
+    for (uint32_t i = 0; i < got / 64; ++i) {
+        const uint8_t* d = buf.data() + size_t(i) * 64;
+        uint64_t       as = 0;
+        uint32_t       w12 = 0, w13 = 0;
+        memcpy(&as, d + 56, 8);
+        memcpy(&w12, d + 48, 4);
+        memcpy(&w13, d + 52, 4);
+        if (!g_char_blas.count(as)) continue;
+        CharInst ci;
+        ci.index = i;
+        ci.id = w12 & 0xffffff;
+        ci.mask = w12 >> 24;
+        ci.contrib = w13 & 0xffffff;
+        ci.flags = w13 >> 24;
+        ci.blas = as;
+        hits.push_back(ci);
+        float t[12];
+        memcpy(t, d, 48);
+        if (hits.size() <= 8)
+            g_log.Line(true, "  char instance #%u blas=%llx id=%u mask=%02x hitgroup_contrib=%u flags=%02x translation=(%.2f %.2f %.2f)", i,
+                (unsigned long long)as, ci.id, ci.mask, ci.contrib, ci.flags, t[3], t[7], t[11]);
+    }
+    g_log.Line(true, "  %zu instance(s) name a mod character's BLAS (of %u read)", hits.size(), got / 64);
+    if (!hits.empty()) g_char_inst = hits;
+}
+
+void ObserveRays(resource rg_res, uint64_t rg_off, uint64_t rg_size, resource miss_res, uint64_t miss_off, uint64_t miss_size,
+    uint64_t miss_stride, resource hit_res, uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, uint32_t w, uint32_t h, uint32_t d)
+{
+    const uint32_t        frame = g_frame_id;
+    std::vector<CharInst> insts;
+    std::map<uint64_t, CharBlas> blas;
+    {
+        std::lock_guard l(g_as_m);
+        if (g_char_inst.empty()) return;
+        const bool want = g_rays_logged < 8 || (rtm::IsObservationFrame(frame) && g_rays_logged < 48);
+        if (!want) return;
+        ++g_rays_logged;
+        insts = g_char_inst;
+        blas = g_char_blas;
+    }
+    ID3D12Resource *rg = nullptr, *ms = nullptr, *hg = nullptr;
+    uint64_t        rg_va = 0, ms_va = 0, hg_va = 0;
+    ResOfVa(rg_res, rg_off, &rg, &rg_va);
+    ResOfVa(miss_res, miss_off, &ms, &ms_va);
+    const bool have_hit = ResOfVa(hit_res, hit_off, &hg, &hg_va);
+    const int  hheap = HeapTypeOf(hg);
+    g_log.Line(true, "RTRAYS f=%u %ux%ux%u raygen=%llx/%llu (heap %d) miss=%llx/%llu stride %llu (heap %d) hit=%llx/%llu stride %llu (heap %d)",
+        frame, w, h, d, (unsigned long long)rg_va, (unsigned long long)rg_size, HeapTypeOf(rg), (unsigned long long)ms_va,
+        (unsigned long long)miss_size, (unsigned long long)miss_stride, HeapTypeOf(ms), (unsigned long long)hg_va, (unsigned long long)hit_size,
+        (unsigned long long)hit_stride, have_hit ? hheap : -2);
+    if (!have_hit || !hit_stride || hheap != int(D3D12_HEAP_TYPE_UPLOAD)) return;
+    std::set<uint32_t> done;
+    for (const CharInst& ci : insts) {
+        if (!done.insert(ci.contrib).second || done.size() > 3) continue;
+        const uint64_t       first = uint64_t(ci.contrib) * hit_stride;
+        if (first >= hit_size) {
+            g_log.Line(true, "  instance contrib %u beyond the hit table (%llu records)", ci.contrib, (unsigned long long)(hit_size / hit_stride));
+            continue;
+        }
+        const uint32_t       want = uint32_t((std::min)(hit_size - first, uint64_t(64) * hit_stride));
+        std::vector<uint8_t> rec(want);
+        const uint32_t       got = GuardedPrivateRead(hg, hg_va + first, rec.data(), want);
+        if (!got) continue;
+        char name[96];
+        snprintf(name, sizeof name, "sbt_f%u_contrib%u_stride%llu.bin", frame, ci.contrib, (unsigned long long)hit_stride);
+        g_log.Bin(name, rec.data(), got, true);
+        g_log.Line(true, "  hit records from contrib %u: %u bytes -> %s", ci.contrib, got, name);
+        for (uint32_t r = 0; r < 2 && (r + 1) * hit_stride <= got; ++r) {
+            std::string hex;
+            for (uint32_t o = 0; o < hit_stride && o < 128; o += 4) {
+                uint32_t v;
+                memcpy(&v, rec.data() + r * hit_stride + o, 4);
+                char b[12];
+                snprintf(b, sizeof b, " %08x", v);
+                hex += b;
+            }
+            g_log.Line(true, "    record %u:%s", ci.contrib + r, hex.c_str());
+        }
+        // root arguments that are the character's own buffers (its BLAS's index / vertex buffers)
+        const auto bi = blas.find(ci.blas);
+        uint32_t   matches = 0;
+        for (uint32_t o = 0; o + 8 <= got && matches < 24; o += 8) {
+            uint64_t v;
+            memcpy(&v, rec.data() + o, 8);
+            if (!v || bi == blas.end()) continue;
+            for (size_t g = 0; g < bi->second.ibs.size(); ++g) {
+                const char* what = nullptr;
+                if (v == bi->second.ibs[g]) what = "IB";
+                else if (v == bi->second.vbs[g]) what = "VB";
+                else if (v >= bi->second.ring && v < bi->second.ring + 0x1000000 && bi->second.ring) what = "near ring";
+                if (!what) continue;
+                g_log.Line(true, "    record %u +%u = %llx: geometry %zu %s", ci.contrib + o / uint32_t(hit_stride), o % uint32_t(hit_stride),
+                    (unsigned long long)v, g, what);
+                ++matches;
+                break;
+            }
+        }
+        if (!matches) g_log.Line(true, "    no record holds the character's IB / VB addresses");
+    }
+}
+
 } // namespace
 
 // ==== rt_hooks.h =================================================================================
@@ -567,11 +735,14 @@ bool RtHoldVanilla()
     return RtActive() && Mode() == 1; // M2 holds per draw (RtClaimNote), never the whole frame
 }
 
-void RtNoteRays()
+void RtNoteRays(command_list*, resource rg_res, uint64_t rg_off, uint64_t rg_size, resource miss_res, uint64_t miss_off,
+    uint64_t miss_size, uint64_t miss_stride, resource hit_res, uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, uint32_t w,
+    uint32_t h, uint32_t d)
 {
     if (Mode() == 0) return;
     NoteRtFrame();
     g_c.rays.fetch_add(1, std::memory_order_relaxed);
+    ObserveRays(rg_res, rg_off, rg_size, miss_res, miss_off, miss_size, miss_stride, hit_res, hit_off, hit_size, hit_stride, w, h, d);
 }
 
 void RtPresentTick()
@@ -913,13 +1084,16 @@ bool RtClaimNote(const RtClaimInfo& in)
     return true;
 }
 
-bool RtOnBlasBuild(command_list*, acceleration_structure_type type, acceleration_structure_build_flags,
+bool RtOnBlasBuild(command_list*, acceleration_structure_type type, acceleration_structure_build_flags build_flags,
     uint32_t input_count, const acceleration_structure_build_input* inputs, resource_view dest,
     acceleration_structure_build_mode mode, unsigned long long)
 {
     if (Mode() == 0) return false;
     NoteRtFrame();
     g_c.blas_builds.fetch_add(1, std::memory_order_relaxed);
+    if (type == acceleration_structure_type::top_level && inputs && input_count &&
+        inputs[0].type == acceleration_structure_build_input_type::instances)
+        ObserveTlas(build_flags, inputs[0], dest, mode);
     if (type != acceleration_structure_type::bottom_level || !inputs || !input_count) return false;
     g_c.blas_bottom.fetch_add(1, std::memory_order_relaxed);
     std::vector<rtm::BlasGeom> geoms;
@@ -940,6 +1114,45 @@ bool RtOnBlasBuild(command_list*, acceleration_structure_type type, acceleration
         g.dest = dest.handle;
         g.transformed = t.transform_buffer.handle != 0 || t.transform_offset != 0;
         geoms.push_back(g);
+    }
+    // M3 observe: a BLAS built from a skin cache ring the module poses a mod for
+    if (Mode() == 2 && !geoms.empty()) {
+        const uint64_t ring = rtskin::RingKey(geoms[0].vb);
+        if (ring) {
+            CharBlas cb;
+            cb.ring = ring;
+            cb.frame = g_frame_id;
+            cb.build_flags = uint32_t(build_flags);
+            cb.mode = uint32_t(mode);
+            for (uint32_t i = 0; i < input_count && i < 256; ++i) {
+                if (inputs[i].type != acceleration_structure_build_input_type::triangles) continue;
+                const auto& t = inputs[i].triangles;
+                cb.vbs.push_back(BufferVa(t.vertex_buffer, t.vertex_offset));
+                cb.ibs.push_back((t.index_buffer.handle || t.index_offset) ? BufferVa(t.index_buffer, t.index_offset) : 0);
+                cb.tris.push_back(t.index_count / 3);
+                cb.verts.push_back(t.vertex_count);
+                cb.flags.push_back(uint32_t(inputs[i].flags));
+                cb.index_width.push_back(IndexWidth(t.index_format));
+            }
+            bool fresh = false;
+            {
+                std::lock_guard l(g_as_m);
+                if (g_char_blas.size() > 64) g_char_blas.clear();
+                fresh = !g_char_blas.count(dest.handle);
+                g_char_blas[dest.handle] = cb;
+            }
+            if (fresh) {
+                std::string geo;
+                for (size_t i = 0; i < cb.ibs.size(); ++i) {
+                    char b[96];
+                    snprintf(b, sizeof b, " [%zu: %u tris, %u verts, ib %llx w%u, flags %x]", i, cb.tris[i], cb.verts[i],
+                        (unsigned long long)cb.ibs[i], cb.index_width[i], cb.flags[i]);
+                    geo += b;
+                }
+                g_log.Line(true, "RTBLAS char dest=%llx ring=%llx build_flags=%x mode=%u geometries=%zu%s", (unsigned long long)dest.handle,
+                    (unsigned long long)ring, cb.build_flags, cb.mode, cb.ibs.size(), geo.c_str());
+            }
+        }
     }
     std::vector<rtm::RingEvent>    ev;
     std::vector<rtm::SignatureHit> fresh;

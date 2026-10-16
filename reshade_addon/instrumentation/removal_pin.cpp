@@ -308,16 +308,18 @@ bool on_build_acceleration_structure(reshade::api::command_list* cmd_list, resha
     if (cmd_list) RemovalPin::Ours(reinterpret_cast<const void*>(cmd_list->get_native()), "game-as-build");
     return false;
 }
-bool on_dispatch_rays(reshade::api::command_list* cmd_list, reshade::api::resource, uint64_t, uint64_t, reshade::api::resource,
-    uint64_t, uint64_t, uint64_t, reshade::api::resource, uint64_t, uint64_t, uint64_t, reshade::api::resource,
-    uint64_t, uint64_t, uint64_t, uint32_t width, uint32_t height, uint32_t depth)
+bool on_dispatch_rays(reshade::api::command_list* cmd_list, reshade::api::resource rg_res, uint64_t rg_off, uint64_t rg_size,
+    reshade::api::resource miss_res, uint64_t miss_off, uint64_t miss_size, uint64_t miss_stride, reshade::api::resource hit_res,
+    uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, reshade::api::resource, uint64_t, uint64_t, uint64_t, uint32_t width,
+    uint32_t height, uint32_t depth)
 {
     RtBlockWithoutModule();
     static std::atomic<unsigned long long> s_n{ 0 };
     const unsigned long long               n = s_n.fetch_add(1, std::memory_order_relaxed);
     if (n == 0 || n == 1000 || n == 100000)
         logger::report("RT ACTIVE: DispatchRays #%llu (%u x %u x %u) at frame %u", n + 1, width, height, depth, g_frame_id);
-    RtNoteRays();
+    RtNoteRays(cmd_list, rg_res, rg_off, rg_size, miss_res, miss_off, miss_size, miss_stride, hit_res, hit_off, hit_size, hit_stride,
+        width, height, depth);
     if (cmd_list) RemovalPin::Ours(reinterpret_cast<const void*>(cmd_list->get_native()), "game-dispatch-rays");
     return false;
 }

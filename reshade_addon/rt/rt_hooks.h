@@ -98,7 +98,9 @@ bool RtHoldVanilla();
 void RtObserveDraw(reshade::api::command_list* cmd_list, uint32_t index_count, uint32_t first_index, int32_t vertex_offset,
     uint64_t vs_hash);
 // The game issued DispatchRays (removal_pin.cpp): ray tracing is on even in a frame without a BLAS build.
-void RtNoteRays();
+void RtNoteRays(reshade::api::command_list* cmd_list, reshade::api::resource rg_res, uint64_t rg_off, uint64_t rg_size,
+    reshade::api::resource miss_res, uint64_t miss_off, uint64_t miss_size, uint64_t miss_stride, reshade::api::resource hit_res,
+    uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, uint32_t w, uint32_t h, uint32_t d);
 // Once per frame from the present path, while the add-on is enabled: the module's hold transitions
 // (entering the hold gives every stamped texture slot back to the game) and its periodic work.
 void RtPresentTick();
