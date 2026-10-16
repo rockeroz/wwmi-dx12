@@ -449,6 +449,18 @@ const rtm::CompWindow* CompAt(uint32_t first, uint32_t count) // g_m held
 
 std::atomic<bool> g_palfmt_told{ false };
 
+// M2: why a claim stayed the game's (one line per mod, component and reason; counted in RTSUM's held).
+void NoteHeld(int mod, int comp, const char* why)
+{
+    static std::mutex                                 s_m;
+    static std::set<std::tuple<int, int, const char*>> s_seen;
+    {
+        std::lock_guard l(s_m);
+        if (s_seen.size() >= 512 || !s_seen.insert({ mod, comp, why }).second) return;
+    }
+    g_log.Line(true, "RTM2 held mod=%d comp=%d (drawn by the game, vanilla): %s", mod, comp, why);
+}
+
 // M2: every skin cache dispatch of a ring, every frame -- its bone palette (t0: the view's window into the frame's
 // upload buffer) and its tangent output (u0), in dispatch order = section order (rtskin::NoteSection).
 void NoteSkinSection(command_list* cmd_list, const CmdState& state, uint64_t cs_hash)
@@ -823,16 +835,23 @@ bool RtClaimNote(const RtClaimInfo& in)
     if (Mode() == 2 && in.identified && in.cmd_list && width) {
         // M2: a draw reading a known ring is ours to draw when the mesh and the section's palette are at hand
         const uint64_t vb0 = uint64_t(int64_t(in.vb0) + int64_t(in.vertex_offset) * int64_t(in.vb0_stride));
-        const uint64_t vb4 = CmdGfx(in.cmd_list).vb[4].va;
-        uint64_t       ring = 0, prev = 0;
+        const VertexBind vb4 = CmdGfx(in.cmd_list).vb[4];
+        const uint64_t   prev = vb4.va && vb4.stride == 12 ? vb4.va : 0; // ATTRIBUTE14: the previous frame's ring
+        uint64_t         ring = 0;
         {
             std::lock_guard l(g_m);
             if (const rtm::Ring* r = g_reg.RingAt(vb0, 1)) ring = r->va;
-            if (vb4 && g_reg.RingAt(vb4, 1)) prev = vb4;
         }
-        if (ring) {
+        const char* why = nullptr;
+        if (!ring) why = "VB0 is not a known skin cache ring";
+        else {
             rtskin::RequestMesh(in.mod);
-            if (rtskin::MeshReady(in.mod) && rtskin::SectionKnown(ring, in.comp)) {
+            if (!rtskin::MeshReady(in.mod)) why = "the mod's mesh is not loaded (yet)";
+            else if (!rtskin::SectionKnown(ring, in.comp)) why = "no skin cache palette recorded for this section this frame";
+        }
+        if (why) NoteHeld(in.mod, in.comp, why);
+        if (!why) {
+            {
                 rtskin::ClaimCtx c;
                 c.cmd_list = in.cmd_list;
                 c.gen = CmdGen(in.cmd_list);

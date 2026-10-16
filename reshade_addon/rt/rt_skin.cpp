@@ -20,6 +20,7 @@
 #include "../addon_common.h"
 #include "../hooks/resource_tracker.h"
 #include "../hooks/cb_ring.h"
+#include "../hooks/pipeline_hooks.h" // PipelineSrvRegs
 #include "../instrumentation/removal_pin.h"
 #include "../mods/claim_state.h" // g_geomods
 #include "../mods/layout_registry.h"
@@ -43,7 +44,7 @@ void Log(bool essential, _Printf_format_string_ const char* fmt, ...); // rt_mod
 
 namespace {
 
-constexpr uint32_t kMaxSlots = 32;    // output buffers per mesh (one per command list recording in flight)
+constexpr uint32_t kMaxSlots = 48;    // output buffers per mesh (one per command list recording in flight, two frames)
 constexpr uint32_t kHeapSlots = 2048; // CPU-only SRV descriptors (never freed: views per slot / mesh / format)
 constexpr uint32_t kSectionAge = 1;   // frames a recorded palette stays usable (it lives in a per-frame upload buffer)
 
@@ -64,8 +65,12 @@ struct Slot {
     ComPtr<ID3D12Resource>      pos, tan;
     D3D12_CPU_DESCRIPTOR_HANDLE pos_view{}, tan_view{};
     uint32_t                    tan_fmt = 0;
-    uint64_t                    stamp = 0;
-    uint32_t                    frame = UINT32_MAX;
+    uint64_t                    stamp = 0;          // GPU progress when last written or read
+    uint32_t                    used = UINT32_MAX;  // frame last written or read (kept two frames: the next frame's history)
+};
+struct Pose {
+    int      slot = -1;
+    uint32_t frame = 0;
 };
 struct Mesh {
     int                                             mod = -1;
@@ -75,8 +80,8 @@ struct Mesh {
     uint32_t                                        verts = 0, indices = 0, influences = 0, blend_stride = 0, uv_stride = 0;
     bool                                            has_color = false;
     std::vector<Slot>                               slots;
-    D3D12_CPU_DESCRIPTOR_HANDLE                     bind_pos_view{};
     std::map<uint32_t, D3D12_CPU_DESCRIPTOR_HANDLE> uv_views, color_views;
+    std::map<int, std::pair<Pose, Pose>>            poses; // component -> (latest pose, the one before): velocity history
 };
 std::map<int, Mesh> g_meshes;
 std::set<int>       g_requested;
@@ -313,7 +318,7 @@ bool AcquireSlot(Mesh& m, reshade::api::command_list* cmd_list, uint64_t gen, ui
     int pick = -1;
     for (int i = 0; i < int(m.slots.size()); ++i) {
         const Slot& s = m.slots[size_t(i)];
-        if (!named[size_t(i)] && s.frame != frame && (!s.stamp || GpuPassed(s.stamp))) {
+        if (!named[size_t(i)] && (s.used == UINT32_MAX || frame - s.used >= 2) && (!s.stamp || GpuPassed(s.stamp))) {
             pick = i;
             break;
         }
@@ -445,6 +450,10 @@ void PresentTick()
     {
         std::lock_guard l(g_m);
         todo.swap(g_requested);
+        // a mod asked for again while it was loading is not loaded twice: a live mesh is never replaced (its
+        // output buffers may still be read by the GPU)
+        for (auto it = todo.begin(); it != todo.end();)
+            it = g_meshes.count(*it) ? todo.erase(it) : std::next(it);
         if (!todo.empty()) EnsurePipeline();
         // bindings of recordings from earlier frames are done with (their lists were submitted long ago)
         for (auto it = g_binds.begin(); it != g_binds.end();)
@@ -459,7 +468,7 @@ void PresentTick()
         std::lock_guard l(g_m);
         m.ready = ok;
         m.failed = !ok;
-        g_meshes[mod] = std::move(m);
+        g_meshes.emplace(mod, std::move(m)); // never over an existing one
     }
 }
 
@@ -501,7 +510,8 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
     }
     std::vector<ShadowSlotOvr> slots;
     uint32_t                   uv_per_vertex = 0;
-    D3D12_VERTEX_BUFFER_VIEW   vbv{};
+    bool                       vf_patch = false;
+    D3D12_VERTEX_BUFFER_VIEW   vbv{}, vbv_prev{};
     {
         std::lock_guard l(g_m);
         if (!EnsurePipeline()) {
@@ -530,10 +540,22 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
             return out;
         }
         Slot& sl = m.slots[size_t(bind->slot)];
+        // last frame's pose of this component (the VS's previous positions, for motion vectors)
+        Slot* prev = nullptr;
+        {
+            const auto pit = m.poses.find(comp);
+            if (pit != m.poses.end()) {
+                const Pose& p = pit->second.first.frame == frame ? pit->second.second : pit->second.first;
+                if (p.slot >= 0 && p.slot != bind->slot && size_t(p.slot) < m.slots.size() && p.frame + 1 == frame) prev = &m.slots[size_t(p.slot)];
+            }
+        }
         // the VS's fetch slots: what the game put there decides what of ours replaces it
+        const DxilSrvRegs vs_regs = PipelineSrvRegs(st.gfx_pso, 'v');
+        bool              new_uv = false, new_color = false, any = false;
         for (unsigned r = 0; r < 4; ++r) {
             const RegBind& b = t_vs[r];
             if (b.param == 0xFF || b.param >= 64 || !b.is_table) continue;
+            if (vs_regs.parsed && !vs_regs.reads(r)) continue; // a slot the VS does not declare
             const TableStart ts = TableStartOf(dv, st.root[b.param].table);
             ResInfo          ri{};
             if (!ts || !g_heap_to_res.find({ ts.heap, ts.base + b.offset }, ri) || !ri.view_handle) continue;
@@ -542,16 +564,18 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
             D3D12_CPU_DESCRIPTOR_HANDLE h{ 0 };
             const char*                 what = "kept (the game's)";
             const bool                  ring = Overlaps(ri, ctx.ring) || Overlaps(ri, ctx.prev_ring);
-            if (fmt == format::r32_float && ring) {
+            // R32_FLOAT in the pass-through VS is a skin cache ring: this frame's (VB0's buffer) or the previous one
+            if (fmt == format::r32_float && Overlaps(ri, ctx.ring)) {
                 h = sl.pos_view;
                 what = "posed positions";
-            } else if (fmt == format::r32_float) { // pre-skinned positions: the mod's bind pose, if indexed from 0
-                if (have_vf && vf_words[4] == 0) {
-                    if (!m.bind_pos_view.ptr) m.bind_pos_view = MakeView(m.pos.Get(), DXGI_FORMAT_R32_FLOAT, 0, m.verts * 3);
-                    h = m.bind_pos_view;
-                    what = "mod bind-pose positions";
-                } else
-                    what = "kept (the game's; LocalVF word 4 is not 0)";
+            } else if (fmt == format::r32_float && prev) {
+                h = prev->pos_view;
+                prev->used = frame;
+                prev->stamp = GpuStamp();
+                what = "previous posed positions";
+            } else if (fmt == format::r32_float) {
+                h = sl.pos_view;
+                what = "posed positions (no previous pose yet: no motion)";
             } else if (fmt == format::r16g16b16a16_snorm || (sec.tan_ring && Overlaps(ri, sec.tan_ring))) {
                 if (!sl.tan_view.ptr) sl.tan_view = MakeView(sl.tan.Get(), DXGI_FORMAT_R16G16B16A16_SNORM, 0, m.verts * 2);
                 h = sl.tan_view;
@@ -562,11 +586,13 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
                 if (!v.ptr) v = MakeView(m.uv.Get(), DXGI_FORMAT(fmt), 0, m.verts * (m.uv_stride / fb));
                 h = v;
                 uv_per_vertex = m.uv_stride / fb;
+                new_uv = true;
                 what = "mod UVs";
             } else if (m.has_color && (fmt == format::r8g8b8a8_unorm || fmt == format::b8g8r8a8_unorm)) {
                 auto& v = m.color_views[uint32_t(format::r8g8b8a8_unorm)]; // the mod's colors are RGBA in memory
                 if (!v.ptr) v = MakeView(m.color.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 0, m.verts);
                 h = v;
+                new_color = true;
                 what = "mod colors";
             }
             char line[320];
@@ -579,6 +605,20 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
             if (h.ptr) {
                 slots.push_back({ b.param, b.offset, h });
                 out.shadow_params |= 1ull << b.param;
+                any = true;
+            }
+        }
+        // LocalVF for our buffers: NumTexCoords = the mod's UV channels, ColorIndexMask = every vertex has its color,
+        // vertex fetch base = 0 (the VS reads [base + SV_VertexID]; our views start at the mod's vertex 0)
+        if (have_vf && any) {
+            uint32_t want[8];
+            memcpy(want, vf_words, sizeof want);
+            if (new_uv) want[1] = uv_per_vertex;
+            if (new_color) want[0] = 0xFFFFFFFFu;
+            want[3] = 0;
+            if (memcmp(want, vf_words, 16) != 0) {
+                vf_patch = true;
+                memcpy(vf_words, want, sizeof want);
             }
         }
         // pose: COMMON | read -> UAV, dispatch, -> read
@@ -599,13 +639,20 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         RemovalPin::Ours(cl, "rt-m2 skin");
         Transition(cl, sl.pos.Get(), sl.tan.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
         bind->state = 2;
-        sl.frame = frame;
+        sl.used = frame;
         sl.stamp = GpuStamp();
+        {
+            auto& pp = m.poses[comp];
+            if (pp.first.frame != frame) pp.second = pp.first;
+            pp.first = { bind->slot, frame };
+        }
         vbv = { sl.pos->GetGPUVirtualAddress(), m.verts * 12, 12 };
+        vbv_prev = prev ? D3D12_VERTEX_BUFFER_VIEW{ prev->pos->GetGPUVirtualAddress(), m.verts * 12, 12 } : vbv;
         ++g_dispatches;
         char first[200];
-        snprintf(first, sizeof first, "RTM2 first draw mod=%d comp=%d: %u indices from %u, %u bones, %zu fetch slot(s) replaced, LocalVF %s",
-            mod, comp, c, s2, sec.bones, slots.size(), have_vf ? "read" : "NOT read");
+        snprintf(first, sizeof first, "RTM2 first draw mod=%d comp=%d: %u indices from %u, %u bones, %zu fetch slot(s) replaced, LocalVF %s %08x %08x %08x %08x%s",
+            mod, comp, c, s2, sec.bones, slots.size(), have_vf ? "read" : "NOT read", vf_words[0], vf_words[1], vf_words[2], vf_words[3],
+            vf_patch ? " (patched)" : "");
         char key[48];
         snprintf(key, sizeof key, "first %d %d", mod, comp);
         LogOnce(key, first);
@@ -613,12 +660,10 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
     // the game's graphics PSO back (the dispatch replaced it); the core's variants are applied after this
     cl->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(st.gfx_restore()));
     cl->IASetVertexBuffers(0, 1, &vbv);
-    if (ctx.prev_ring) cl->IASetVertexBuffers(4, 1, &vbv); // previous positions = current: no motion of ours yet
-    // LocalVF: the game's, with NumTexcoords = the mod's UV channels per vertex
-    if (have_vf && uv_per_vertex && vf_words[1] != uv_per_vertex) {
+    if (ctx.prev_ring) cl->IASetVertexBuffers(4, 1, &vbv_prev); // ATTRIBUTE14: previous positions
+    if (vf_patch) {
         uint64_t va = 0;
         if (uint8_t* p = g_cb.Take(&va)) {
-            vf_words[1] = uv_per_vertex;
             memcpy(p, vf_words, sizeof vf_words);
             cl->SetGraphicsRootConstantBufferView(lb.param, va);
             out.param = lb.param;
