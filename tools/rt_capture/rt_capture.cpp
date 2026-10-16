@@ -115,8 +115,8 @@ void add(std::string row, bool rt_priority = false) // mutex held
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     const uint64_t seq = ++sequence;
-    auto& target = rt_priority ? rt_trace : trace;
-    if (!target.append("{\"seq\":" + std::to_string(seq) + ",\"frame\":" + std::to_string(frame) +
+    auto& sink = rt_priority ? rt_trace : trace; // not `target`: that is the global BLAS signature (C4459)
+    if (!sink.append("{\"seq\":" + std::to_string(seq) + ",\"frame\":" + std::to_string(frame) +
         ",\"qpc\":" + std::to_string(now.QuadPart) + "," + row + "}", seq))
         (rt_priority ? trace_rt_full : trace_full).store(true);
 }
