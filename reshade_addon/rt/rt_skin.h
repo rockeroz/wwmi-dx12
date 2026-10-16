@@ -9,8 +9,10 @@
 
 namespace rtskin {
 
-// A skin cache dispatch of a ring the module tracks (any thread, recording order): its bone palette view.
-void NoteSection(uint64_t ring_va, uint64_t palette_va, uint32_t bones, uint64_t tangent_ring_va, uint32_t frame);
+// A skin cache dispatch (any thread): the ring it writes (u1's buffer), the section's start vertex in it ($Globals
+// SkinCacheStart), its bone palette view and tangent output; `expected` = sections the ring's BLAS has (0 unknown).
+void NoteSection(uint64_t ring_va, uint32_t start, uint64_t palette_va, uint32_t bones, uint64_t tangent_ring_va, uint32_t expected,
+    uint32_t frame);
 
 // What the module saw of the game's draw it is about to replace (draw_claim.cpp -> RtClaimNote, same thread).
 struct ClaimCtx {
@@ -28,6 +30,7 @@ bool ClaimIsPassThrough(reshade::api::command_list* cmd_list); // the current cl
 bool ClaimActive();                                            // ...on whatever list (RtPalPublish has none)
 // Has the skin cache posed section `comp` of this ring recently enough for its palette to be used?
 bool SectionKnown(uint64_t ring, int comp);
+bool RingSeen(uint64_t ring); // has a skin cache dispatch written this buffer recently?
 
 // The mod's meshes: asked for from any thread, loaded on the present thread (RtPresentTick).
 bool MeshReady(int mod);

@@ -447,7 +447,7 @@ const rtm::CompWindow* CompAt(uint32_t first, uint32_t count) // g_m held
     return nullptr;
 }
 
-std::atomic<bool> g_palfmt_told{ false };
+std::atomic<bool> g_palfmt_told{ false }, g_globals_told{ false };
 
 // M2: why a claim stayed the game's (one line per mod, component and reason; counted in RTSUM's held).
 void NoteHeld(int mod, int comp, const char* why)
@@ -472,7 +472,8 @@ void NoteSkinSection(command_list* cmd_list, const CmdState& state, uint64_t cs_
         t_skin = IsSkinCs(cs_hash);
     }
     if (!t_skin) return;
-    RegBind t0{ 0, 0, true }, u0{ 2, 0, true }, u1{ 2, 1, true }; // as observed, when the root signature has no map
+    // as observed, when the root signature has no map: tables p0 (SRVs) / p2 (UAVs), $Globals root CBV p3
+    RegBind t0{ 0, 0, true }, u0{ 2, 0, true }, u1{ 2, 1, true }, b0{ 3, 0, false };
     {
         std::lock_guard l(g_layout_regmap_mtx);
         auto            it = g_layout_regmap.find(CmdCmpLayout(cmd_list));
@@ -480,6 +481,7 @@ void NoteSkinSection(command_list* cmd_list, const CmdState& state, uint64_t cs_
             t0 = it->second.t_cs[0];
             u0 = it->second.u_cs[0];
             u1 = it->second.u_cs[1];
+            if (it->second.b_cs[0].param != 0xFF) b0 = it->second.b_cs[0];
         }
     }
     device* dev = cmd_list->get_device();
@@ -496,12 +498,26 @@ void NoteSkinSection(command_list* cmd_list, const CmdState& state, uint64_t cs_
     };
     ResInfo rring{}, rpal{}, rtan{};
     if (!resolve(u1, rring)) return;
-    uint64_t ring = 0;
+    const uint64_t ring = rring.cached_va; // the buffer the draws bind at VB0
+    uint32_t       expected = 0;
     {
         std::lock_guard l(g_m);
-        if (const rtm::Ring* r = g_reg.RingAt(rring.cached_va, rring.size ? rring.size : 1)) ring = r->va;
+        if (const rtm::Ring* r = g_reg.RingAt(ring, rring.size ? rring.size : 1)) expected = r->geometries;
     }
-    if (!ring) return; // not a character the module knows
+    // $Globals word 1 = SkinCacheStart (the section's first vertex in the ring) in every variant seen (ef8d.., e031..,
+    // 8210..)
+    uint32_t start = UINT32_MAX;
+    if (!b0.is_table && b0.param < 64) {
+        const RootCbvBind rc = CmdCbv(cmd_list).binds[b0.param];
+        uint32_t          w[2] = {};
+        if (rc.res && rc.va && BufferLive(rc.res) && SnapshotGameCB(rc.res, rc.va, reinterpret_cast<uint8_t*>(w), sizeof w, true) == sizeof w)
+            start = w[1];
+    }
+    if (start == UINT32_MAX) {
+        g_c.section_misses.fetch_add(1, std::memory_order_relaxed);
+        if (!g_globals_told.exchange(true)) g_log.Line(true, "RTM2 skin cache $Globals not readable (p%u): sections not recorded", b0.param);
+        return;
+    }
     uint64_t pal = 0;
     uint32_t bones = 0;
     if (resolve(t0, rpal)) {
@@ -524,7 +540,7 @@ void NoteSkinSection(command_list* cmd_list, const CmdState& state, uint64_t cs_
         return;
     }
     const uint64_t tan_va = resolve(u0, rtan) ? rtan.cached_va : 0;
-    rtskin::NoteSection(ring, pal, bones, tan_va, g_frame_id);
+    rtskin::NoteSection(ring, start, pal, bones, tan_va, expected, g_frame_id);
     g_c.sections.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -837,17 +853,23 @@ bool RtClaimNote(const RtClaimInfo& in)
         const uint64_t vb0 = uint64_t(int64_t(in.vb0) + int64_t(in.vertex_offset) * int64_t(in.vb0_stride));
         const VertexBind vb4 = CmdGfx(in.cmd_list).vb[4];
         const uint64_t   prev = vb4.va && vb4.stride == 12 ? vb4.va : 0; // ATTRIBUTE14: the previous frame's ring
-        uint64_t         ring = 0;
+        uint64_t         reg_ring = 0;
         {
             std::lock_guard l(g_m);
-            if (const rtm::Ring* r = g_reg.RingAt(vb0, 1)) ring = r->va;
+            if (const rtm::Ring* r = g_reg.RingAt(vb0, 1)) reg_ring = r->va;
         }
+        // the ring: VB0 itself when the skin cache wrote it (no need to wait for the registry to learn it), else the
+        // registry's ring around it
+        uint64_t    ring = 0;
         const char* why = nullptr;
-        if (!ring) why = "VB0 is not a known skin cache ring";
+        const bool  seen = rtskin::RingSeen(vb0) || (reg_ring && rtskin::RingSeen(reg_ring));
+        if (!seen && !reg_ring) why = "VB0 is not a skin cache ring the module saw posed";
         else {
             rtskin::RequestMesh(in.mod);
             if (!rtskin::MeshReady(in.mod)) why = "the mod's mesh is not loaded (yet)";
-            else if (!rtskin::SectionKnown(ring, in.comp)) why = "no skin cache palette recorded for this section this frame";
+            else if (rtskin::SectionKnown(vb0, in.comp)) ring = vb0;
+            else if (reg_ring && rtskin::SectionKnown(reg_ring, in.comp)) ring = reg_ring;
+            else why = "no complete skin cache layout / palette for this section this frame";
         }
         if (why) NoteHeld(in.mod, in.comp, why);
         if (!why) {

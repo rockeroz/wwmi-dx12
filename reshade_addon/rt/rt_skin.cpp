@@ -55,11 +55,20 @@ struct Sec {
     uint32_t bones = 0;
     uint64_t tan_ring = 0;
 };
-struct RingFrames {
-    uint32_t         frame = 0, last_frame = 0;
-    std::vector<Sec> cur, last;
+// A ring's sections by their start vertex in it ($Globals SkinCacheStart): section k = the k-th start. Dispatch order
+// is not section order (two shader variants pose different sections, and a pass can straddle a frame id).
+struct SecRec {
+    Sec      s;
+    uint32_t frame = 0;
 };
-std::unordered_map<uint64_t, RingFrames> g_rings;
+struct RingSecs {
+    std::map<uint32_t, SecRec> by_start;
+    uint32_t                   expected = 0; // sections the ring's BLAS has (0 = not known)
+    uint32_t                   frame = 0;    // last dispatch seen
+    std::string                layout;       // the starts last logged
+};
+std::unordered_map<uint64_t, RingSecs> g_rings;
+constexpr uint32_t                     kStartForget = 120; // frames a start not posed again stays in the layout
 
 struct Slot {
     ComPtr<ID3D12Resource>      pos, tan;
@@ -364,14 +373,17 @@ bool LookupSection(uint64_t ring, int comp, uint32_t frame, Sec* out) // g_m hel
 {
     auto it = g_rings.find(ring);
     if (it == g_rings.end() || comp < 0) return false;
-    const RingFrames& r = it->second;
-    // the most recent pass over this ring that has the section, if it is recent enough
-    if (size_t(comp) < r.cur.size() && frame - r.frame <= kSectionAge) {
-        if (out) *out = r.cur[size_t(comp)];
-        return true;
-    }
-    if (size_t(comp) < r.last.size() && frame - r.last_frame <= kSectionAge) {
-        if (out) *out = r.last[size_t(comp)];
+    const RingSecs& r = it->second;
+    // the layout must be complete: a missing start would shift every later section
+    uint32_t live = 0;
+    for (const auto& [start, rec] : r.by_start) live += frame - rec.frame <= kStartForget ? 1u : 0u;
+    if (r.expected && live != r.expected) return false;
+    uint32_t k = 0;
+    for (const auto& [start, rec] : r.by_start) {
+        if (frame - rec.frame > kStartForget) continue;
+        if (k++ != uint32_t(comp)) continue;
+        if (int32_t(frame - rec.frame) > int32_t(kSectionAge)) return false; // posed too long ago: its palette is gone
+        if (out) *out = rec.s;
         return true;
     }
     return false;
@@ -384,37 +396,49 @@ bool Overlaps(const ResInfo& ri, uint64_t va)
 
 } // namespace
 
-void NoteSection(uint64_t ring_va, uint64_t palette_va, uint32_t bones, uint64_t tangent_ring_va, uint32_t frame)
+void NoteSection(uint64_t ring_va, uint32_t start, uint64_t palette_va, uint32_t bones, uint64_t tangent_ring_va, uint32_t expected,
+    uint32_t frame)
 {
     std::lock_guard l(g_m);
     if (g_rings.size() >= 64 && !g_rings.count(ring_va))
         for (auto it = g_rings.begin(); it != g_rings.end();)
-            it = frame - it->second.frame > 8 ? g_rings.erase(it) : std::next(it);
-    RingFrames& r = g_rings[ring_va];
-    if (r.frame != frame) {
-        if (!r.cur.empty()) {
-            // how many sections the skin cache posed in one pass (section k = the k-th dispatch: a skipped section
-            // would shift every later one -- this line shows it)
-            char line[160], key[64];
-            snprintf(line, sizeof line, "RTM2 ring %llx: %zu skin cache section(s) per pass, bones per section:", (unsigned long long)ring_va,
-                r.cur.size());
-            std::string full = line;
-            for (const Sec& x : r.cur) full += " " + std::to_string(x.bones);
-            snprintf(key, sizeof key, "secs %llx %zu", (unsigned long long)ring_va, r.cur.size());
-            LogOnce(key, full.c_str());
-            r.last.swap(r.cur);
-            r.last_frame = r.frame;
+            it = frame - it->second.frame > kStartForget ? g_rings.erase(it) : std::next(it);
+    RingSecs& r = g_rings[ring_va];
+    if (expected) r.expected = expected;
+    r.frame = frame;
+    // the pool gave this ring to another mesh: starts not posed for a while leave the layout
+    for (auto it = r.by_start.begin(); it != r.by_start.end();)
+        it = frame - it->second.frame > kStartForget ? r.by_start.erase(it) : std::next(it);
+    const bool fresh = !r.by_start.count(start);
+    if (fresh && r.by_start.size() >= 32) return;
+    SecRec& rec = r.by_start[start];
+    rec.s = { palette_va, bones, tangent_ring_va };
+    rec.frame = frame;
+    if (fresh) { // the layout as it grows (one line per distinct layout)
+        std::string lay;
+        for (const auto& [st, x] : r.by_start) lay += " " + std::to_string(st) + "/" + std::to_string(x.s.bones);
+        if (lay != r.layout) {
+            r.layout = lay;
+            char head[160];
+            snprintf(head, sizeof head, "RTM2 ring %llx: %zu section(s) (expected %u), start/bones:", (unsigned long long)ring_va,
+                r.by_start.size(), r.expected);
+            const std::string line = head + lay;
+            LogOnce("lay " + std::to_string(ring_va) + lay, line.c_str());
         }
-        r.cur.clear();
-        r.frame = frame;
     }
-    if (r.cur.size() < 32) r.cur.push_back({ palette_va, bones, tangent_ring_va });
 }
 
 bool SectionKnown(uint64_t ring, int comp)
 {
     std::lock_guard l(g_m);
     return LookupSection(ring, comp, g_frame_id, nullptr);
+}
+
+bool RingSeen(uint64_t ring)
+{
+    std::lock_guard l(g_m);
+    const auto      it = g_rings.find(ring);
+    return it != g_rings.end() && g_frame_id - it->second.frame <= kStartForget;
 }
 
 void SetClaim(const ClaimCtx& c)
