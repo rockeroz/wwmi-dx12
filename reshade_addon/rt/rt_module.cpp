@@ -585,7 +585,9 @@ struct CopyRec {
     const void*     cl = nullptr; // the recording it is in
     uint64_t        gen = 0;
     bool            executed = false; // ...submitted already (ExecuteCommandLists): too late to change what it copies
+    uint32_t        seq = 0;          // recording order (shared with the TLAS builds)
 };
+std::atomic<uint32_t> g_rec_seq{ 0 };
 std::mutex g_copy_m;
 CopyRec    g_copies[512];
 uint32_t   g_copy_next = 0;
@@ -774,8 +776,10 @@ void ObserveRays(resource rg_res, uint64_t rg_off, uint64_t rg_size, resource mi
 // hit group system parameters -- +32 index buffer (the BLAS's geometry 0 IB), +40 vertex buffer (the ring), +48
 // config (index stride | vertex stride << 8), +52 the geometry's offset in the index buffer (bytes) -- and nothing
 // else (no material). So the hit shaders read the index / vertex buffers the records name, with the primitive index
-// of the BLAS they hit: a BLAS of ours goes in only together with records naming our buffers, all or nothing, in a
-// command list not yet submitted (both are patched in the UPLOAD memory the GPU reads them from).
+// of the BLAS they hit: a BLAS of ours goes in only together with records naming our buffers (both patched in the
+// UPLOAD memory the GPU reads them from, in lists not submitted yet). The game submits the TLAS build before it records
+// the rays (cecef50 test), so the instance is changed at the TLAS build -- only for a character whose records were
+// patchable at the rays for kM3Streak frames in a row -- and the records at the rays that follow.
 struct ModBlas {
     uint32_t                                                geoms = 0;
     uint64_t                                                game_ib = 0; // the game's geometry 0 IB (its records' base)
@@ -791,6 +795,10 @@ struct ModBlas {
     bool                                                    ok = false;
     // where the TLAS instance naming it was last found / written
     uint32_t inst_hint = UINT32_MAX, last_scan = 0, redirected = 0;
+    uint32_t contrib = UINT32_MAX;          // its instance's hit group contribution (last TLAS that named it)
+    uint32_t streak = 0, streak_frame = 0;  // frames in a row its records were patchable when the rays were recorded
+    uint32_t patched = 0;                   // frame a TLAS build last got our BLAS in its instance
+    std::vector<uint32_t> patched_contribs; // ...with these contributions (their records must follow)
     struct Written {
         ID3D12Resource* res;
         uint32_t        index, frame;
@@ -1114,29 +1122,121 @@ uint32_t FindInstance(ID3D12Resource* res, uint64_t va, uint32_t count, uint64_t
     return found;
 }
 
+constexpr uint32_t kM3Streak = 30; // frames of patchable records before a TLAS build gets our BLAS
+constexpr uint32_t kM3Window = 2;  // frames a TLAS build's redirect stays in force (a TLAS may serve the next frame too)
+
+// The hit group table's records as the CPU can still change them: the table itself when it is UPLOAD, or the UPLOAD
+// source of the copy that fills it, recorded in a list not submitted yet. g_m3_m held.
+bool M3HitSource(resource hit_res, uint64_t hit_off, uint64_t hit_size, uint32_t frame, ID3D12Resource** rd, uint64_t* rd_va,
+    const char** why, CopyRec* copy)
+{
+    ID3D12Resource* hg = nullptr;
+    uint64_t        hg_va = 0;
+    if (!ResOfVa(hit_res, hit_off, &hg, &hg_va)) {
+        *why = "the hit group table's buffer is unknown";
+        return false;
+    }
+    if (HeapTypeOf(hg) == int(D3D12_HEAP_TYPE_UPLOAD)) {
+        *rd = hg;
+        *rd_va = hg_va;
+        return true;
+    }
+    CopyRec c{};
+    {
+        std::lock_guard l2(g_copy_m);
+        for (const CopyRec& r : g_copies)
+            if (r.src && hg_va >= r.dst_va && hg_va + hit_size <= r.dst_va + r.size && int32_t(frame - r.frame) <= 1 && (!c.src || r.seq > c.seq))
+                c = r;
+    }
+    if (copy) *copy = c;
+    if (!c.src) {
+        *why = "no copy filled the hit group table this frame";
+        return false;
+    }
+    if (HeapTypeOf(c.src) != int(D3D12_HEAP_TYPE_UPLOAD)) {
+        *why = "the hit group table was not filled from UPLOAD memory";
+        return false;
+    }
+    if (c.executed) {
+        *why = "the copy that fills the hit group table was already submitted";
+        return false;
+    }
+    *rd = c.src;
+    *rd_va = c.src_va + (hg_va - c.dst_va);
+    return true;
+}
+
+// The 3-per-geometry records from `contrib`: each the game's for its geometry or already ours (else false, nothing
+// written). `write`: all made ours. g_m3_m held.
+bool M3Records(ModBlas& mb, ID3D12Resource* rd, uint64_t rd_va, uint64_t hit_size, uint64_t stride, uint32_t contrib, bool write)
+{
+    const uint64_t nrec = uint64_t(mb.geoms) * 3;
+    if (!mb.ib || !nrec || stride < 64 || (uint64_t(contrib) + nrec) * stride > hit_size) return false;
+    std::vector<uint8_t> recs(size_t(nrec * stride));
+    if (GuardedPrivateRead(rd, rd_va + uint64_t(contrib) * stride, recs.data(), uint32_t(recs.size())) != recs.size()) return false;
+    const uint64_t ib_va = mb.ib->GetGPUVirtualAddress();
+    bool           mine = true;
+    for (uint64_t i = 0; i < nrec; ++i) {
+        uint8_t*       r = recs.data() + i * stride;
+        const uint32_t g = uint32_t(i / 3);
+        uint64_t       ib, vb;
+        uint32_t       cfg, off;
+        memcpy(&ib, r + 32, 8);
+        memcpy(&vb, r + 40, 8);
+        memcpy(&cfg, r + 48, 4);
+        memcpy(&off, r + 52, 4);
+        const bool is_game = ib == mb.game_ib && off == mb.game_off[g] && (cfg & 0xff) == mb.game_iw && ((cfg >> 8) & 0xff) == 12 &&
+                             rtskin::RingKey(vb) != 0;
+        const bool is_ours = ib == ib_va && off == mb.ib_off[g] && (cfg & 0xff) == 4;
+        if (!is_game && !is_ours) {
+            static std::atomic<uint32_t> s_dump{ 0 };
+            if (s_dump.fetch_add(1) < 8)
+                g_log.Line(true, "RTM3 record %llu (contrib %u, geometry %u) is not the character's: ib=%llx (want %llx) vb=%llx cfg=%x off=%x (want %llx)",
+                    (unsigned long long)(contrib + i), contrib, g, (unsigned long long)ib, (unsigned long long)mb.game_ib, (unsigned long long)vb,
+                    cfg, off, (unsigned long long)mb.game_off[g]);
+            return false;
+        }
+        mine = mine && is_ours && vb == mb.vb[g];
+        memcpy(r + 32, &ib_va, 8);
+        memcpy(r + 40, &mb.vb[g], 8);
+        cfg = (cfg & 0xffff0000u) | (12u << 8) | 4u;
+        memcpy(r + 48, &cfg, 4);
+        memcpy(r + 52, &mb.ib_off[g], 4);
+    }
+    if (!write || mine) return true;
+    uint8_t* p = MapUpload(rd, rd_va + uint64_t(contrib) * stride, recs.size());
+    if (!p) return false;
+    const bool ok = GuardedCopy(p, recs.data(), recs.size());
+    UnmapUpload(rd);
+    return ok;
+}
+
+// A TLAS build (its list is being recorded: what it reads is still ours to change). The instance naming a character's
+// BLAS gives its contribution; once the records were patchable at the rays for kM3Streak frames in a row, it is
+// pointed at our BLAS -- and the rays of the frame then must patch the records (M3Redirect).
 void M3NoteTlas(command_list* cmd_list, const acceleration_structure_build_input& in)
 {
     if (!M3On() || !g_m3_any.load(std::memory_order_relaxed) || in.instances.array_of_pointers || !in.instances.count) return;
     ID3D12Resource* res = nullptr;
     uint64_t        va = 0;
     if (!ResOfVa(in.instances.buffer, in.instances.offset, &res, &va) || HeapTypeOf(res) != int(D3D12_HEAP_TYPE_UPLOAD)) return;
+    const uint32_t  frame = g_frame_id;
     std::lock_guard l(g_m3_m);
-    const uint32_t seq = ++g_m3_tlas_next;
-    TlasRec&       t = g_m3_tlas[seq & 7];
+    const uint32_t  slot = ++g_m3_tlas_next;
+    TlasRec&        t = g_m3_tlas[slot & 7];
     t = TlasRec{};
-    t.seq = seq;
+    t.seq = g_rec_seq.fetch_add(1, std::memory_order_relaxed) + 1;
     t.cl = cmd_list;
     t.gen = CmdGen(cmd_list);
-    t.frame = g_frame_id;
+    t.frame = frame;
     t.res = res;
     t.va = va;
     t.count = in.instances.count;
-    // an instance a redirect of an earlier frame left naming our BLAS (the game did not rewrite it): the game's again,
-    // until this frame's rays redirect it with its records
+    // an instance a redirect of an earlier frame left naming our BLAS (the game did not rewrite it): the game's again
     // (only one written in an earlier frame: this frame's may be read by a TLAS build recorded before this one)
     for (auto& [game, mb] : g_m3)
         for (auto it = mb.written.begin(); it != mb.written.end();) {
-            if (it->res != res || it->frame == g_frame_id || it->index >= t.count || !mb.blas) {
+            if (it->res != res || it->frame == frame || it->index >= t.count || !mb.blas) {
                 ++it;
                 continue;
             }
@@ -1150,168 +1250,102 @@ void M3NoteTlas(command_list* cmd_list, const acceleration_structure_build_input
                 }
             it = mb.written.erase(it);
         }
-}
-
-// DispatchRays: our BLAS into the TLAS instance and our buffers into its hit group records -- both or neither.
-void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride)
-{
-    if (!M3On() || !g_m3_any.load(std::memory_order_relaxed) || hit_stride < 64 || !cmd_list) return;
-    const uint32_t frame = g_frame_id;
-    const uint64_t gen = CmdGen(cmd_list);
-    std::lock_guard l(g_m3_m);
-    bool any = false;
-    for (const auto& [game, mb] : g_m3) any = any || (mb.ok && int32_t(frame - mb.built) <= 1);
-    if (!any) return;
-    // the TLAS build and the hit table's copy must be in recordings not submitted yet (what we write is what runs);
-    // the newest TLAS build of the frame (this list's first). A TLAS already submitted can only keep an instance we
-    // redirected earlier: its records are still fixed then
-    const TlasRec* t = nullptr;
-    for (const TlasRec& r : g_m3_tlas) // this recording's newest
-        if (r.res && r.cl == cmd_list && r.gen == gen && int32_t(frame - r.frame) <= 1 && (!t || r.seq > t->seq)) t = &r;
-    if (!t)
-        for (const TlasRec& r : g_m3_tlas) // else the frame's newest
-            if (r.res && int32_t(frame - r.frame) <= 1 && (!t || r.seq > t->seq)) t = &r;
-    const bool same_list = t && !t->executed;
-    if (!t) {
-        M3Refuse("no TLAS build recorded this frame");
-        return;
-    }
-    if (!same_list) {
-        static std::atomic<uint32_t> s_diag{ 0 };
-        if (s_diag.fetch_add(1) < 16) {
-            std::string recs;
-            for (const TlasRec& r : g_m3_tlas)
-                if (r.res) {
-                    char b[96];
-                    snprintf(b, sizeof b, " [cl %p gen %llu f%u%s]", r.cl, (unsigned long long)r.gen, r.frame, r.executed ? " submitted" : "");
-                    recs += b;
-                }
-            g_log.Line(true, "RTM3 diag f=%u rays in cl %p gen %llu; TLAS builds:%s", frame, (const void*)cmd_list, (unsigned long long)gen, recs.c_str());
-        }
-    }
-    ID3D12Resource* hg = nullptr;
-    uint64_t        hg_va = 0;
-    if (!ResOfVa(hit_res, hit_off, &hg, &hg_va)) {
-        M3Refuse("the hit group table's buffer is unknown");
-        return;
-    }
-    ID3D12Resource* rd = HeapTypeOf(hg) == int(D3D12_HEAP_TYPE_UPLOAD) ? hg : nullptr;
-    uint64_t        rd_va = hg_va;
-    if (!rd) {
-        CopyRec c{};
-        {
-            std::lock_guard l2(g_copy_m);
-            for (const CopyRec& r : g_copies)
-                if (r.src && hg_va >= r.dst_va && hg_va + hit_size <= r.dst_va + r.size && int32_t(frame - r.frame) <= 1 &&
-                    (!c.src || int32_t(r.frame - c.frame) >= 0))
-                    c = r;
-        }
-        if (!c.src || HeapTypeOf(c.src) != int(D3D12_HEAP_TYPE_UPLOAD) || c.executed) {
-            M3Refuse(!c.src ? "no copy filled the hit group table this frame"
-                     : c.executed ? "the copy that fills the hit group table was already submitted"
-                                  : "the hit group table was not filled from UPLOAD memory");
-            for (const auto& [game, mb] : g_m3)
-                if (mb.redirected == frame) {
-                    static std::atomic<uint32_t> s_warn{ 0 };
-                    if (s_warn.fetch_add(1) < 8)
-                        g_log.Line(true, "RTM3 WARNING f=%u: a dispatch whose hit table could not be patched follows a redirect this frame", frame);
-                    break;
-                }
-            return;
-        }
-        rd = c.src;
-        rd_va = c.src_va + (hg_va - c.dst_va);
-    }
     for (auto& [game, mb] : g_m3) {
-        if (!mb.ok || int32_t(frame - mb.built) > 1 || !mb.blas || !mb.ib) continue;
+        if (!mb.ok || int32_t(frame - mb.built) > int32_t(kM3Window) || !mb.blas || !mb.ib) continue;
         const uint64_t ours = mb.blas->GetGPUVirtualAddress();
-        const uint32_t idx = FindInstance(t->res, t->va, t->count, game, ours, mb, frame);
-        if (idx == UINT32_MAX) {
-            M3Refuse("no TLAS instance names the character's BLAS");
+        const uint32_t idx = FindInstance(res, va, t.count, game, ours, mb, frame);
+        if (idx == UINT32_MAX) continue;
+        uint32_t w13 = 0;
+        if (GuardedPrivateRead(res, va + uint64_t(idx) * 64 + 52, reinterpret_cast<uint8_t*>(&w13), 4) != 4) continue;
+        mb.contrib = w13 & 0xffffff;
+        if (mb.streak < kM3Streak) continue;
+        uint8_t* p = MapUpload(res, va + uint64_t(idx) * 64 + 56, 8);
+        if (!p) {
+            M3Refuse("the TLAS instance could not be mapped");
             continue;
         }
-        uint64_t cur_as = 0;
-        GuardedPrivateRead(t->res, t->va + uint64_t(idx) * 64 + 56, reinterpret_cast<uint8_t*>(&cur_as), 8);
-        if (!same_list && cur_as != ours) {
-            M3Refuse("the TLAS build was already submitted when the rays were recorded");
-            continue;
-        }
-        uint8_t inst[64];
-        if (GuardedPrivateRead(t->res, t->va + uint64_t(idx) * 64, inst, 64) != 64) {
-            M3Refuse("the TLAS instance could not be read");
-            continue;
-        }
-        uint32_t w13;
-        memcpy(&w13, inst + 52, 4);
-        const uint32_t contrib = w13 & 0xffffff;
-        const uint64_t nrec = uint64_t(mb.geoms) * 3;
-        if ((uint64_t(contrib) + nrec) * hit_stride > hit_size) {
-            M3Refuse("the instance's hit group records lie past the table");
-            continue;
-        }
-        std::vector<uint8_t> recs(size_t(nrec * hit_stride));
-        if (GuardedPrivateRead(rd, rd_va + uint64_t(contrib) * hit_stride, recs.data(), uint32_t(recs.size())) != recs.size()) {
-            M3Refuse("the hit group records could not be read");
-            continue;
-        }
-        // every record must be the game's for this geometry (or already ours): anything else and nothing is touched
-        const uint64_t ib_va = mb.ib->GetGPUVirtualAddress();
-        bool           valid = true;
-        for (uint64_t i = 0; i < nrec && valid; ++i) {
-            uint8_t*       r = recs.data() + i * hit_stride;
-            const uint32_t g = uint32_t(i / 3);
-            uint64_t       ib, vb;
-            uint32_t       cfg, off;
-            memcpy(&ib, r + 32, 8);
-            memcpy(&vb, r + 40, 8);
-            memcpy(&cfg, r + 48, 4);
-            memcpy(&off, r + 52, 4);
-            const bool is_game = ib == mb.game_ib && off == mb.game_off[g] && (cfg & 0xff) == mb.game_iw && ((cfg >> 8) & 0xff) == 12 &&
-                                 rtskin::RingKey(vb) != 0;
-            const bool is_ours = ib == ib_va && off == mb.ib_off[g] && (cfg & 0xff) == 4;
-            if (!is_game && !is_ours) {
-                valid = false;
-                static std::atomic<uint32_t> s_dump{ 0 };
-                if (s_dump.fetch_add(1) < 8)
-                    g_log.Line(true, "RTM3 record %llu (contrib %u, geometry %u) is not the character's: ib=%llx (want %llx) vb=%llx cfg=%x off=%x (want %llx)",
-                        (unsigned long long)(contrib + i), contrib, g, (unsigned long long)ib, (unsigned long long)mb.game_ib,
-                        (unsigned long long)vb, cfg, off, (unsigned long long)mb.game_off[g]);
-                break;
-            }
-            memcpy(r + 32, &ib_va, 8);
-            memcpy(r + 40, &mb.vb[g], 8);
-            cfg = (cfg & 0xffff0000u) | (12u << 8) | 4u;
-            memcpy(r + 48, &cfg, 4);
-            memcpy(r + 52, &mb.ib_off[g], 4);
-        }
-        if (!valid) {
-            M3Refuse("the instance's hit group records are not the character's geometry records (3 per geometry)");
-            continue;
-        }
-        // both mapped before either is written
-        uint8_t* pr = MapUpload(rd, rd_va + uint64_t(contrib) * hit_stride, recs.size());
-        uint8_t* pi = pr ? MapUpload(t->res, t->va + uint64_t(idx) * 64 + 56, 8) : nullptr;
-        if (!pr || !pi) {
-            if (pr) UnmapUpload(rd);
-            M3Refuse("the records / instance could not be mapped");
-            continue;
-        }
-        const bool ok_r = GuardedCopy(pr, recs.data(), recs.size());
-        const bool ok_i = ok_r && GuardedCopy(pi, &ours, 8);
-        UnmapUpload(t->res);
-        UnmapUpload(rd);
-        if (!ok_r || !ok_i) {
-            M3Refuse("a write faulted");
+        const bool ok = GuardedCopy(p, &ours, 8);
+        UnmapUpload(res);
+        if (!ok) {
+            M3Refuse("the TLAS instance write faulted");
             continue;
         }
         if (mb.written.size() >= 8) mb.written.erase(mb.written.begin());
-        mb.written.push_back({ t->res, idx, frame });
-        if (mb.redirected != frame) {
+        mb.written.push_back({ res, idx, frame });
+        if (mb.patched != frame) {
+            mb.patched_contribs.clear();
             if (g_m3_redirects++ < 4)
-                g_log.Line(true, "RTM3 redirect f=%u game=%llx -> ours=%llx: TLAS instance #%u, hit records %u..%llu (stride %llu) now name our buffers",
-                    frame, (unsigned long long)game, (unsigned long long)ours, idx, contrib, (unsigned long long)(contrib + nrec - 1),
-                    (unsigned long long)hit_stride);
-            mb.redirected = frame;
+                g_log.Line(true, "RTM3 redirect f=%u game=%llx -> ours=%llx: TLAS instance #%u of %u (contrib %u), list %p gen %llu", frame,
+                    (unsigned long long)game, (unsigned long long)ours, idx, t.count, mb.contrib, (const void*)cmd_list,
+                    (unsigned long long)t.gen);
+        }
+        mb.patched = frame;
+        if (std::find(mb.patched_contribs.begin(), mb.patched_contribs.end(), mb.contrib) == mb.patched_contribs.end())
+            mb.patched_contribs.push_back(mb.contrib);
+    }
+}
+
+// DispatchRays: the records of every instance a TLAS build of the frame pointed at our BLAS name our buffers now;
+// for the others, whether they could have been (the streak the TLAS builds wait for).
+void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride)
+{
+    if (!M3On() || !g_m3_any.load(std::memory_order_relaxed) || hit_stride < 64 || !cmd_list) return;
+    const uint32_t  frame = g_frame_id;
+    std::lock_guard l(g_m3_m);
+    bool            any = false;
+    for (const auto& [game, mb] : g_m3) any = any || (mb.ok && mb.contrib != UINT32_MAX);
+    if (!any) return;
+    ID3D12Resource* rd = nullptr;
+    uint64_t        rd_va = 0;
+    const char*     why = nullptr;
+    CopyRec         copy{};
+    const bool      src = M3HitSource(hit_res, hit_off, hit_size, frame, &rd, &rd_va, &why, &copy);
+    // the TLAS these rays trace: the newest one built
+    const TlasRec* t = nullptr;
+    for (const TlasRec& r : g_m3_tlas)
+        if (r.res && (!t || r.seq > t->seq)) t = &r;
+    {
+        static std::atomic<uint32_t> s_order{ 0 };
+        if (s_order.fetch_add(1) < 12) {
+            g_log.Line(true, "RTM3 order f=%u rays cl %p gen %llu | hit copy seq %u cl %p gen %llu f%u%s | newest TLAS seq %u cl %p gen %llu f%u%s | %s",
+                frame, (const void*)cmd_list, (unsigned long long)CmdGen(cmd_list), copy.seq, copy.cl, (unsigned long long)copy.gen, copy.frame,
+                copy.executed ? " submitted" : "", t ? t->seq : 0u, t ? t->cl : nullptr, t ? (unsigned long long)t->gen : 0ull, t ? t->frame : 0u,
+                t && t->executed ? " submitted" : "", src ? "records patchable" : why);
+        }
+    }
+    for (auto& [game, mb] : g_m3) {
+        // redirected = that TLAS's instance names our BLAS (what its build reads, final once its list was submitted)
+        bool redirected = false;
+        if (t && mb.blas && int32_t(frame - mb.patched) <= int32_t(kM3Window) && !mb.patched_contribs.empty())
+            for (const ModBlas::Written& w : mb.written)
+                if (w.res == t->res && w.frame == t->frame && w.index < t->count) {
+                    uint64_t as = 0;
+                    GuardedPrivateRead(t->res, t->va + uint64_t(w.index) * 64 + 56, reinterpret_cast<uint8_t*>(&as), 8);
+                    redirected = redirected || as == mb.blas->GetGPUVirtualAddress();
+                }
+        if (!mb.ok && !redirected) continue;
+        if (redirected) {
+            // a TLAS of the frame names our BLAS: its records must name our buffers
+            bool done = src;
+            for (uint32_t c : mb.patched_contribs)
+                done = done && M3Records(mb, rd, rd_va, hit_size, hit_stride, c, true);
+            if (!done) {
+                mb.streak = 0;
+                M3Refuse(src ? "records of a redirected instance are not the character's" : why);
+                static std::atomic<uint32_t> s_warn{ 0 };
+                if (s_warn.fetch_add(1) < 16)
+                    g_log.Line(true, "RTM3 WARNING f=%u game=%llx: rays over a redirected instance whose records could not be patched (%s)", frame,
+                        (unsigned long long)game, src ? "records not the character's" : why);
+            }
+            continue;
+        }
+        if (mb.contrib == UINT32_MAX || mb.streak_frame == frame) continue;
+        mb.streak_frame = frame;
+        if (src && M3Records(mb, rd, rd_va, hit_size, hit_stride, mb.contrib, false))
+            ++mb.streak;
+        else {
+            mb.streak = 0;
+            M3Refuse(src ? "the records at the instance's contribution are not the character's" : why);
         }
     }
 }
@@ -1327,6 +1361,13 @@ std::string M3Status()
         (unsigned long long)g_m3_builds, (unsigned long long)g_m3_updates, (unsigned long long)g_m3_redirects, (unsigned long long)g_m3_kept,
         g_m3_grave.size());
     std::string s = b;
+    for (const auto& [g, mb] : g_m3)
+        if (mb.ok) {
+            char c[128];
+            snprintf(c, sizeof c, " [%llx contrib %d streak %u redirected %s]", (unsigned long long)g, mb.contrib == UINT32_MAX ? -1 : int(mb.contrib),
+                mb.streak, int32_t(g_frame_id - mb.patched) <= int32_t(kM3Window) ? "yes" : "no");
+            s += c;
+        }
     for (const auto& [why, n] : g_m3_why) s += " | m3 refused " + std::to_string(n) + ": " + why;
     return s;
 }
@@ -1352,6 +1393,7 @@ void RtNoteCopy(command_list* cmd_list, resource src, uint64_t src_off, resource
     CopyRec r;
     r.cl = cmd_list;
     r.gen = CmdGen(cmd_list);
+    r.seq = g_rec_seq.fetch_add(1, std::memory_order_relaxed) + 1;
     r.dst_va = BufferVa(dst, dst_off);
     r.size = size;
     r.src = reinterpret_cast<ID3D12Resource*>(src.handle);
