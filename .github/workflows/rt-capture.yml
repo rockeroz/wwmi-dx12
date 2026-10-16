@@ -3,9 +3,9 @@ name: RT capture tool
 on:
   workflow_dispatch:
   push:
-    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'tests/mock_d3d12/**', 'reshade_addon/rt/**', '.github/workflows/rt-capture.yml']
+    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'tests/mock_d3d12/**', 'reshade_addon/rt/**', '.github/workflows/rt-capture.yml', 'tools/ci/**']
   pull_request:
-    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'tests/mock_d3d12/**', 'reshade_addon/rt/**', '.github/workflows/rt-capture.yml']
+    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'tests/mock_d3d12/**', 'reshade_addon/rt/**', '.github/workflows/rt-capture.yml', 'tools/ci/**']
 
 permissions:
   contents: read
@@ -19,24 +19,27 @@ jobs:
           submodules: false
       - name: Fetch the pinned ReShade SDK headers
         run: git submodule update --init reshade_addon/sdk
-      - name: Build capture add-on and run CPU tests
-        shell: cmd
+      - name: Build capture add-on
+        shell: pwsh
+        run: ./tools/ci/annotate.ps1 -Title "build.cmd" -Command "tools\rt_capture\build.cmd"
+      - name: CPU test rt_capture_test
+        if: always()
+        shell: pwsh
         run: |
-          call tools\rt_capture\build.cmd
-          if errorlevel 1 exit /b 1
-          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
-          cl /nologo /std:c++20 /EHsc /W4 /WX /MT tests\rt_capture_test.cpp /Febuild_addon\rt_capture\rt_capture_test.exe /Fobuild_addon\rt_capture\rt_capture_test.obj
-          if errorlevel 1 exit /b 1
-          build_addon\rt_capture\rt_capture_test.exe
-          if errorlevel 1 exit /b 1
-          cl /nologo /std:c++20 /EHsc /W4 /WX /MT /Itests\mock_d3d12 tests\rt_upload_readback_test.cpp /Febuild_addon\rt_capture\rt_upload_readback_test.exe /Fobuild_addon\rt_capture\rt_upload_readback_test.obj
-          if errorlevel 1 exit /b 1
-          build_addon\rt_capture\rt_upload_readback_test.exe
-          if errorlevel 1 exit /b 1
-          cl /nologo /std:c++20 /EHsc /W4 /WX /MT tests\rt_registry_test.cpp /Febuild_addon\rt_capture\rt_registry_test.exe /Fobuild_addon\rt_capture\rt_registry_test.obj
-          if errorlevel 1 exit /b 1
-          build_addon\rt_capture\rt_registry_test.exe
-          if errorlevel 1 exit /b 1
+          New-Item -ItemType Directory -Force build_addon\rt_capture | Out-Null
+          ./tools/ci/annotate.ps1 -VcVars -Title "rt_capture_test" -Command "cl /nologo /std:c++20 /EHsc /W4 /WX /MT tests\rt_capture_test.cpp /Febuild_addon\rt_capture\rt_capture_test.exe /Fobuild_addon\rt_capture\rt_capture_test.obj && build_addon\rt_capture\rt_capture_test.exe"
+      - name: CPU test rt_upload_readback_test
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build_addon\rt_capture | Out-Null
+          ./tools/ci/annotate.ps1 -VcVars -Title "rt_upload_readback_test" -Command "cl /nologo /std:c++20 /EHsc /W4 /WX /MT /Itests\mock_d3d12 tests\rt_upload_readback_test.cpp /Febuild_addon\rt_capture\rt_upload_readback_test.exe /Fobuild_addon\rt_capture\rt_upload_readback_test.obj && build_addon\rt_capture\rt_upload_readback_test.exe"
+      - name: CPU test rt_registry_test
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build_addon\rt_capture | Out-Null
+          ./tools/ci/annotate.ps1 -VcVars -Title "rt_registry_test" -Command "cl /nologo /std:c++20 /EHsc /W4 /WX /MT tests\rt_registry_test.cpp /Febuild_addon\rt_capture\rt_registry_test.exe /Fobuild_addon\rt_capture\rt_registry_test.obj && build_addon\rt_capture\rt_registry_test.exe"
       - name: Test offline analysis
         run: python -m unittest discover -s tests -p "test_rt_*py"
       - uses: actions/upload-artifact@v4
