@@ -1,0 +1,49 @@
+name: RT observe build
+
+# Builds the full add-on with the RT observe module (M1) on every push to an RT branch, and uploads the
+# package as an artifact. No release is created.
+on:
+  workflow_dispatch:
+  push:
+    branches: ['rt-m1', 'rt-m*']
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+
+      - name: Fetch Dear ImGui, the one ReShade SDK dependency the build uses
+        run: git -C reshade_addon/sdk submodule update --init deps/imgui
+
+      - name: Fetch the XXMI tags the engine version is read from
+        shell: pwsh
+        run: |
+          if ((git -C third_party/3Dmigoto rev-parse --is-shallow-repository) -eq 'true') {
+            git -C third_party/3Dmigoto fetch --tags --unshallow
+          } else {
+            git -C third_party/3Dmigoto fetch --tags
+          }
+
+      - name: Build and package (WwmiPackageRT=observe)
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\amd64\MSBuild.exe' | Select-Object -First 1
+          & $msbuild package.proj -m -nologo /p:WwmiPackageRT=observe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wwmi-dx12-rt-observe
+          path: build_addon/release/*.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wwmi-dx12-rt-observe-map
+          path: build_addon/wwmi_dx12.map
