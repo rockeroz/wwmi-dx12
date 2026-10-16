@@ -115,7 +115,7 @@ uint32_t                     g_heap_next = 0, g_heap_inc = 0;
 bool                         g_pipeline_tried = false;
 std::string                  g_pipeline_why;
 CbRing                       g_cb;
-uint64_t                     g_draws = 0, g_skips = 0, g_dispatches = 0;
+uint64_t                     g_draws = 0, g_skips = 0, g_dispatches = 0, g_cached = 0;
 std::string                  g_last_skip;
 std::set<std::string>        g_logged; // one line per distinct message
 
@@ -389,6 +389,17 @@ bool LookupSection(uint64_t ring, int comp, uint32_t frame, Sec* out) // g_m hel
     return false;
 }
 
+constexpr uint32_t kCachedPose = 30; // frames our last pose of a section may stand in for a missing palette
+
+Slot* CachedPose(Mesh& m, int comp, uint32_t frame) // g_m held
+{
+    const auto it = m.poses.find(comp);
+    if (it == m.poses.end()) return nullptr;
+    const Pose& p = it->second.first;
+    if (p.slot < 0 || size_t(p.slot) >= m.slots.size() || p.frame >= frame || frame - p.frame > kCachedPose) return nullptr;
+    return &m.slots[size_t(p.slot)];
+}
+
 bool Overlaps(const ResInfo& ri, uint64_t va)
 {
     return va && ri.cached_va && va >= ri.cached_va && va < ri.cached_va + (ri.size ? ri.size : 1);
@@ -432,6 +443,13 @@ bool SectionKnown(uint64_t ring, int comp)
 {
     std::lock_guard l(g_m);
     return LookupSection(ring, comp, g_frame_id, nullptr);
+}
+
+bool PoseCached(int mod, int comp)
+{
+    std::lock_guard l(g_m);
+    auto            it = g_meshes.find(mod);
+    return it != g_meshes.end() && it->second.ready && CachedPose(it->second, comp, g_frame_id) != nullptr;
 }
 
 bool RingSeen(uint64_t ring)
@@ -553,20 +571,23 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
             SkipLocked("sub-draw past the mod's index buffer", mod, comp);
             return out;
         }
-        Sec sec;
-        if (!LookupSection(ctx.ring, comp, frame, &sec)) {
-            SkipLocked("no skin cache palette for this ring and section this frame", mod, comp);
+        Sec        sec;
+        const bool fresh = LookupSection(ctx.ring, comp, frame, &sec);
+        // no palette this frame (the skin cache did not pose the section): our last pose of it, drawn as it was
+        Slot* cached = fresh ? nullptr : CachedPose(m, comp, frame);
+        if (!fresh && !cached) {
+            SkipLocked("no skin cache palette for this ring and section this frame, and no earlier pose of ours", mod, comp);
             return out;
         }
         Bind* bind = nullptr;
-        if (!AcquireSlot(m, cmd_list, gen, frame, bind)) {
+        if (fresh && !AcquireSlot(m, cmd_list, gen, frame, bind)) {
             SkipLocked("no free output buffer", mod, comp);
             return out;
         }
-        Slot& sl = m.slots[size_t(bind->slot)];
+        Slot& sl = fresh ? m.slots[size_t(bind->slot)] : *cached;
         // last frame's pose of this component (the VS's previous positions, for motion vectors)
         Slot* prev = nullptr;
-        {
+        if (fresh) {
             const auto pit = m.poses.find(comp);
             if (pit != m.poses.end()) {
                 const Pose& p = pit->second.first.frame == frame ? pit->second.second : pit->second.first;
@@ -645,6 +666,18 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
                 memcpy(vf_words, want, sizeof want);
             }
         }
+        if (!fresh) {
+            sl.used = frame;
+            sl.stamp = GpuStamp();
+            vbv = { sl.pos->GetGPUVirtualAddress(), m.verts * 12, 12 };
+            vbv_prev = vbv;
+            ++g_cached;
+            char key[48];
+            snprintf(key, sizeof key, "cached %d %d", mod, comp);
+            char line[160];
+            snprintf(line, sizeof line, "RTM2 mod=%d comp=%d drawn with its last pose (the skin cache did not pose the section this frame)", mod, comp);
+            LogOnce(key, line);
+        } else {
         // pose: COMMON | read -> UAV, dispatch, -> read
         const D3D12_RESOURCE_STATES from = bind->state == 2 ? kRead : D3D12_RESOURCE_STATE_COMMON;
         if (bind->state != 1) Transition(cl, sl.pos.Get(), sl.tan.Get(), from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -680,6 +713,7 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         char key[48];
         snprintf(key, sizeof key, "first %d %d", mod, comp);
         LogOnce(key, first);
+        }
     }
     // the game's graphics PSO back (the dispatch replaced it); the core's variants are applied after this
     cl->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(st.gfx_restore()));
@@ -713,9 +747,9 @@ std::string Status()
         ready += m.ready ? 1 : 0;
         slots += m.slots.size();
     }
-    snprintf(b, sizeof b, "m2 pipeline=%s meshes=%zu/%zu slots=%zu draws=%llu dispatches=%llu skips=%llu last_skip=%s rings=%zu views=%u",
+    snprintf(b, sizeof b, "m2 pipeline=%s meshes=%zu/%zu slots=%zu draws=%llu dispatches=%llu cached=%llu skips=%llu last_skip=%s rings=%zu views=%u",
         g_pso ? "ok" : (g_pipeline_why.empty() ? "not yet" : g_pipeline_why.c_str()), ready, g_meshes.size(), slots,
-        (unsigned long long)g_draws, (unsigned long long)g_dispatches, (unsigned long long)g_skips,
+        (unsigned long long)g_draws, (unsigned long long)g_dispatches, (unsigned long long)g_cached, (unsigned long long)g_skips,
         g_last_skip.empty() ? "-" : g_last_skip.c_str(), g_rings.size(), g_heap_next);
     return b;
 }

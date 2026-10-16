@@ -261,6 +261,8 @@ private:
     std::wstring                                              dir_;
 };
 ObserveLog g_log;
+std::mutex                      g_held_m;
+std::map<std::string, uint64_t> g_held_why; // g_held_m: M2 holds by reason (RTSUM)
 
 const char* ModeText(int m)
 {
@@ -271,7 +273,11 @@ const char* ModeText(int m)
 
 void Summary()
 {
-    const std::string m2 = Mode() == 2 ? rtskin::Status() : std::string("m2 off");
+    std::string m2 = Mode() == 2 ? rtskin::Status() : std::string("m2 off");
+    {
+        std::lock_guard l(g_held_m);
+        for (const auto& [why, n] : g_held_why) m2 += " | held " + std::to_string(n) + ": " + why;
+    }
     std::string rings;
     {
         std::lock_guard l(g_m);
@@ -452,10 +458,10 @@ std::atomic<bool> g_palfmt_told{ false }, g_globals_told{ false };
 // M2: why a claim stayed the game's (one line per mod, component and reason; counted in RTSUM's held).
 void NoteHeld(int mod, int comp, const char* why)
 {
-    static std::mutex                                 s_m;
     static std::set<std::tuple<int, int, const char*>> s_seen;
     {
-        std::lock_guard l(s_m);
+        std::lock_guard l(g_held_m);
+        ++g_held_why[why];
         if (s_seen.size() >= 512 || !s_seen.insert({ mod, comp, why }).second) return;
     }
     g_log.Line(true, "RTM2 held mod=%d comp=%d (drawn by the game, vanilla): %s", mod, comp, why);
@@ -869,7 +875,8 @@ bool RtClaimNote(const RtClaimInfo& in)
             if (!rtskin::MeshReady(in.mod)) why = "the mod's mesh is not loaded (yet)";
             else if (rtskin::SectionKnown(vb0, in.comp)) ring = vb0;
             else if (reg_ring && rtskin::SectionKnown(reg_ring, in.comp)) ring = reg_ring;
-            else why = "no complete skin cache layout / palette for this section this frame";
+            else if (rtskin::PoseCached(in.mod, in.comp)) ring = seen && rtskin::RingSeen(vb0) ? vb0 : (reg_ring ? reg_ring : vb0);
+            else why = "no complete skin cache layout / palette for this section this frame, and no earlier pose";
         }
         if (why) NoteHeld(in.mod, in.comp, why);
         if (!why) {

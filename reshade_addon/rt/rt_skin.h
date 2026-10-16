@@ -31,6 +31,7 @@ bool ClaimActive();                                            // ...on whatever
 // Has the skin cache posed section `comp` of this ring recently enough for its palette to be used?
 bool SectionKnown(uint64_t ring, int comp);
 bool RingSeen(uint64_t ring); // has a skin cache dispatch written this buffer recently?
+bool PoseCached(int mod, int comp); // do we have a recent pose of ours of this component (stands in for a missing palette)?
 
 // The mod's meshes: asked for from any thread, loaded on the present thread (RtPresentTick).
 bool MeshReady(int mod);
