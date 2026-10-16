@@ -79,6 +79,10 @@ bool RtClaimNote(const RtClaimInfo& info);
 // texture placement swaps, shapekey relocation, the [Present] lists): the module's observe mode while the
 // game ray traces. false whenever RT is off.
 bool RtHoldVanilla();
+// Every indexed draw, before the core looks at it (draw_hook.cpp): the module samples, on observation frames
+// only, which index windows the draws reading a BLAS vertex base use. Records only; never changes the draw.
+void RtObserveDraw(reshade::api::command_list* cmd_list, uint32_t index_count, uint32_t first_index, int32_t vertex_offset,
+    uint64_t vs_hash);
 // The game issued DispatchRays (removal_pin.cpp): ray tracing is on even in a frame without a BLAS build.
 void RtNoteRays();
 // Once per frame from the present path, while the add-on is enabled: the module's hold transitions

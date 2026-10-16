@@ -26,6 +26,7 @@
 #include "rt_registry.h"
 #include <cstdarg>
 #include <map>
+#include <set>
 #include <share.h>
 #include <tuple>
 
@@ -52,6 +53,8 @@ std::atomic<int>      g_mode{ -1 }; // -1 unread, 0 off, 1 observe
 std::atomic<uint32_t> g_last_rt_frame{ 0 };
 std::atomic<uint32_t> g_ring_count{ 0 };
 std::atomic<uint32_t> g_ring_gen{ 0 };
+std::atomic<size_t>   g_comps_n{ 0 };                  // loaded component windows (g_comps)
+std::atomic<uint64_t> g_sig_rings{ 0 }, g_rt_draws{ 0 }; // rings learned from a BLAS signature; sampled draws
 
 struct Counters {
     std::atomic<uint64_t> blas_builds{ 0 }, blas_bottom{ 0 }, rays{ 0 }, claims{ 0 }, claims_identified{ 0 }, claims_held{ 0 },
@@ -251,7 +254,7 @@ void Summary()
     g_log.Line(true,
         "RTSUM active=%d blas=%llu bottom=%llu rays=%llu claims=%llu identified=%llu held=%llu ring_dispatches=%llu "
         "pal_records=%llu snapshots=%llu upload=%llu faults=%llu bins=%llu dropped_lines=%llu dropped_bins=%llu "
-        "unstamped=%llu best_bone_run=%u (cs=%016llx param=%u) inspect_us=%llu rings=%u:%s",
+        "unstamped=%llu best_bone_run=%u (cs=%016llx param=%u) inspect_us=%llu components=%zu sig_rings=%llu rt_draws=%llu rings=%u:%s",
         RtActive() ? 1 : 0, (unsigned long long)g_c.blas_builds.load(), (unsigned long long)g_c.blas_bottom.load(),
         (unsigned long long)g_c.rays.load(), (unsigned long long)g_c.claims.load(), (unsigned long long)g_c.claims_identified.load(),
         (unsigned long long)g_c.claims_held.load(), (unsigned long long)g_c.ring_dispatches.load(),
@@ -259,7 +262,8 @@ void Summary()
         (unsigned long long)g_c.snapshot_upload.load(), (unsigned long long)g_c.snapshot_faults.load(),
         (unsigned long long)g_c.bins.load(), (unsigned long long)g_c.dropped_lines.load(), (unsigned long long)g_c.dropped_bins.load(),
         (unsigned long long)g_c.unstamped.load(), g_c.best_bone_run.load(), (unsigned long long)g_c.best_bone_cs.load(),
-        g_c.best_bone_param.load(), (unsigned long long)g_c.inspect_us.load(), g_ring_count.load(), rings.c_str());
+        g_c.best_bone_param.load(), (unsigned long long)g_c.inspect_us.load(), g_comps_n.load(),
+        (unsigned long long)g_sig_rings.load(), (unsigned long long)g_rt_draws.load(), g_ring_count.load(), rings.c_str());
 }
 
 uint64_t BufferVa(resource res, uint64_t offset) // ReShade DX12: a null resource carries the VA in `offset`
@@ -358,6 +362,19 @@ constexpr size_t                                             kMaxPrevSnaps = 512
 
 std::map<int, RtDrawVb> g_draw_vb;
 
+// The loaded mods' component windows, copied on the present thread (where the core loads them) for the
+// BLAS-signature match on other threads. g_m.
+std::vector<rtm::CompWindow> g_comps;
+std::set<std::tuple<uint64_t, uint32_t, uint32_t>> g_seen_draws; // (vb0, first, count) already logged
+constexpr size_t                                   kMaxSeenDraws = 1024;
+
+const rtm::CompWindow* CompAt(uint32_t first, uint32_t count) // g_m held
+{
+    for (const rtm::CompWindow& c : g_comps)
+        if (c.first == first && c.count == count) return &c;
+    return nullptr;
+}
+
 } // namespace
 
 // ==== rt_hooks.h =================================================================================
@@ -389,6 +406,29 @@ void RtPresentTick()
             Mode() ? "mods held while the game ray traces" : "off: the add-on stops while the game ray traces");
         g_log.Line(true, "RTSTART module M1 observe, rt_mode=%d; waiting for ray tracing (BLAS builds / DispatchRays)", Mode());
     }
+    {
+        static size_t s_comps_seen = SIZE_MAX;
+        static bool   s_loaded_seen = false;
+        if (g_merged_comps.size() != s_comps_seen || g_merged_loaded != s_loaded_seen) {
+            s_comps_seen = g_merged_comps.size();
+            s_loaded_seen = g_merged_loaded;
+            std::vector<rtm::CompWindow> comps;
+            for (const MergedComp& c : g_merged_comps) comps.push_back({ c.mod_id, c.comp_idx, c.first_index, c.match_count });
+            g_log.Line(true, "RTMODS merged_loaded=%d merged_enable=%d geomods=%zu components=%zu", g_merged_loaded ? 1 : 0,
+                g_merged_enable ? 1 : 0, g_geomods.size(), comps.size());
+            ReshadeLog(reshade::log::level::info, "wwmi-dx12 RT module: %zu mod(s), %zu component window(s) loaded", g_geomods.size(),
+                comps.size());
+            for (size_t i = 0; i < g_merged_comps.size() && i < 96; ++i) {
+                const MergedComp& c = g_merged_comps[i];
+                const std::string ns = c.mod_id >= 0 && size_t(c.mod_id) < g_geomods.size() ? Utf8(g_geomods[c.mod_id].wcl_ns) : std::string();
+                g_log.Line(true, "  mod=%d comp=%d first=%u count=%u hide=%d ns=%s", c.mod_id, c.comp_idx, c.first_index, c.match_count,
+                    c.hide ? 1 : 0, ns.c_str());
+            }
+            std::lock_guard l(g_m);
+            g_comps.swap(comps);
+            g_comps_n.store(g_comps.size(), std::memory_order_relaxed);
+        }
+    }
     const bool held = RtHoldVanilla();
     if (held && !s_held) {
         const UnstampTally t = UnstampAll(TexHoldForRetry); // as C1/C2 off does: the game's textures back, kept for retry
@@ -407,6 +447,38 @@ void RtPresentTick()
         Summary();
     }
     g_log.Flush();
+}
+
+void RtObserveDraw(command_list* cmd_list, uint32_t index_count, uint32_t first_index, int32_t vertex_offset, uint64_t vs_hash)
+{
+    if (!cmd_list || !rtm::IsObservationFrame(g_frame_id) || !RtActive() || Mode() == 0) return;
+    const CmdState& st = CmdGfx(cmd_list);
+    const uint64_t  vb0 = st.vb[0].va;
+    if (!vb0) return;
+    const uint32_t stride = st.vb[0].stride;
+    const uint64_t ib = st.ib.va;
+    const uint32_t ib_w = st.ib.index_bytes;
+    bool           fresh = false, ring = false;
+    int            comp_mod = -1, comp_idx = -1;
+    {
+        std::lock_guard l(g_m);
+        ring = g_reg.IsSkinOut(vb0, 1);
+        if (!ring && !g_reg.HasGeomVb(vb0)) return;
+        const auto key = std::make_tuple(vb0, first_index, index_count);
+        if (!g_seen_draws.count(key) && g_seen_draws.size() < kMaxSeenDraws) {
+            g_seen_draws.insert(key);
+            fresh = true;
+            if (const rtm::CompWindow* c = CompAt(first_index, index_count)) {
+                comp_mod = c->mod;
+                comp_idx = c->comp;
+            }
+        }
+    }
+    g_rt_draws.fetch_add(1, std::memory_order_relaxed);
+    if (!fresh) return;
+    g_log.Line(true, "RTDRAW vb0=%llx%s stride=%u ib=%llx width=%u first=%u count=%u vertex_offset=%d vs=%016llx -> %s mod=%d comp=%d",
+        (unsigned long long)vb0, ring ? " (ring)" : " (BLAS vertex base)", stride, (unsigned long long)ib, ib_w, first_index, index_count,
+        vertex_offset, (unsigned long long)vs_hash, comp_mod >= 0 ? "IS a component window" : "no component window", comp_mod, comp_idx);
 }
 
 bool RtClaimNote(const RtClaimInfo& in)
@@ -468,14 +540,28 @@ bool RtOnBlasBuild(command_list*, acceleration_structure_type type, acceleration
         g.transformed = t.transform_buffer.handle != 0 || t.transform_offset != 0;
         geoms.push_back(g);
     }
-    std::vector<rtm::RingEvent> ev;
+    std::vector<rtm::RingEvent>    ev;
+    std::vector<rtm::SignatureHit> fresh;
     {
         std::lock_guard l(g_m);
         ev = g_reg.NoteBlas(geoms, g_frame_id);
+        if (!g_comps.empty())
+            for (const rtm::SignatureHit& h : rtm::MatchSignatures(geoms, g_comps)) {
+                const bool known = g_reg.RingAt(h.vb, 1) != nullptr;
+                g_reg.NoteRing(h.vb, h.bytes, h.mod, false, g_frame_id); // learns or confirms
+                if (!known) fresh.push_back(h);
+            }
         SyncAtomics();
     }
     for (const auto& e : ev)
         if (e.is_new) LogRing(e, mode == acceleration_structure_build_mode::update ? "blas-update" : "blas-build");
+    for (const rtm::SignatureHit& h : fresh) {
+        g_sig_rings.fetch_add(1, std::memory_order_relaxed);
+        g_log.Line(true, "RTRING NEW via blas-signature: va=%llx bytes=%llu mod=%d geometries=%u (of %u in the build) first index at "
+                         "the lowest IB=%u dest=%llx",
+            (unsigned long long)h.vb, (unsigned long long)h.bytes, h.mod, h.geometries, input_count, h.base_first,
+            (unsigned long long)dest.handle);
+    }
     return false; // M1: the game's own build always runs unchanged
 }
 

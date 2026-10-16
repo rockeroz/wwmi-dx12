@@ -96,6 +96,7 @@ public:
             if (geoms_.size() >= kMaxGeoms && !geoms_.count(k)) EvictOldest(geoms_);
             geoms_[k] = g;
             geoms_[k].frame = frame;
+            if (geom_vbs_.size() < kMaxGeoms || geom_vbs_.count(g.vb)) geom_vbs_[g.vb] = frame;
             auto d = draws_.find(k);
             if (d != draws_.end() && Agree(g, d->second)) Learn(g, d->second, frame, out);
         }
@@ -186,6 +187,8 @@ public:
     uint32_t                 Gen() const { return gen_; }
     const std::vector<Ring>& Rings() const { return rings_; }
     size_t                   PendingGeoms() const { return geoms_.size(); }
+    // Was this VA the vertex base of a recent BLAS triangle geometry?
+    bool HasGeomVb(uint64_t vb) const { return vb && geom_vbs_.count(vb) != 0; }
     size_t                   PendingDraws() const { return draws_.size(); }
 
     void Expire(uint32_t frame)
@@ -199,6 +202,8 @@ public:
         if (rings_.size() != before) ++gen_;
         DropOld(geoms_, frame);
         DropOld(draws_, frame);
+        for (auto it = geom_vbs_.begin(); it != geom_vbs_.end();)
+            it = (frame - it->second > kKeepFrames) ? geom_vbs_.erase(it) : std::next(it);
         PruneRingGeoms();
     }
 
@@ -265,9 +270,102 @@ private:
     std::map<Key, DrawNote>                                             draws_;
     std::vector<Ring>                                                   rings_;
     std::map<uint64_t, std::vector<std::pair<uint64_t, uint32_t>>>     ring_geoms_;
+    std::map<uint64_t, uint32_t>                                        geom_vbs_; // vertex base -> last frame seen
     uint32_t                                                            gen_ = 0;
     uint32_t                                                            last_expire_ = 0;
 };
+
+// ---- a BLAS build explained by a mod's component windows ------------------------------------------
+// The mod's ini names each component by the ORIGINAL mesh's index window (match_first_index /
+// match_index_count). A skinned character's BLAS has one triangle geometry per drawn section, all reading
+// the same vertex base, each starting at IB + first * width. If one mod's windows explain EVERY geometry
+// of a build -- same counts, same relative first indices -- the build is that character's, whatever its
+// raster draws look like. One geometry alone is too weak unless its count is unique among all components.
+struct CompWindow {
+    int      mod = -1;
+    int      comp = -1;
+    uint32_t first = 0;
+    uint32_t count = 0;
+};
+struct SignatureHit {
+    int      mod = -1;
+    uint64_t vb = 0;
+    uint64_t bytes = 0;
+    uint32_t geometries = 0;
+    uint32_t base_first = 0; // the first index of the build's lowest index VA, per the mod's windows
+};
+inline std::vector<SignatureHit> MatchSignatures(const std::vector<BlasGeom>& geoms, const std::vector<CompWindow>& comps)
+{
+    std::vector<SignatureHit> hits;
+    if (comps.empty()) return hits;
+    // group usable geometries by vertex base
+    std::map<uint64_t, std::vector<const BlasGeom*>> by_vb;
+    for (const BlasGeom& g : geoms)
+        if (g.vb && g.ib && g.index_count && (g.index_width == 2 || g.index_width == 4) && !g.transformed && g.vertex_stride)
+            by_vb[g.vb].push_back(&g);
+    for (const auto& [vb, list] : by_vb) {
+        const uint32_t w = list.front()->index_width;
+        uint64_t       ib0 = UINT64_MAX;
+        bool           ok = true;
+        for (const BlasGeom* g : list) {
+            if (g->index_width != w) ok = false;
+            ib0 = (std::min)(ib0, g->ib);
+        }
+        if (!ok) continue;
+        std::vector<std::pair<uint64_t, uint32_t>> rel; // (first index relative to ib0, count)
+        for (const BlasGeom* g : list) {
+            const uint64_t d = g->ib - ib0;
+            if (d % w) {
+                ok = false;
+                break;
+            }
+            rel.emplace_back(d / w, g->index_count);
+        }
+        if (!ok) continue;
+        if (rel.size() == 1) { // a lone geometry: only if its count is unique among every component
+            const uint32_t c = rel.front().second;
+            int            owner = -1, n = 0;
+            for (const CompWindow& cw : comps)
+                if (cw.count == c) {
+                    ++n;
+                    owner = cw.mod;
+                }
+            if (n != 1 || c < 1024) continue;
+            hits.push_back({ owner, vb, uint64_t(list.front()->vertex_count) * list.front()->vertex_stride, 1u, 0u });
+            for (const CompWindow& cw : comps)
+                if (cw.count == c) hits.back().base_first = cw.first;
+            continue;
+        }
+        // the geometry at relative 0, aligned in turn to each component with its count, of each mod
+        const auto anchor = std::find_if(rel.begin(), rel.end(), [](const auto& r) { return r.first == 0; });
+        int        found = -1;
+        uint32_t   found_base = 0;
+        for (const CompWindow& a : comps) {
+            if (a.count != anchor->second) continue;
+            const uint64_t base = a.first;
+            bool           all = true;
+            for (const auto& [off, cnt] : rel) {
+                const bool m = std::any_of(comps.begin(), comps.end(), [&](const CompWindow& c) {
+                    return c.mod == a.mod && c.count == cnt && uint64_t(c.first) == base + off;
+                });
+                if (!m) {
+                    all = false;
+                    break;
+                }
+            }
+            if (!all) continue;
+            if (found >= 0 && found != a.mod) {
+                found = -2; // two mods explain it: refuse
+                break;
+            }
+            found = a.mod;
+            found_base = uint32_t(base);
+        }
+        if (found >= 0)
+            hits.push_back({ found, vb, uint64_t(list.front()->vertex_count) * list.front()->vertex_stride, uint32_t(rel.size()), found_base });
+    }
+    return hits;
+}
 
 // ---- bone-likeness of raw constant / buffer bytes -------------------------------------------------
 // A 3x4 row-major affine matrix (12 floats) whose 3x3 part looks like a rotation (+ mild scale) and whose

@@ -47,6 +47,7 @@ bool RtHoldVanilla()
     return false;
 }
 void RtNoteRays() {}
+void RtObserveDraw(reshade::api::command_list*, uint32_t, uint32_t, int32_t, uint64_t) {}
 void RtPresentTick() {}
 void RtDrawOverlay()
 {

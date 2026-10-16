@@ -25,6 +25,7 @@ bool on_draw_indexed_body(command_list* cmd_list, uint32_t index_count, uint32_t
     MigotoPort::FrameAnalysisDrawScope fa_scope;
     uint64_t                           vs_hash = 0;
     cmd_list->get_private_data(s_iid_vs_hash, &vs_hash);
+    RtObserveDraw(cmd_list, index_count, first_index, vertex_offset, vs_hash); // RT module: records only
     if (!vs_hash) return false;
     if (g_hide_vs_hash && vs_hash == g_hide_vs_hash) {
         t_x23_hidden = 1;

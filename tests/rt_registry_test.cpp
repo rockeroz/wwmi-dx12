@@ -189,8 +189,43 @@ static void judge()
     CHECK(IsObservationFrame(3600) && !IsObservationFrame(3602));
 }
 
+static void signatures()
+{
+    // the Hsin body windows from the 0.1.2 capture: 8 geometries over one vertex base
+    const uint32_t first[8] = { 0, 24111, 51186, 68460, 134256, 135684, 209574, 247680 };
+    const uint32_t count[8] = { 24111, 27075, 17274, 65796, 1428, 73890, 38106, 107763 };
+    std::vector<CompWindow> comps;
+    for (int i = 0; i < 8; ++i) comps.push_back({ 0, i, first[i], count[i] });
+    comps.push_back({ 1, 0, 0, 20496 }); // another mod: a lone accessory
+    std::vector<BlasGeom> geoms;
+    const uint64_t        ib = 0x1c578d3200;
+    for (int i = 0; i < 8; ++i) geoms.push_back(Geom(0x1d20c00000, ib + uint64_t(first[i]) * 4, count[i]));
+    auto hits = MatchSignatures(geoms, comps);
+    CHECK(hits.size() == 1 && hits[0].mod == 0 && hits[0].geometries == 8 && hits[0].base_first == 0);
+    // the same build starting at another first index (the IB start not at component 0): still found
+    geoms.erase(geoms.begin());
+    hits = MatchSignatures(geoms, comps);
+    CHECK(hits.size() == 1 && hits[0].mod == 0 && hits[0].base_first == 24111);
+    // one count off: refused
+    geoms[2].index_count += 3;
+    CHECK(MatchSignatures(geoms, comps).empty());
+    // a lone geometry with a unique count
+    hits = MatchSignatures({ Geom(0x1d20e00000, 0xc188100, 20496, 5495) }, comps);
+    CHECK(hits.size() == 1 && hits[0].mod == 1);
+    // a lone geometry whose count two components share: refused
+    comps.push_back({ 2, 0, 500, 20496 });
+    CHECK(MatchSignatures({ Geom(0x1d20e00000, 0xc188100, 20496, 5495) }, comps).empty());
+    // the registry remembers vertex bases
+    Registry r;
+    r.NoteBlas({ Geom(0x9000000, 0x100, 30) }, 5);
+    CHECK(r.HasGeomVb(0x9000000) && !r.HasGeomVb(0x9000004));
+    r.Expire(5 + Registry::kKeepFrames + 1);
+    CHECK(!r.HasGeomVb(0x9000000));
+}
+
 int main()
 {
+    signatures();
     blas_then_draw();
     draw_then_blas();
     mismatches_do_not_learn();
