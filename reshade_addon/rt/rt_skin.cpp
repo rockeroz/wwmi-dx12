@@ -52,9 +52,11 @@ constexpr uint32_t kSectionAge = 1;   // frames a recorded palette stays usable 
 std::mutex g_m; // everything below
 
 struct Sec {
-    uint64_t pal = 0;
-    uint32_t bones = 0;
-    uint64_t tan_ring = 0;
+    uint64_t        pal = 0;
+    uint32_t        bones = 0;
+    uint64_t        tan_ring = 0;
+    ID3D12Resource* pal_res = nullptr; // the palette's buffer and offset in it (merged skeletons copy from it)
+    uint64_t        pal_off = 0;
 };
 // A ring's sections by their start vertex in it ($Globals SkinCacheStart): section k = the k-th start. Dispatch order
 // is not section order (two shader variants pose different sections, and a pass can straddle a frame id).
@@ -79,6 +81,7 @@ struct Slot {
     uint32_t                    tan_fmt = 0;
     uint64_t                    stamp = 0;          // GPU progress when last written or read
     uint32_t                    used = UINT32_MAX;  // frame last written or read (kept two frames: the next frame's history)
+    ComPtr<ID3D12Resource>      merged;             // merged-skeleton mods: every section's palette at vg_offset
 };
 struct Pose {
     int      slot = -1;
@@ -94,6 +97,15 @@ struct Mesh {
     std::vector<Slot>                               slots;
     std::map<uint32_t, D3D12_CPU_DESCRIPTOR_HANDLE> uv_views, color_views;
     std::map<int, std::pair<Pose, Pose>>            poses; // component -> (latest pose, the one before): velocity history
+    // WWMI merged skeleton ($\WWMIv1\vg_offset / vg_count): the mod's bone indices address every section's palette
+    // laid end to end, section k's first vg_count bones at vg_offset
+    struct MergedComp {
+        int      index;
+        uint32_t offset, count;
+    };
+    std::vector<MergedComp> merged;
+    uint32_t                merged_bones = 0;
+    Pose                    merged_cur, merged_prev; // the last merged palettes built (velocity-free history)
 };
 std::map<int, Mesh> g_meshes;
 std::set<int>       g_requested;
@@ -108,6 +120,7 @@ struct Bind {
     int      slot = -1;
     int      state = 0; // 0 COMMON, 1 UAV, 2 read
     uint32_t frame = 0;
+    bool     merged_built = false;
 };
 std::map<BindKey, Bind> g_binds;
 
@@ -239,6 +252,16 @@ bool LoadMesh(Mesh& m) // g_m NOT held (file and GPU work); the caller publishes
     m.blend_stride = blend.stride;
     m.influences = blend.stride / 2;
     m.uv_stride = uv.stride;
+    for (const WwmiMod::Component& wc : mod.comps) {
+        if (wc.remapped) {
+            m.why = "remapped skeleton (BlendRemap) not supported yet";
+            return false;
+        }
+        if (wc.vg_count) {
+            m.merged.push_back({ int(wc.index), wc.vg_offset, wc.vg_count });
+            m.merged_bones = (std::max)(m.merged_bones, wc.vg_offset + wc.vg_count);
+        }
+    }
     m.has_color = !col.bytes.empty() && col.stride == 4 && col.bytes.size() >= size_t(m.verts) * 4;
     if (!m.has_color) col.bytes.clear();
     if (!m.verts || !m.indices || (m.blend_stride != 8 && m.blend_stride != 16) || blend.bytes.size() < size_t(m.verts) * m.blend_stride ||
@@ -395,6 +418,50 @@ bool LookupSection(uint64_t ring, int comp, uint32_t frame, Sec* out) // g_m hel
     return true;
 }
 
+// Merged skeleton for this list's slot: last frame's merged palettes as the base, then every section posed this frame
+// copied over its range. false = nothing to build from (no base, not every section posed).
+bool BuildMerged(Mesh& m, Slot& sl, Bind& bind, int self_slot, uint64_t ring, uint32_t frame, ID3D12GraphicsCommandList* cl) // g_m held
+{
+    if (bind.merged_built) return true;
+    const uint64_t bytes = uint64_t(m.merged_bones) * 48;
+    if (!sl.merged && FAILED(CreateD3D12Buffer(g_d3d12_device, D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COMMON, &sl.merged)))
+        return false;
+    Slot*       base = nullptr;
+    const Pose& bp = m.merged_cur.frame < frame ? m.merged_cur : m.merged_prev;
+    if (bp.slot >= 0 && bp.slot != self_slot && size_t(bp.slot) < m.slots.size() && bp.frame < frame && m.slots[size_t(bp.slot)].merged)
+        base = &m.slots[size_t(bp.slot)];
+    std::vector<std::pair<const Mesh::MergedComp*, Sec>> fresh;
+    for (const Mesh::MergedComp& mc : m.merged) {
+        Sec x;
+        if (LookupSection(ring, mc.index, frame, &x) && x.pal_res) fresh.push_back({ &mc, x });
+    }
+    if (!base && fresh.size() != m.merged.size()) return false;
+    if (fresh.empty() && !base) return false;
+    D3D12_RESOURCE_BARRIER br{};
+    br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    br.Transition.pResource = sl.merged.Get();
+    br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    br.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    br.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    cl->ResourceBarrier(1, &br);
+    if (base) {
+        cl->CopyBufferRegion(sl.merged.Get(), 0, base->merged.Get(), 0, bytes);
+        base->used = frame;
+        base->stamp = GpuStamp();
+    }
+    for (const auto& [mc, x] : fresh) {
+        const uint32_t n = (std::min)(mc->count, x.bones);
+        if (n && uint64_t(mc->offset + n) * 48 <= bytes) cl->CopyBufferRegion(sl.merged.Get(), uint64_t(mc->offset) * 48, x.pal_res, x.pal_off, uint64_t(n) * 48);
+    }
+    br.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    br.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    cl->ResourceBarrier(1, &br);
+    bind.merged_built = true;
+    if (m.merged_cur.frame != frame) m.merged_prev = m.merged_cur;
+    m.merged_cur = { self_slot, frame };
+    return true;
+}
+
 constexpr uint32_t kCachedPose = 3600; // frames our last pose may stand in for a section the skin cache left as it was
 
 Slot* CachedPose(Mesh& m, int comp, uint32_t frame) // g_m held
@@ -414,7 +481,7 @@ bool Overlaps(const ResInfo& ri, uint64_t va)
 } // namespace
 
 void NoteSection(uint64_t ring_va, uint32_t start, uint64_t palette_va, uint32_t bones, uint64_t tangent_ring_va, uint32_t expected,
-    uint32_t frame)
+    uint32_t frame, ID3D12Resource* palette_res, uint64_t palette_off)
 {
     std::lock_guard l(g_m);
     if (g_rings.size() >= 64 && !g_rings.count(ring_va))
@@ -429,7 +496,7 @@ void NoteSection(uint64_t ring_va, uint32_t start, uint64_t palette_va, uint32_t
     const bool fresh = !r.by_start.count(start);
     if (fresh && r.by_start.size() >= 32) return;
     SecRec& rec = r.by_start[start];
-    rec.s = { palette_va, bones, tangent_ring_va };
+    rec.s = { palette_va, bones, tangent_ring_va, palette_res, palette_off };
     rec.frame = frame;
     if (fresh) { // the layout as it grows (one line per distinct layout)
         std::string lay;
@@ -449,6 +516,13 @@ bool SectionKnown(uint64_t ring, int comp)
 {
     std::lock_guard l(g_m);
     return LookupSection(ring, comp, g_frame_id, nullptr);
+}
+
+bool MeshFailed(int mod)
+{
+    std::lock_guard l(g_m);
+    auto            it = g_meshes.find(mod);
+    return it != g_meshes.end() && it->second.failed;
 }
 
 bool PoseCached(int mod, int comp)
@@ -511,8 +585,9 @@ void PresentTick()
         Mesh m;
         m.mod = mod;
         const bool ok = LoadMesh(m);
-        Log(true, "RTM2 mesh mod=%d %s: verts=%u indices=%u influences=%u uv_stride=%u color=%d%s%s", mod, ok ? "loaded" : "FAILED", m.verts,
-            m.indices, m.influences, m.uv_stride, m.has_color ? 1 : 0, ok ? "" : " -- ", ok ? "" : m.why.c_str());
+        Log(true, "RTM2 mesh mod=%d %s: verts=%u indices=%u influences=%u uv_stride=%u color=%d merged_skeleton=%u bones (%zu sections)%s%s", mod,
+            ok ? "loaded" : "FAILED", m.verts, m.indices, m.influences, m.uv_stride, m.has_color ? 1 : 0, m.merged_bones, m.merged.size(),
+            ok ? "" : " -- ", ok ? "" : m.why.c_str());
         std::lock_guard l(g_m);
         m.ready = ok;
         m.failed = !ok;
@@ -577,8 +652,16 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
             SkipLocked("sub-draw past the mod's index buffer", mod, comp);
             return out;
         }
-        Sec        sec;
-        const bool fresh = LookupSection(ctx.ring, comp, frame, &sec);
+        Sec  sec;
+        bool fresh = LookupSection(ctx.ring, comp, frame, &sec);
+        if (!m.merged.empty()) { // merged skeleton: any section posed this frame, or last frame's palettes, will do
+            bool any = false;
+            for (const Mesh::MergedComp& mc : m.merged) {
+                Sec x;
+                any = any || LookupSection(ctx.ring, mc.index, frame, &x);
+            }
+            fresh = any;
+        }
         // no palette this frame (the skin cache did not pose the section): our last pose of it, drawn as it was
         Slot* cached = fresh ? nullptr : CachedPose(m, comp, frame);
         if (!fresh && !cached) {
@@ -591,6 +674,16 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
             return out;
         }
         Slot& sl = fresh ? m.slots[size_t(bind->slot)] : *cached;
+        uint64_t palette_va = sec.pal;
+        uint32_t palette_bones = sec.bones;
+        if (fresh && !m.merged.empty()) {
+            if (!BuildMerged(m, sl, *bind, bind->slot, ctx.ring, frame, cl)) {
+                SkipLocked("merged skeleton: not every section posed and no earlier merged palettes", mod, comp);
+                return out;
+            }
+            palette_va = sl.merged->GetGPUVirtualAddress();
+            palette_bones = m.merged_bones;
+        }
         // last frame's pose of this component (the VS's previous positions, for motion vectors)
         Slot* prev = nullptr;
         if (fresh) {
@@ -687,7 +780,7 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         // pose: COMMON | read -> UAV, dispatch, -> read
         const D3D12_RESOURCE_STATES from = bind->state == 2 ? kRead : D3D12_RESOURCE_STATE_COMMON;
         if (bind->state != 1) Transition(cl, sl.pos.Get(), sl.tan.Get(), from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        const uint32_t consts[12] = { s2, c, m.verts, sec.bones, m.influences, m.blend_stride, 0u, 0u, 0u, 0u, 0u, 0u };
+        const uint32_t consts[12] = { s2, c, m.verts, palette_bones, m.influences, m.blend_stride, 0u, 0u, 0u, 0u, 0u, 0u };
         cl->SetComputeRootSignature(g_rs.Get());
         cl->SetPipelineState(g_pso.Get());
         cl->SetComputeRoot32BitConstants(0, 12, consts, 0);
@@ -695,7 +788,7 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         cl->SetComputeRootShaderResourceView(2, m.pos->GetGPUVirtualAddress());
         cl->SetComputeRootShaderResourceView(3, m.blend->GetGPUVirtualAddress());
         cl->SetComputeRootShaderResourceView(4, m.vec->GetGPUVirtualAddress());
-        cl->SetComputeRootShaderResourceView(5, sec.pal);
+        cl->SetComputeRootShaderResourceView(5, palette_va);
         cl->SetComputeRootUnorderedAccessView(6, sl.pos->GetGPUVirtualAddress());
         cl->SetComputeRootUnorderedAccessView(7, sl.tan->GetGPUVirtualAddress());
         cl->Dispatch((c + 63) / 64, 1, 1);
@@ -714,7 +807,7 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         ++g_dispatches;
         char first[200];
         snprintf(first, sizeof first, "RTM2 first draw mod=%d comp=%d: %u indices from %u, %u bones, %zu fetch slot(s) replaced, LocalVF %s %08x %08x %08x %08x%s",
-            mod, comp, c, s2, sec.bones, slots.size(), have_vf ? "read" : "NOT read", vf_words[0], vf_words[1], vf_words[2], vf_words[3],
+            mod, comp, c, s2, palette_bones, slots.size(), have_vf ? "read" : "NOT read", vf_words[0], vf_words[1], vf_words[2], vf_words[3],
             vf_patch ? " (patched)" : "");
         char key[48];
         snprintf(key, sizeof key, "first %d %d", mod, comp);

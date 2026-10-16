@@ -524,17 +524,21 @@ void NoteSkinSection(command_list* cmd_list, const CmdState& state, uint64_t cs_
         if (!g_globals_told.exchange(true)) g_log.Line(true, "RTM2 skin cache $Globals not readable (p%u): sections not recorded", b0.param);
         return;
     }
-    uint64_t pal = 0;
-    uint32_t bones = 0;
+    uint64_t        pal = 0, pal_off = 0;
+    uint32_t        bones = 0;
+    ID3D12Resource* pal_res = nullptr;
     if (resolve(t0, rpal)) {
+        pal_res = rpal.res;
         if (!t0.is_table) {
             pal = rpal.cached_va; // a root SRV: the address is the palette's
             bones = 256;
+            if (pal_res) pal_off = pal - pal_res->GetGPUVirtualAddress();
         } else if (rpal.view_handle) {
             const resource_view_desc vd = dev->get_resource_view_desc(resource_view{ rpal.view_handle });
             if (vd.type == resource_view_type::buffer && (vd.format == format::r32g32b32a32_float || vd.format == format::r32g32b32a32_uint ||
                                                              vd.format == format::r32g32b32a32_typeless)) {
                 pal = rpal.cached_va + vd.buffer.offset * 16;
+                pal_off = (pal_res ? rpal.cached_va - pal_res->GetGPUVirtualAddress() : 0) + vd.buffer.offset * 16;
                 bones = vd.buffer.size == UINT64_MAX ? 0u : uint32_t((std::min)(vd.buffer.size / 3, uint64_t(1024)));
             } else if (!g_palfmt_told.exchange(true))
                 g_log.Line(true, "RTM2 skin cache t0 view is not float4 (type %u fmt %u): sections not recorded", uint32_t(vd.type),
@@ -546,7 +550,7 @@ void NoteSkinSection(command_list* cmd_list, const CmdState& state, uint64_t cs_
         return;
     }
     const uint64_t tan_va = resolve(u0, rtan) ? rtan.cached_va : 0;
-    rtskin::NoteSection(ring, start, pal, bones, tan_va, expected, g_frame_id);
+    rtskin::NoteSection(ring, start, pal, bones, tan_va, expected, g_frame_id, pal_res, pal_off);
     g_c.sections.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -875,7 +879,8 @@ bool RtClaimNote(const RtClaimInfo& in)
             else why = "VB0 is not a skin cache ring the module saw posed, and no earlier pose";
         } else {
             rtskin::RequestMesh(in.mod);
-            if (!rtskin::MeshReady(in.mod)) why = "the mod's mesh is not loaded (yet)";
+            if (rtskin::MeshFailed(in.mod)) why = "the module cannot draw this mod (see RTM2 mesh FAILED)";
+            else if (!rtskin::MeshReady(in.mod)) why = "the mod's mesh is not loaded (yet)";
             else if (rtskin::SectionKnown(vb0, in.comp)) ring = vb0;
             else if (reg_ring && rtskin::SectionKnown(reg_ring, in.comp)) ring = reg_ring;
             else if (rtskin::PoseCached(in.mod, in.comp)) ring = seen && rtskin::RingSeen(vb0) ? vb0 : (reg_ring ? reg_ring : vb0);

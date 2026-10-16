@@ -12,7 +12,8 @@ namespace rtskin {
 // A skin cache dispatch (any thread): the ring it writes (u1's buffer), the section's start vertex in it ($Globals
 // SkinCacheStart), its bone palette view and tangent output; `expected` = sections the ring's BLAS has (0 unknown).
 void NoteSection(uint64_t ring_va, uint32_t start, uint64_t palette_va, uint32_t bones, uint64_t tangent_ring_va, uint32_t expected,
-    uint32_t frame);
+    uint32_t frame, ID3D12Resource* palette_res, uint64_t palette_off);
+bool MeshFailed(int mod); // the module cannot draw this mod (RTM2 mesh FAILED says why)
 
 // What the module saw of the game's draw it is about to replace (draw_claim.cpp -> RtClaimNote, same thread).
 struct ClaimCtx {
