@@ -3,6 +3,8 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 #include <reshade.hpp>
 #include <d3d12.h>
 #include "rt_hooks.h"
@@ -43,6 +45,20 @@ void PresentTick(); // loads requested meshes, retires bindings
 // The draw (draw_section_draw.cpp -> RtSkinDraw): pose the sub-draw [s2, s2 + c) of component `comp` of mod `mod`,
 // bind it, redirect the VS's fetch buffers and LocalVF. Returns what the core must restore / whether to skip.
 VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* cl, int mod, int comp, uint32_t c, uint32_t s2);
+
+// M3: what the raster draws of section `comp` of the character whose skin cache ring is `ring` (either of the two the
+// pool alternates) last posed -- the mod that draws it, our posed positions (FLOAT3, `verts` of them) and the index
+// ranges of the mod's index buffer (R32) posed there. The positions buffer is marked in use this frame.
+struct GeomPose {
+    int                                        mod = -1;
+    uint64_t                                   pos_va = 0;
+    uint32_t                                   verts = 0;
+    ID3D12Resource*                            idx = nullptr;
+    uint32_t                                   indices = 0; // the mod's index buffer size (in indices)
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;      // (first index, count), sorted
+    uint32_t                                   frame = 0;   // when it was posed
+};
+bool PoseFor(uint64_t ring, int comp, uint32_t frame, GeomPose* out);
 
 std::string Status(); // one line for RTSUM / the overlay
 std::string Explain(uint64_t va, int comp, int mod); // why a section of this ring is (not) usable: for the held lines

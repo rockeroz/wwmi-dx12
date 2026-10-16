@@ -25,6 +25,8 @@
 // rt_mode=1 is M1 (observe and hold), rt_mode=0 the public build's behaviour.
 #include "../addon_common.h"
 #include "../hooks/resource_tracker.h"
+#include "../instrumentation/removal_pin.h"
+#include "../../src/d3d12_buffer.h"
 #include "../mods/layout_registry.h" // TableStartOf
 #include "../mods/skeleton.h"        // SnapshotGameCB
 #include "../textures/texture_module.h" // TexHoldForRetry / TexRetryMissed
@@ -37,8 +39,10 @@
 #include <unordered_map>
 #include <share.h>
 #include <tuple>
+#include <wrl/client.h>
 
 using namespace reshade::api;
+using Microsoft::WRL::ComPtr;
 
 namespace {
 
@@ -271,9 +275,11 @@ const char* ModeText(int m)
                   : "off: the add-on stops while the game ray traces";
 }
 
+std::string M3Status();
+
 void Summary()
 {
-    std::string m2 = Mode() == 2 ? rtskin::Status() : std::string("m2 off");
+    std::string m2 = Mode() == 2 ? rtskin::Status() + M3Status() : std::string("m2 off");
     {
         std::lock_guard l(g_held_m);
         for (const auto& [why, n] : g_held_why) m2 += " | held " + std::to_string(n) + ": " + why;
@@ -576,9 +582,11 @@ struct CopyRec {
     uint64_t        dst_va = 0, size = 0, src_va = 0;
     ID3D12Resource* src = nullptr;
     uint32_t        frame = 0;
+    const void*     cl = nullptr; // the recording it is in
+    uint64_t        gen = 0;
 };
 std::mutex g_copy_m;
-CopyRec    g_copies[256];
+CopyRec    g_copies[512];
 uint32_t   g_copy_next = 0;
 
 // The buffer holding a GPU address (resource handle when ReShade gave one, else the core's address map).
@@ -757,6 +765,553 @@ void ObserveRays(resource rg_res, uint64_t rg_off, uint64_t rg_size, resource mi
     }
 }
 
+// ---- M3: the mod's own BLAS in the character's place: named by its TLAS instance and its hit group records ----------
+// Facts this rests on (rt_observe.log, 2a398de): the character BLAS is built (then updated every frame) from the skin
+// cache ring, one geometry per mesh section, flags ALLOW_UPDATE | PREFER_FAST_BUILD; the TLAS instances are read from
+// an UPLOAD buffer; the hit group table (DEFAULT) is filled by a copy from UPLOAD in the frame; a character's records
+// are InstanceContributionToHitGroupIndex + 3 * geometry + ray type, 128 bytes: shader identifier (32), then UE's
+// hit group system parameters -- +32 index buffer (the BLAS's geometry 0 IB), +40 vertex buffer (the ring), +48
+// config (index stride | vertex stride << 8), +52 the geometry's offset in the index buffer (bytes) -- and nothing
+// else (no material). So the hit shaders read the index / vertex buffers the records name, with the primitive index
+// of the BLAS they hit: a BLAS of ours goes in only together with records naming our buffers, all or nothing, in a
+// command list not yet submitted (both are patched in the UPLOAD memory the GPU reads them from).
+struct ModBlas {
+    uint32_t                                                geoms = 0;
+    uint64_t                                                game_ib = 0; // the game's geometry 0 IB (its records' base)
+    std::vector<uint64_t>                                   game_off;    // each geometry's offset from it
+    uint32_t                                                game_iw = 0;
+    ComPtr<ID3D12Resource>                                  blas, scratch, ib;
+    uint64_t                                                blas_cap = 0, scratch_cap = 0;
+    std::vector<uint64_t>                                   vb;
+    std::vector<uint32_t>                                   verts, ib_off, ib_cnt, gflags;
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> sig;     // the topology built: ranges per geometry
+    std::vector<ID3D12Resource*>                            sig_idx; // ...of which mod index buffer
+    uint32_t                                                built = 0, updates = 0, builds = 0;
+    bool                                                    ok = false;
+    // where the TLAS instance naming it was last found / written
+    uint32_t inst_hint = UINT32_MAX, last_scan = 0, redirected = 0;
+    struct Written {
+        ID3D12Resource* res;
+        uint32_t        index, frame;
+    };
+    std::vector<Written> written; // instances we pointed at our BLAS (a game that does not rewrite them gets them back)
+};
+struct TlasRec {
+    const void*     cl = nullptr;
+    uint64_t        gen = 0;
+    uint32_t        frame = 0, count = 0;
+    ID3D12Resource* res = nullptr;
+    uint64_t        va = 0;
+};
+std::mutex                                           g_m3_m; // everything below
+std::map<uint64_t, ModBlas>                          g_m3;   // the game's BLAS (dest VA) -> ours
+std::vector<std::pair<ComPtr<ID3D12Resource>, uint32_t>> g_m3_grave; // retired buffers, the frame they left
+TlasRec                                              g_m3_tlas[8];
+uint32_t                                             g_m3_tlas_next = 0;
+std::map<std::string, uint64_t>                      g_m3_why; // refusals by reason
+uint64_t                                             g_m3_builds = 0, g_m3_updates = 0, g_m3_redirects = 0, g_m3_kept = 0;
+std::atomic<bool>                                    g_m3_any{ false };
+std::atomic<int>                                     g_m3_on{ -1 };
+ComPtr<ID3D12Device5>                                g_dev5;
+
+bool M3On()
+{
+    int v = g_m3_on.load(std::memory_order_relaxed);
+    if (v >= 0) return v != 0;
+    if (g_addon_ini_path.empty()) return false; // not read yet: nothing until it is
+    v = GetPrivateProfileIntW(L"wwmi-dx12", L"rt_m3", 1, g_addon_ini_path.c_str()) != 0 ? 1 : 0;
+    g_m3_on.store(v, std::memory_order_relaxed);
+    return v != 0;
+}
+
+void M3Refuse(const char* why) // g_m3_m held
+{
+    uint64_t& n = g_m3_why[why];
+    if (n++ == 0 || n == 100 || n == 10000) g_log.Line(true, "RTM3 refused (%llu): %s", (unsigned long long)n, why);
+}
+
+void M3Retire(ComPtr<ID3D12Resource>& r) // g_m3_m held: the GPU may still read it for a few frames
+{
+    if (r) g_m3_grave.push_back({ r, g_frame_id });
+    r.Reset();
+}
+
+// Write into a game UPLOAD buffer (its CPU-visible memory, read by the GPU when the list runs).
+uint8_t* MapUpload(ID3D12Resource* res, uint64_t va, uint64_t n)
+{
+    if (!res || HeapTypeOf(res) != int(D3D12_HEAP_TYPE_UPLOAD)) return nullptr;
+    const uint64_t base = res->GetGPUVirtualAddress(), width = res->GetDesc().Width;
+    if (va < base || va - base + n > width) return nullptr;
+    D3D12_RANGE none = { 0, 0 };
+    void*       p = nullptr;
+    if (FAILED(res->Map(0, &none, &p)) || !p) return nullptr;
+    return static_cast<uint8_t*>(p) + (va - base);
+}
+void UnmapUpload(ID3D12Resource* res)
+{
+    res->Unmap(0, nullptr);
+}
+bool GuardedCopy(void* dst, const void* src, size_t n)
+{
+#ifdef _MSC_VER
+    __try {
+        memcpy(dst, src, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    memcpy(dst, src, n);
+    return true;
+#endif
+}
+
+// The game builds / updates a character BLAS from a ring the module poses a mod for: build ours next to it, from the
+// raster's last poses of the mod's components (one geometry per section, as the game's).
+void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const acceleration_structure_build_input* inputs, uint32_t n,
+    acceleration_structure_build_mode mode)
+{
+    if (!M3On() || !cmd_list || !n || n > 64) return;
+    const uint32_t frame = g_frame_id;
+    std::vector<uint64_t> gib(n);
+    std::vector<uint32_t> gflags(n);
+    uint32_t              iw = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (inputs[i].type != acceleration_structure_build_input_type::triangles) return;
+        const auto& t = inputs[i].triangles;
+        if (!t.index_buffer.handle && !t.index_offset) return;
+        gib[i] = BufferVa(t.index_buffer, t.index_offset);
+        gflags[i] = uint32_t(inputs[i].flags);
+        iw = IndexWidth(t.index_format);
+    }
+    std::vector<rtskin::GeomPose> poses(n);
+    uint32_t                      have = 0;
+    for (uint32_t g = 0; g < n; ++g) {
+        rtskin::GeomPose p;
+        if (!rtskin::PoseFor(ring, int(g), frame, &p)) continue;
+        bool fits = p.idx && p.pos_va && p.verts;
+        for (const auto& [s2, c] : p.ranges) fits = fits && c && uint64_t(s2) + c <= p.indices && c % 3 == 0;
+        if (!fits) continue;
+        poses[g] = std::move(p);
+        ++have;
+    }
+    std::lock_guard l(g_m3_m);
+    // retired buffers the GPU has long finished with
+    for (auto it = g_m3_grave.begin(); it != g_m3_grave.end();)
+        it = frame - it->second > 600 ? g_m3_grave.erase(it) : std::next(it);
+    for (auto it = g_m3.begin(); it != g_m3.end();) // characters gone (their BLAS not built for a long time)
+        if (it->first != game && it->second.built && frame - it->second.built > 600) {
+            M3Retire(it->second.blas);
+            M3Retire(it->second.scratch);
+            M3Retire(it->second.ib);
+            it = g_m3.erase(it);
+        } else
+            ++it;
+    ModBlas& mb = g_m3[game];
+    mb.ok = false;
+    if (!have) {
+        M3Refuse("no pose of the mod for any of the character's sections (not drawn lately)");
+        return;
+    }
+    if (!g_dev5 && (!g_d3d12_device || FAILED(g_d3d12_device->QueryInterface(IID_PPV_ARGS(&g_dev5))))) {
+        M3Refuse("no ID3D12Device5");
+        return;
+    }
+    ComPtr<ID3D12GraphicsCommandList4> cl;
+    if (FAILED(reinterpret_cast<IUnknown*>(cmd_list->get_native())->QueryInterface(IID_PPV_ARGS(&cl))) || !cl) {
+        M3Refuse("the list is not an ID3D12GraphicsCommandList4");
+        return;
+    }
+    // topology: the index ranges of each geometry (a section the mod does not draw: one degenerate triangle)
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> sig(n);
+    std::vector<ID3D12Resource*>                            sig_idx(n, nullptr);
+    uint64_t                                                any_vb = 0;
+    uint32_t                                                any_verts = 0;
+    for (uint32_t g = 0; g < n; ++g)
+        if (poses[g].mod >= 0) {
+            sig[g] = poses[g].ranges;
+            sig_idx[g] = poses[g].idx;
+            any_vb = poses[g].pos_va;
+            any_verts = poses[g].verts;
+        }
+    const bool topo = !mb.blas || !mb.ib || mb.geoms != n || sig != mb.sig || sig_idx != mb.sig_idx;
+    if (topo) {
+        std::vector<uint32_t> off(n), cnt(n);
+        uint64_t              total = 0;
+        for (uint32_t g = 0; g < n; ++g) {
+            uint32_t c = 0;
+            for (const auto& r : sig[g]) c += r.second;
+            off[g] = uint32_t(total * 4);
+            cnt[g] = c ? c : 3;
+            total += cnt[g];
+        }
+        ComPtr<ID3D12Resource> ib; // zero-filled (committed): the degenerate triangles are indices 0, 0, 0
+        if (total > (64u << 20) || FAILED(CreateD3D12Buffer(g_d3d12_device, D3D12_HEAP_TYPE_DEFAULT, (total * 4 + 255) & ~uint64_t(255),
+                                       D3D12_RESOURCE_STATE_COPY_DEST, &ib))) {
+            M3Refuse("could not create the index buffer");
+            return;
+        }
+        for (uint32_t g = 0; g < n; ++g) {
+            uint64_t o = off[g];
+            for (const auto& [s2, c] : sig[g]) {
+                cl->CopyBufferRegion(ib.Get(), o, sig_idx[g], uint64_t(s2) * 4, uint64_t(c) * 4);
+                o += uint64_t(c) * 4;
+            }
+        }
+        D3D12_RESOURCE_BARRIER br{};
+        br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        br.Transition.pResource = ib.Get();
+        br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        br.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        br.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        cl->ResourceBarrier(1, &br);
+        M3Retire(mb.ib);
+        mb.ib = ib;
+        mb.ib_off = off;
+        mb.ib_cnt = cnt;
+        mb.sig = sig;
+        mb.sig_idx = sig_idx;
+    }
+    mb.geoms = n;
+    mb.game_ib = gib[0];
+    mb.game_off.resize(n);
+    for (uint32_t g = 0; g < n; ++g) mb.game_off[g] = gib[g] - gib[0];
+    mb.game_iw = iw;
+    mb.gflags = gflags;
+    mb.vb.resize(n);
+    mb.verts.resize(n);
+    for (uint32_t g = 0; g < n; ++g) {
+        mb.vb[g] = poses[g].mod >= 0 ? poses[g].pos_va : any_vb;
+        mb.verts[g] = poses[g].mod >= 0 ? poses[g].verts : any_verts;
+    }
+    std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> gd(n);
+    const uint64_t                              ib_va = mb.ib->GetGPUVirtualAddress();
+    for (uint32_t g = 0; g < n; ++g) {
+        D3D12_RAYTRACING_GEOMETRY_DESC& d = gd[g];
+        d.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+        d.Flags = D3D12_RAYTRACING_GEOMETRY_FLAGS(mb.gflags[g]);
+        d.Triangles.Transform3x4 = 0;
+        d.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+        d.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+        d.Triangles.IndexCount = mb.ib_cnt[g];
+        d.Triangles.VertexCount = mb.verts[g];
+        d.Triangles.IndexBuffer = ib_va + mb.ib_off[g];
+        d.Triangles.VertexBuffer.StartAddress = mb.vb[g];
+        d.Triangles.VertexBuffer.StrideInBytes = 12;
+    }
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS in{};
+    in.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    in.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+    in.NumDescs = n;
+    in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    in.pGeometryDescs = gd.data();
+    const bool full = topo || !mb.built || mode == acceleration_structure_build_mode::build || mb.updates >= 300;
+    if (full) {
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pi{};
+        g_dev5->GetRaytracingAccelerationStructurePrebuildInfo(&in, &pi);
+        if (!pi.ResultDataMaxSizeInBytes) {
+            M3Refuse("prebuild info returned no size");
+            return;
+        }
+        if (pi.ResultDataMaxSizeInBytes > mb.blas_cap) {
+            ComPtr<ID3D12Resource> b;
+            const uint64_t         cap = (pi.ResultDataMaxSizeInBytes + pi.ResultDataMaxSizeInBytes / 4 + 65535) & ~uint64_t(65535);
+            if (FAILED(CreateD3D12Buffer(g_d3d12_device, D3D12_HEAP_TYPE_DEFAULT, cap, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, &b,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) {
+                M3Refuse("could not create the BLAS buffer");
+                return;
+            }
+            M3Retire(mb.blas);
+            mb.blas = b;
+            mb.blas_cap = cap;
+        }
+        const uint64_t need = (std::max)(pi.ScratchDataSizeInBytes, pi.UpdateScratchDataSizeInBytes);
+        if (need > mb.scratch_cap) {
+            ComPtr<ID3D12Resource> s;
+            const uint64_t         cap = (need + need / 4 + 65535) & ~uint64_t(65535);
+            if (FAILED(CreateD3D12Buffer(g_d3d12_device, D3D12_HEAP_TYPE_DEFAULT, cap, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) {
+                M3Refuse("could not create the scratch buffer");
+                return;
+            }
+            M3Retire(mb.scratch);
+            mb.scratch = s;
+            mb.scratch_cap = cap;
+        }
+    } else
+        in.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+    D3D12_RESOURCE_BARRIER uav[2]{};
+    uav[0].Type = uav[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav[0].UAV.pResource = mb.blas.Get();
+    uav[1].UAV.pResource = mb.scratch.Get();
+    cl->ResourceBarrier(2, uav); // a build of an earlier list still writing either
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC bd{};
+    bd.Inputs = in;
+    bd.DestAccelerationStructureData = mb.blas->GetGPUVirtualAddress();
+    bd.SourceAccelerationStructureData = full ? 0 : bd.DestAccelerationStructureData;
+    bd.ScratchAccelerationStructureData = mb.scratch->GetGPUVirtualAddress();
+    cl->BuildRaytracingAccelerationStructure(&bd, 0, nullptr);
+    cl->ResourceBarrier(1, &uav[0]); // complete before the TLAS build reads it
+    RemovalPin::Ours(reinterpret_cast<const void*>(cmd_list->get_native()), "rt-m3 blas");
+    mb.updates = full ? 0 : mb.updates + 1;
+    mb.built = frame;
+    mb.ok = true;
+    g_m3_any.store(true, std::memory_order_relaxed);
+    if (full) {
+        ++g_m3_builds;
+        if (mb.builds++ < 3 || topo) {
+            std::string geo;
+            for (uint32_t g = 0; g < n && geo.size() < 900; ++g) {
+                char b[96];
+                snprintf(b, sizeof b, " [%u: mod %d, %u tris (game %llu), %zu range(s)]", g, poses[g].mod, mb.ib_cnt[g] / 3,
+                    (unsigned long long)((g + 1 < n ? gib[g + 1] - gib[g] : 0) / (iw ? iw * 3 : 1)), sig[g].size());
+                geo += b;
+            }
+            g_log.Line(true, "RTM3 blas %s game=%llx ours=%llx (%llu bytes) ring=%llx geometries=%u%s", topo ? "built (new topology)" : "rebuilt",
+                (unsigned long long)game, (unsigned long long)mb.blas->GetGPUVirtualAddress(), (unsigned long long)mb.blas_cap,
+                (unsigned long long)ring, n, geo.c_str());
+        }
+    } else
+        ++g_m3_updates;
+}
+
+// The instance naming one of two BLAS addresses: at the hint, around it, or (now and then) anywhere.
+uint32_t FindInstance(ID3D12Resource* res, uint64_t va, uint32_t count, uint64_t a, uint64_t b, ModBlas& mb, uint32_t frame)
+{
+    auto at = [&](uint32_t i) -> uint64_t {
+        uint64_t as = 0;
+        return GuardedPrivateRead(res, va + uint64_t(i) * 64 + 56, reinterpret_cast<uint8_t*>(&as), 8) == 8 ? as : 0;
+    };
+    if (mb.inst_hint < count) {
+        const uint64_t as = at(mb.inst_hint);
+        if (as && (as == a || as == b)) return mb.inst_hint;
+    }
+    auto scan = [&](uint32_t from, uint32_t to) -> uint32_t {
+        std::vector<uint8_t> buf(1024 * 64);
+        for (uint32_t i = from; i < to; i += 1024) {
+            const uint32_t k = (std::min)(1024u, to - i);
+            const uint32_t got = GuardedPrivateRead(res, va + uint64_t(i) * 64, buf.data(), k * 64);
+            for (uint32_t j = 0; j < got / 64; ++j) {
+                uint64_t as;
+                memcpy(&as, buf.data() + size_t(j) * 64 + 56, 8);
+                if (as == a || as == b) return i + j;
+            }
+        }
+        return UINT32_MAX;
+    };
+    uint32_t found = UINT32_MAX;
+    if (mb.inst_hint < count) found = scan(mb.inst_hint > 128 ? mb.inst_hint - 128 : 0, (std::min)(count, mb.inst_hint + 129));
+    if (found == UINT32_MAX && (count <= 2048 || frame - mb.last_scan >= 30)) {
+        mb.last_scan = frame;
+        found = scan(0, count);
+    }
+    if (found != UINT32_MAX) mb.inst_hint = found;
+    return found;
+}
+
+void M3NoteTlas(command_list* cmd_list, const acceleration_structure_build_input& in)
+{
+    if (!M3On() || !g_m3_any.load(std::memory_order_relaxed) || in.instances.array_of_pointers || !in.instances.count) return;
+    ID3D12Resource* res = nullptr;
+    uint64_t        va = 0;
+    if (!ResOfVa(in.instances.buffer, in.instances.offset, &res, &va) || HeapTypeOf(res) != int(D3D12_HEAP_TYPE_UPLOAD)) return;
+    std::lock_guard l(g_m3_m);
+    TlasRec& t = g_m3_tlas[g_m3_tlas_next++ & 7];
+    t.cl = cmd_list;
+    t.gen = CmdGen(cmd_list);
+    t.frame = g_frame_id;
+    t.res = res;
+    t.va = va;
+    t.count = in.instances.count;
+    // an instance a redirect of an earlier frame left naming our BLAS (the game did not rewrite it): the game's again,
+    // until this frame's rays redirect it with its records
+    // (only one written in an earlier frame: this frame's may be read by a TLAS build recorded before this one)
+    for (auto& [game, mb] : g_m3)
+        for (auto it = mb.written.begin(); it != mb.written.end();) {
+            if (it->res != res || it->frame == g_frame_id || it->index >= t.count || !mb.blas) {
+                ++it;
+                continue;
+            }
+            uint64_t       as = 0;
+            const uint64_t at = va + uint64_t(it->index) * 64 + 56;
+            if (GuardedPrivateRead(res, at, reinterpret_cast<uint8_t*>(&as), 8) == 8 && as == mb.blas->GetGPUVirtualAddress())
+                if (uint8_t* p = MapUpload(res, at, 8)) {
+                    GuardedCopy(p, &game, 8);
+                    UnmapUpload(res);
+                    ++g_m3_kept;
+                }
+            it = mb.written.erase(it);
+        }
+}
+
+// DispatchRays: our BLAS into the TLAS instance and our buffers into its hit group records -- both or neither.
+void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride)
+{
+    if (!M3On() || !g_m3_any.load(std::memory_order_relaxed) || hit_stride < 64 || !cmd_list) return;
+    const uint32_t frame = g_frame_id;
+    const uint64_t gen = CmdGen(cmd_list);
+    std::lock_guard l(g_m3_m);
+    bool any = false;
+    for (const auto& [game, mb] : g_m3) any = any || (mb.ok && int32_t(frame - mb.built) <= 1);
+    if (!any) return;
+    // the TLAS and the hit table must come from this very recording (not submitted yet: what we write is what runs);
+    // a later dispatch of the frame in another list still gets its records fixed for an instance already redirected
+    const TlasRec* t = nullptr;
+    bool           same_list = true;
+    for (const TlasRec& r : g_m3_tlas)
+        if (r.cl == cmd_list && r.gen == gen && r.res && int32_t(frame - r.frame) <= 1 && (!t || int32_t(r.frame - t->frame) >= 0)) t = &r;
+    if (!t) {
+        bool redirected = false;
+        for (const auto& [game, mb] : g_m3) redirected = redirected || mb.redirected == frame;
+        if (redirected)
+            for (const TlasRec& r : g_m3_tlas)
+                if (r.res && int32_t(frame - r.frame) <= 1 && (!t || int32_t(r.frame - t->frame) >= 0)) t = &r;
+        same_list = false;
+    }
+    if (!t) {
+        M3Refuse("the TLAS was not built in the list that traces the rays");
+        return;
+    }
+    ID3D12Resource* hg = nullptr;
+    uint64_t        hg_va = 0;
+    if (!ResOfVa(hit_res, hit_off, &hg, &hg_va)) {
+        M3Refuse("the hit group table's buffer is unknown");
+        return;
+    }
+    ID3D12Resource* rd = HeapTypeOf(hg) == int(D3D12_HEAP_TYPE_UPLOAD) ? hg : nullptr;
+    uint64_t        rd_va = hg_va;
+    if (!rd) {
+        CopyRec c{};
+        {
+            std::lock_guard l2(g_copy_m);
+            for (const CopyRec& r : g_copies)
+                if (r.src && r.cl == cmd_list && r.gen == gen && hg_va >= r.dst_va && hg_va + hit_size <= r.dst_va + r.size &&
+                    (!c.src || int32_t(r.frame - c.frame) >= 0))
+                    c = r;
+        }
+        if (!c.src || HeapTypeOf(c.src) != int(D3D12_HEAP_TYPE_UPLOAD)) {
+            M3Refuse("the hit group table was not filled from UPLOAD memory in the list that traces the rays");
+            for (const auto& [game, mb] : g_m3)
+                if (mb.redirected == frame) {
+                    static std::atomic<uint32_t> s_warn{ 0 };
+                    if (s_warn.fetch_add(1) < 8)
+                        g_log.Line(true, "RTM3 WARNING f=%u: a dispatch whose hit table could not be patched follows a redirect this frame", frame);
+                    break;
+                }
+            return;
+        }
+        rd = c.src;
+        rd_va = c.src_va + (hg_va - c.dst_va);
+    }
+    for (auto& [game, mb] : g_m3) {
+        if (!mb.ok || int32_t(frame - mb.built) > 1 || !mb.blas || !mb.ib) continue;
+        const uint64_t ours = mb.blas->GetGPUVirtualAddress();
+        const uint32_t idx = FindInstance(t->res, t->va, t->count, game, ours, mb, frame);
+        if (idx == UINT32_MAX) {
+            M3Refuse("no TLAS instance names the character's BLAS");
+            continue;
+        }
+        uint64_t cur_as = 0;
+        GuardedPrivateRead(t->res, t->va + uint64_t(idx) * 64 + 56, reinterpret_cast<uint8_t*>(&cur_as), 8);
+        if (!same_list && cur_as != ours) {
+            M3Refuse("the TLAS was not built in the list that traces the rays");
+            continue;
+        }
+        uint8_t inst[64];
+        if (GuardedPrivateRead(t->res, t->va + uint64_t(idx) * 64, inst, 64) != 64) {
+            M3Refuse("the TLAS instance could not be read");
+            continue;
+        }
+        uint32_t w13;
+        memcpy(&w13, inst + 52, 4);
+        const uint32_t contrib = w13 & 0xffffff;
+        const uint64_t nrec = uint64_t(mb.geoms) * 3;
+        if ((uint64_t(contrib) + nrec) * hit_stride > hit_size) {
+            M3Refuse("the instance's hit group records lie past the table");
+            continue;
+        }
+        std::vector<uint8_t> recs(size_t(nrec * hit_stride));
+        if (GuardedPrivateRead(rd, rd_va + uint64_t(contrib) * hit_stride, recs.data(), uint32_t(recs.size())) != recs.size()) {
+            M3Refuse("the hit group records could not be read");
+            continue;
+        }
+        // every record must be the game's for this geometry (or already ours): anything else and nothing is touched
+        const uint64_t ib_va = mb.ib->GetGPUVirtualAddress();
+        bool           valid = true;
+        for (uint64_t i = 0; i < nrec && valid; ++i) {
+            uint8_t*       r = recs.data() + i * hit_stride;
+            const uint32_t g = uint32_t(i / 3);
+            uint64_t       ib, vb;
+            uint32_t       cfg, off;
+            memcpy(&ib, r + 32, 8);
+            memcpy(&vb, r + 40, 8);
+            memcpy(&cfg, r + 48, 4);
+            memcpy(&off, r + 52, 4);
+            const bool is_game = ib == mb.game_ib && off == mb.game_off[g] && (cfg & 0xff) == mb.game_iw && ((cfg >> 8) & 0xff) == 12 &&
+                                 rtskin::RingKey(vb) != 0;
+            const bool is_ours = ib == ib_va && off == mb.ib_off[g] && (cfg & 0xff) == 4;
+            if (!is_game && !is_ours) {
+                valid = false;
+                static std::atomic<uint32_t> s_dump{ 0 };
+                if (s_dump.fetch_add(1) < 8)
+                    g_log.Line(true, "RTM3 record %llu (contrib %u, geometry %u) is not the character's: ib=%llx (want %llx) vb=%llx cfg=%x off=%x (want %llx)",
+                        (unsigned long long)(contrib + i), contrib, g, (unsigned long long)ib, (unsigned long long)mb.game_ib,
+                        (unsigned long long)vb, cfg, off, (unsigned long long)mb.game_off[g]);
+                break;
+            }
+            memcpy(r + 32, &ib_va, 8);
+            memcpy(r + 40, &mb.vb[g], 8);
+            cfg = (cfg & 0xffff0000u) | (12u << 8) | 4u;
+            memcpy(r + 48, &cfg, 4);
+            memcpy(r + 52, &mb.ib_off[g], 4);
+        }
+        if (!valid) {
+            M3Refuse("the instance's hit group records are not the character's geometry records (3 per geometry)");
+            continue;
+        }
+        // both mapped before either is written
+        uint8_t* pr = MapUpload(rd, rd_va + uint64_t(contrib) * hit_stride, recs.size());
+        uint8_t* pi = pr ? MapUpload(t->res, t->va + uint64_t(idx) * 64 + 56, 8) : nullptr;
+        if (!pr || !pi) {
+            if (pr) UnmapUpload(rd);
+            M3Refuse("the records / instance could not be mapped");
+            continue;
+        }
+        const bool ok_r = GuardedCopy(pr, recs.data(), recs.size());
+        const bool ok_i = ok_r && GuardedCopy(pi, &ours, 8);
+        UnmapUpload(t->res);
+        UnmapUpload(rd);
+        if (!ok_r || !ok_i) {
+            M3Refuse("a write faulted");
+            continue;
+        }
+        if (mb.written.size() >= 8) mb.written.erase(mb.written.begin());
+        mb.written.push_back({ t->res, idx, frame });
+        if (mb.redirected != frame) {
+            if (g_m3_redirects++ < 4)
+                g_log.Line(true, "RTM3 redirect f=%u game=%llx -> ours=%llx: TLAS instance #%u, hit records %u..%llu (stride %llu) now name our buffers",
+                    frame, (unsigned long long)game, (unsigned long long)ours, idx, contrib, (unsigned long long)(contrib + nrec - 1),
+                    (unsigned long long)hit_stride);
+            mb.redirected = frame;
+        }
+    }
+}
+
+std::string M3Status()
+{
+    if (!M3On()) return " | m3 off (rt_m3=0)";
+    std::lock_guard l(g_m3_m);
+    char b[256];
+    size_t ok = 0;
+    for (const auto& [g, mb] : g_m3) ok += mb.ok ? 1 : 0;
+    snprintf(b, sizeof b, " | m3 chars=%zu/%zu builds=%llu updates=%llu redirects=%llu stale_reverted=%llu grave=%zu", ok, g_m3.size(),
+        (unsigned long long)g_m3_builds, (unsigned long long)g_m3_updates, (unsigned long long)g_m3_redirects, (unsigned long long)g_m3_kept,
+        g_m3_grave.size());
+    std::string s = b;
+    for (const auto& [why, n] : g_m3_why) s += " | m3 refused " + std::to_string(n) + ": " + why;
+    return s;
+}
+
 } // namespace
 
 // ==== rt_hooks.h =================================================================================
@@ -770,20 +1325,24 @@ bool RtHoldVanilla()
     return RtActive() && Mode() == 1; // M2 holds per draw (RtClaimNote), never the whole frame
 }
 
-void RtNoteCopy(command_list*, resource src, uint64_t src_off, resource dst, uint64_t dst_off, uint64_t size)
+void RtNoteCopy(command_list* cmd_list, resource src, uint64_t src_off, resource dst, uint64_t dst_off, uint64_t size)
 {
-    if (Mode() != 2 || !g_have_char_inst.load(std::memory_order_relaxed) || size < 256 || size > (8ull << 20) || !src.handle) return;
+    if (Mode() != 2 || !(g_have_char_inst.load(std::memory_order_relaxed) || g_m3_any.load(std::memory_order_relaxed)) || size < 256 ||
+        size > (8ull << 20) || !src.handle)
+        return;
     CopyRec r;
+    r.cl = cmd_list;
+    r.gen = CmdGen(cmd_list);
     r.dst_va = BufferVa(dst, dst_off);
     r.size = size;
     r.src = reinterpret_cast<ID3D12Resource*>(src.handle);
     r.src_va = BufferVa(src, src_off);
     r.frame = g_frame_id;
     std::lock_guard l(g_copy_m);
-    g_copies[g_copy_next++ & 255] = r;
+    g_copies[g_copy_next++ & 511] = r;
 }
 
-void RtNoteRays(command_list*, resource rg_res, uint64_t rg_off, uint64_t rg_size, resource miss_res, uint64_t miss_off,
+void RtNoteRays(command_list* cmd_list, resource rg_res, uint64_t rg_off, uint64_t rg_size, resource miss_res, uint64_t miss_off,
     uint64_t miss_size, uint64_t miss_stride, resource hit_res, uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, uint32_t w,
     uint32_t h, uint32_t d)
 {
@@ -791,6 +1350,7 @@ void RtNoteRays(command_list*, resource rg_res, uint64_t rg_off, uint64_t rg_siz
     NoteRtFrame();
     g_c.rays.fetch_add(1, std::memory_order_relaxed);
     ObserveRays(rg_res, rg_off, rg_size, miss_res, miss_off, miss_size, miss_stride, hit_res, hit_off, hit_size, hit_stride, w, h, d);
+    if (Mode() == 2) M3Redirect(cmd_list, hit_res, hit_off, hit_size, hit_stride);
 }
 
 void RtPresentTick()
@@ -1132,7 +1692,7 @@ bool RtClaimNote(const RtClaimInfo& in)
     return true;
 }
 
-bool RtOnBlasBuild(command_list*, acceleration_structure_type type, acceleration_structure_build_flags build_flags,
+bool RtOnBlasBuild(command_list* cmd_list, acceleration_structure_type type, acceleration_structure_build_flags build_flags,
     uint32_t input_count, const acceleration_structure_build_input* inputs, resource_view dest,
     acceleration_structure_build_mode mode, unsigned long long)
 {
@@ -1141,7 +1701,10 @@ bool RtOnBlasBuild(command_list*, acceleration_structure_type type, acceleration
     g_c.blas_builds.fetch_add(1, std::memory_order_relaxed);
     if (type == acceleration_structure_type::top_level && inputs && input_count &&
         inputs[0].type == acceleration_structure_build_input_type::instances)
+    {
         ObserveTlas(build_flags, inputs[0], dest, mode);
+        if (Mode() == 2) M3NoteTlas(cmd_list, inputs[0]);
+    }
     if (type != acceleration_structure_type::bottom_level || !inputs || !input_count) return false;
     g_c.blas_bottom.fetch_add(1, std::memory_order_relaxed);
     std::vector<rtm::BlasGeom> geoms;
@@ -1200,6 +1763,7 @@ bool RtOnBlasBuild(command_list*, acceleration_structure_type type, acceleration
                 g_log.Line(true, "RTBLAS char dest=%llx ring=%llx build_flags=%x mode=%u geometries=%zu%s", (unsigned long long)dest.handle,
                     (unsigned long long)ring, cb.build_flags, cb.mode, cb.ibs.size(), geo.c_str());
             }
+            M3OnCharBlas(cmd_list, dest.handle, ring, inputs, input_count, mode); // M3: ours next to it
         }
     }
     std::vector<rtm::RingEvent>    ev;

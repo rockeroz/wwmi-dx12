@@ -120,7 +120,47 @@ struct Mesh {
     std::vector<MergedComp> merged;
     uint32_t                merged_bones = 0;
     Pose                    merged_cur, merged_prev; // the last merged palettes built (velocity-free history)
+    // M3: per component, the slots its sub-draws were posed into, this frame and the one before (the BLAS takes one)
+    struct RtPose {
+        int                                        slot = -1;
+        std::vector<std::pair<uint32_t, uint32_t>> ranges;
+        uint64_t                                   sum = 0;
+    };
+    struct RtPoseGen {
+        uint32_t            frame = 0;
+        std::vector<RtPose> recs;
+    };
+    std::map<int, std::pair<RtPoseGen, RtPoseGen>> rt_poses; // comp -> (latest frame's, the one before)
 };
+// M3: which mod drew a section of a ring (both of the character's rings), and when
+struct RingDraw {
+    int      mod = -1;
+    uint32_t frame = 0;
+};
+std::unordered_map<uint64_t, std::map<int, RingDraw>> g_ring_draws;
+
+void NoteRtPose(Mesh& m, int comp, int slot, uint32_t frame, uint32_t s2, uint32_t c) // g_m held
+{
+    auto& g = m.rt_poses[comp];
+    if (g.first.frame != frame) {
+        g.second = std::move(g.first);
+        g.first = Mesh::RtPoseGen{};
+        g.first.frame = frame;
+    }
+    Mesh::RtPose* rec = nullptr;
+    for (Mesh::RtPose& r : g.first.recs)
+        if (r.slot == slot) rec = &r;
+    if (!rec) {
+        if (g.first.recs.size() >= 16) return;
+        g.first.recs.push_back({});
+        rec = &g.first.recs.back();
+        rec->slot = slot;
+    }
+    const std::pair<uint32_t, uint32_t> r{ s2, c };
+    if (rec->ranges.size() >= 64 || std::find(rec->ranges.begin(), rec->ranges.end(), r) != rec->ranges.end()) return;
+    rec->ranges.insert(std::upper_bound(rec->ranges.begin(), rec->ranges.end(), r), r);
+    rec->sum += c;
+}
 std::map<int, Mesh> g_meshes;
 std::set<int>       g_requested;
 
@@ -848,6 +888,18 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
                 memcpy(vf_words, want, sizeof want);
             }
         }
+        // M3: this character's section `comp` is drawn by this mod (under both of its rings)
+        for (const uint64_t rv : { ctx.ring, ctx.prev_ring })
+            if (const uint64_t rk = FindRingKey(rv)) {
+                auto& rd = g_ring_draws[rk];
+                rd[comp] = { mod, frame };
+            }
+        if (g_ring_draws.size() > 128)
+            for (auto it = g_ring_draws.begin(); it != g_ring_draws.end();) {
+                bool live = false;
+                for (const auto& [cc, d] : it->second) live = live || frame - d.frame < 600;
+                it = live ? std::next(it) : g_ring_draws.erase(it);
+            }
         if (!fresh) {
             sl.used = frame;
             sl.stamp = GpuStamp();
@@ -885,6 +937,7 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
             if (pp.first.frame != frame) pp.second = pp.first;
             pp.first = { bind->slot, frame };
         }
+        NoteRtPose(m, comp, bind->slot, frame, s2, c);
         vbv = { sl.pos->GetGPUVirtualAddress(), m.verts * 12, 12 };
         vbv_prev = prev ? D3D12_VERTEX_BUFFER_VIEW{ prev->pos->GetGPUVirtualAddress(), m.verts * 12, 12 } : vbv;
         ++g_dispatches;
@@ -918,6 +971,39 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
     std::lock_guard l(g_m);
     ++g_draws;
     return out;
+}
+
+bool PoseFor(uint64_t ring, int comp, uint32_t frame, GeomPose* out)
+{
+    std::lock_guard l(g_m);
+    const uint64_t  key = FindRingKey(ring);
+    const auto      rd = g_ring_draws.find(key);
+    if (!key || rd == g_ring_draws.end()) return false;
+    const auto di = rd->second.find(comp);
+    // drawn recently (a character the raster no longer draws -- off screen -- keeps the game's own geometry)
+    if (di == rd->second.end() || int32_t(frame - di->second.frame) > 8) return false;
+    auto mi = g_meshes.find(di->second.mod);
+    if (mi == g_meshes.end() || !mi->second.ready) return false;
+    Mesh&      m = mi->second;
+    const auto pi = m.rt_poses.find(comp);
+    if (pi == m.rt_poses.end()) return false;
+    // the newest complete frame: this frame's poses may still be coming (the raster draws after the BLAS update)
+    const Mesh::RtPoseGen& g = pi->second.first.frame < frame || pi->second.second.recs.empty() ? pi->second.first : pi->second.second;
+    const Mesh::RtPose*    best = nullptr;
+    for (const Mesh::RtPose& r : g.recs)
+        if (r.slot >= 0 && size_t(r.slot) < m.slots.size() && (!best || r.sum > best->sum)) best = &r;
+    if (!best || best->ranges.empty() || int32_t(frame - g.frame) > int32_t(kCachedPose)) return false;
+    Slot& sl = m.slots[size_t(best->slot)];
+    sl.used = frame; // read by this frame's BLAS and rays: not handed to another recording for two frames
+    sl.stamp = GpuStamp();
+    out->mod = m.mod;
+    out->pos_va = sl.pos->GetGPUVirtualAddress();
+    out->verts = m.verts;
+    out->idx = m.idx.Get();
+    out->indices = m.indices;
+    out->ranges = best->ranges;
+    out->frame = g.frame;
+    return true;
 }
 
 std::string Status()
