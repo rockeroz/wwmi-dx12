@@ -30,6 +30,7 @@
 #include "../../src/d3d12_buffer.h"
 #include "../../src/gpu_progress.h"
 #include "rt_skin.h"
+#include <algorithm>
 #include <map>
 #include <set>
 #include <tuple>
@@ -68,7 +69,9 @@ struct RingSecs {
     std::string                layout;       // the starts last logged
 };
 std::unordered_map<uint64_t, RingSecs> g_rings;
-constexpr uint32_t                     kStartForget = 120; // frames a start not posed again stays in the layout
+constexpr uint32_t                     kStartForget = 1800; // frames a start not posed again stays in the layout
+// (the skin cache can leave a section unposed for long stretches; a ring the pool gives to another mesh is told apart
+// by its section count, see LookupSection)
 
 struct Slot {
     ComPtr<ID3D12Resource>      pos, tan;
@@ -374,22 +377,25 @@ bool LookupSection(uint64_t ring, int comp, uint32_t frame, Sec* out) // g_m hel
     auto it = g_rings.find(ring);
     if (it == g_rings.end() || comp < 0) return false;
     const RingSecs& r = it->second;
+    std::vector<std::pair<uint32_t, const SecRec*>> live; // (start, record), by start
+    for (const auto& [start, rec] : r.by_start)
+        if (frame - rec.frame <= kStartForget) live.push_back({ start, &rec });
     // the layout must be complete: a missing start would shift every later section
-    uint32_t live = 0;
-    for (const auto& [start, rec] : r.by_start) live += frame - rec.frame <= kStartForget ? 1u : 0u;
-    if (r.expected && live != r.expected) return false;
-    uint32_t k = 0;
-    for (const auto& [start, rec] : r.by_start) {
-        if (frame - rec.frame > kStartForget) continue;
-        if (k++ != uint32_t(comp)) continue;
-        if (int32_t(frame - rec.frame) > int32_t(kSectionAge)) return false; // posed too long ago: its palette is gone
-        if (out) *out = rec.s;
-        return true;
+    if (r.expected && live.size() < r.expected) return false;
+    if (r.expected && live.size() > r.expected) {
+        // more starts than sections: the pool gave the ring to another mesh; the most recently posed ones are its own
+        std::sort(live.begin(), live.end(), [](const auto& a, const auto& b) { return a.second->frame > b.second->frame; });
+        live.resize(r.expected);
+        std::sort(live.begin(), live.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     }
-    return false;
+    if (size_t(comp) >= live.size()) return false;
+    const SecRec& rec = *live[size_t(comp)].second;
+    if (int32_t(frame - rec.frame) > int32_t(kSectionAge)) return false; // posed too long ago: its palette is gone
+    if (out) *out = rec.s;
+    return true;
 }
 
-constexpr uint32_t kCachedPose = 30; // frames our last pose of a section may stand in for a missing palette
+constexpr uint32_t kCachedPose = 3600; // frames our last pose may stand in for a section the skin cache left as it was
 
 Slot* CachedPose(Mesh& m, int comp, uint32_t frame) // g_m held
 {
