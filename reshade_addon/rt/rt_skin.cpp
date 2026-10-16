@@ -606,9 +606,15 @@ bool MeshFailed(int mod)
 
 bool PoseCached(int mod, int comp)
 {
+    // this mod's pose of the component, or that of another mod of the same object (a toggle mod -- Hsin's face -- can
+    // draw components its body mod's claims never draw themselves)
     std::lock_guard l(g_m);
-    auto            it = g_meshes.find(mod);
-    return it != g_meshes.end() && it->second.ready && CachedPose(it->second, comp, g_frame_id) != nullptr;
+    const int       guid = mod >= 0 && size_t(mod) < g_geomods.size() ? g_geomods[size_t(mod)].mod.object_guid : 0;
+    for (auto& [id, m] : g_meshes) {
+        if (!m.ready || (id != mod && (!guid || size_t(id) >= g_geomods.size() || g_geomods[size_t(id)].mod.object_guid != guid))) continue;
+        if (CachedPose(m, comp, g_frame_id)) return true;
+    }
+    return false;
 }
 
 bool RingSeen(uint64_t ring)
