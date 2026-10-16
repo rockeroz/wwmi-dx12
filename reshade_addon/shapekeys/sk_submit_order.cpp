@@ -4,6 +4,7 @@
 #include "../instrumentation/removal_pin.h"
 #include "../instrumentation/profiler.h"
 #include "../instrumentation/hot_path.h"
+#include "../rt/rt_hooks.h"
 
 struct SubmitLog {
     uint32_t                 frame = 0;
@@ -33,6 +34,7 @@ void on_execute_command_list(reshade::api::command_queue* queue, reshade::api::c
     PROF(PROF_CmdExecute);
     if (!cl) return;
     HotPath::OnExecute(queue, cl);
+    RtNoteExecute(cl); // RT M3: what this list reads from UPLOAD is out of reach from now on
     const void* native = (const void*)cl->get_native();
     if (queue && native == g_claim_last_list.load(std::memory_order_relaxed)) {
         // FUNCTIONAL: [Present] reads this under g_present_on_game_queue. Always recorded.

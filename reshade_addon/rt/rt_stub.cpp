@@ -48,6 +48,7 @@ bool RtHoldVanilla()
 {
     return false;
 }
+void RtNoteExecute(reshade::api::command_list*) {}
 void RtNoteCopy(reshade::api::command_list*, reshade::api::resource, uint64_t, reshade::api::resource, uint64_t, uint64_t) {}
 void RtNoteRays(reshade::api::command_list*, reshade::api::resource, uint64_t, uint64_t, reshade::api::resource, uint64_t, uint64_t,
     uint64_t, reshade::api::resource, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t)

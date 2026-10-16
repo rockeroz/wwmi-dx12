@@ -584,6 +584,7 @@ struct CopyRec {
     uint32_t        frame = 0;
     const void*     cl = nullptr; // the recording it is in
     uint64_t        gen = 0;
+    bool            executed = false; // ...submitted already (ExecuteCommandLists): too late to change what it copies
 };
 std::mutex g_copy_m;
 CopyRec    g_copies[512];
@@ -802,6 +803,8 @@ struct TlasRec {
     uint32_t        frame = 0, count = 0;
     ID3D12Resource* res = nullptr;
     uint64_t        va = 0;
+    bool            executed = false; // its list was submitted: the instances it reads can no longer be changed
+    uint32_t        seq = 0;
 };
 std::mutex                                           g_m3_m; // everything below
 std::map<uint64_t, ModBlas>                          g_m3;   // the game's BLAS (dest VA) -> ours
@@ -907,12 +910,14 @@ void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const ac
             it = g_m3.erase(it);
         } else
             ++it;
-    ModBlas& mb = g_m3[game];
-    mb.ok = false;
     if (!have) {
+        const auto it = g_m3.find(game);
+        if (it != g_m3.end()) it->second.ok = false;
         M3Refuse("no pose of the mod for any of the character's sections (not drawn lately)");
         return;
     }
+    ModBlas& mb = g_m3[game];
+    mb.ok = false;
     if (!g_dev5 && (!g_d3d12_device || FAILED(g_d3d12_device->QueryInterface(IID_PPV_ARGS(&g_dev5))))) {
         M3Refuse("no ID3D12Device5");
         return;
@@ -1116,7 +1121,10 @@ void M3NoteTlas(command_list* cmd_list, const acceleration_structure_build_input
     uint64_t        va = 0;
     if (!ResOfVa(in.instances.buffer, in.instances.offset, &res, &va) || HeapTypeOf(res) != int(D3D12_HEAP_TYPE_UPLOAD)) return;
     std::lock_guard l(g_m3_m);
-    TlasRec& t = g_m3_tlas[g_m3_tlas_next++ & 7];
+    const uint32_t seq = ++g_m3_tlas_next;
+    TlasRec&       t = g_m3_tlas[seq & 7];
+    t = TlasRec{};
+    t.seq = seq;
     t.cl = cmd_list;
     t.gen = CmdGen(cmd_list);
     t.frame = g_frame_id;
@@ -1154,23 +1162,32 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
     bool any = false;
     for (const auto& [game, mb] : g_m3) any = any || (mb.ok && int32_t(frame - mb.built) <= 1);
     if (!any) return;
-    // the TLAS and the hit table must come from this very recording (not submitted yet: what we write is what runs);
-    // a later dispatch of the frame in another list still gets its records fixed for an instance already redirected
+    // the TLAS build and the hit table's copy must be in recordings not submitted yet (what we write is what runs);
+    // the newest TLAS build of the frame (this list's first). A TLAS already submitted can only keep an instance we
+    // redirected earlier: its records are still fixed then
     const TlasRec* t = nullptr;
-    bool           same_list = true;
-    for (const TlasRec& r : g_m3_tlas)
-        if (r.cl == cmd_list && r.gen == gen && r.res && int32_t(frame - r.frame) <= 1 && (!t || int32_t(r.frame - t->frame) >= 0)) t = &r;
+    for (const TlasRec& r : g_m3_tlas) // this recording's newest
+        if (r.res && r.cl == cmd_list && r.gen == gen && int32_t(frame - r.frame) <= 1 && (!t || r.seq > t->seq)) t = &r;
+    if (!t)
+        for (const TlasRec& r : g_m3_tlas) // else the frame's newest
+            if (r.res && int32_t(frame - r.frame) <= 1 && (!t || r.seq > t->seq)) t = &r;
+    const bool same_list = t && !t->executed;
     if (!t) {
-        bool redirected = false;
-        for (const auto& [game, mb] : g_m3) redirected = redirected || mb.redirected == frame;
-        if (redirected)
-            for (const TlasRec& r : g_m3_tlas)
-                if (r.res && int32_t(frame - r.frame) <= 1 && (!t || int32_t(r.frame - t->frame) >= 0)) t = &r;
-        same_list = false;
-    }
-    if (!t) {
-        M3Refuse("the TLAS was not built in the list that traces the rays");
+        M3Refuse("no TLAS build recorded this frame");
         return;
+    }
+    if (!same_list) {
+        static std::atomic<uint32_t> s_diag{ 0 };
+        if (s_diag.fetch_add(1) < 16) {
+            std::string recs;
+            for (const TlasRec& r : g_m3_tlas)
+                if (r.res) {
+                    char b[96];
+                    snprintf(b, sizeof b, " [cl %p gen %llu f%u%s]", r.cl, (unsigned long long)r.gen, r.frame, r.executed ? " submitted" : "");
+                    recs += b;
+                }
+            g_log.Line(true, "RTM3 diag f=%u rays in cl %p gen %llu; TLAS builds:%s", frame, (const void*)cmd_list, (unsigned long long)gen, recs.c_str());
+        }
     }
     ID3D12Resource* hg = nullptr;
     uint64_t        hg_va = 0;
@@ -1185,12 +1202,14 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
         {
             std::lock_guard l2(g_copy_m);
             for (const CopyRec& r : g_copies)
-                if (r.src && r.cl == cmd_list && r.gen == gen && hg_va >= r.dst_va && hg_va + hit_size <= r.dst_va + r.size &&
+                if (r.src && hg_va >= r.dst_va && hg_va + hit_size <= r.dst_va + r.size && int32_t(frame - r.frame) <= 1 &&
                     (!c.src || int32_t(r.frame - c.frame) >= 0))
                     c = r;
         }
-        if (!c.src || HeapTypeOf(c.src) != int(D3D12_HEAP_TYPE_UPLOAD)) {
-            M3Refuse("the hit group table was not filled from UPLOAD memory in the list that traces the rays");
+        if (!c.src || HeapTypeOf(c.src) != int(D3D12_HEAP_TYPE_UPLOAD) || c.executed) {
+            M3Refuse(!c.src ? "no copy filled the hit group table this frame"
+                     : c.executed ? "the copy that fills the hit group table was already submitted"
+                                  : "the hit group table was not filled from UPLOAD memory");
             for (const auto& [game, mb] : g_m3)
                 if (mb.redirected == frame) {
                     static std::atomic<uint32_t> s_warn{ 0 };
@@ -1214,7 +1233,7 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
         uint64_t cur_as = 0;
         GuardedPrivateRead(t->res, t->va + uint64_t(idx) * 64 + 56, reinterpret_cast<uint8_t*>(&cur_as), 8);
         if (!same_list && cur_as != ours) {
-            M3Refuse("the TLAS was not built in the list that traces the rays");
+            M3Refuse("the TLAS build was already submitted when the rays were recorded");
             continue;
         }
         uint8_t inst[64];
@@ -1340,6 +1359,19 @@ void RtNoteCopy(command_list* cmd_list, resource src, uint64_t src_off, resource
     r.frame = g_frame_id;
     std::lock_guard l(g_copy_m);
     g_copies[g_copy_next++ & 511] = r;
+}
+
+void RtNoteExecute(command_list* cmd_list)
+{
+    if (!cmd_list || Mode() != 2 || !g_m3_any.load(std::memory_order_relaxed)) return;
+    const uint64_t gen = CmdGen(cmd_list);
+    // g_m3_m held throughout: a redirect checking and writing on another thread finishes before this list goes
+    std::lock_guard l(g_m3_m);
+    for (TlasRec& r : g_m3_tlas)
+        if (r.cl == cmd_list && r.gen == gen) r.executed = true;
+    std::lock_guard l2(g_copy_m);
+    for (CopyRec& r : g_copies)
+        if (r.cl == cmd_list && r.gen == gen) r.executed = true;
 }
 
 void RtNoteRays(command_list* cmd_list, resource rg_res, uint64_t rg_off, uint64_t rg_size, resource miss_res, uint64_t miss_off,
