@@ -1346,6 +1346,23 @@ bool M3Records(ModBlas& mb, ID3D12Resource* rd, uint64_t rd_va, uint64_t hit_siz
             return false;
         }
         same = same && is_ours && vb == mb.vb[g];
+        { // M4: the hit group identifiers characters' records run (once each)
+            static std::set<uint64_t> s_ids;
+            uint64_t                  id8;
+            memcpy(&id8, r, 8);
+            if (s_ids.size() < 32 && s_ids.insert(id8).second) {
+                std::string tail;
+                for (uint64_t o = 56; o < stride && o < 128; o += 8) {
+                    uint64_t v;
+                    memcpy(&v, r + o, 8);
+                    char e[24];
+                    snprintf(e, sizeof e, " %llx", (unsigned long long)v);
+                    tail += e;
+                }
+                g_log.Line(true, "RTM4 character record id=%02x%02x%02x%02x%02x%02x%02x%02x (ray type %u, geometry %u, contrib %u) +56..:%s", r[0], r[1],
+                    r[2], r[3], r[4], r[5], r[6], r[7], uint32_t(i % 3), g, contrib, tail.c_str());
+            }
+        }
         memcpy(r + 32, &ib_va, 8);
         memcpy(r + 40, &mb.vb[g], 8);
         cfg = (cfg & 0xffff0000u) | (12u << 8) | 4u;
@@ -2430,6 +2447,88 @@ void RtNoteShader(uint64_t cs_hash, const void* code, size_t code_size)
     // The entry name is stored as plain text in the container's PSV0 string table.
     static const char kSkin[] = "SkinCacheUpdateBatchCS";
     if (std::search(p, p + code_size, kSkin, kSkin + sizeof kSkin - 1) != p + code_size) g_skin_cs.insert(cs_hash);
+}
+
+// M4 (observe): a ray tracing pipeline's shaders. Each shader's library is dumped once (rtlib_<hash>.dxil); RTLIB names
+// the entry, its kind and, for exports that have one (raygen / miss / callable), its shader identifier's first bytes --
+// to tell which hit shader the characters' records (identifier 0xaf...) run, and what it reads.
+void RtNotePipeline(uint32_t n, const pipeline_subobject* so, pipeline pl)
+{
+    if (!so || !n || Mode() == 0) return;
+    using T = pipeline_subobject_type;
+    auto kind_of = [](T t) -> const char* {
+        switch (t) {
+        case T::raygen_shader: return "raygen";
+        case T::any_hit_shader: return "anyhit";
+        case T::closest_hit_shader: return "closesthit";
+        case T::miss_shader: return "miss";
+        case T::intersection_shader: return "intersection";
+        case T::callable_shader: return "callable";
+        default: return nullptr;
+        }
+    };
+    bool rt = false;
+    for (uint32_t i = 0; i < n; ++i) rt = rt || kind_of(so[i].type) || so[i].type == T::shader_groups || so[i].type == T::libraries;
+    if (!rt) return;
+    static std::atomic<uint32_t> s_pipes{ 0 };
+    const uint32_t               pidx = s_pipes.fetch_add(1);
+    if (pidx >= 256) return;
+    ComPtr<ID3D12StateObjectProperties> props;
+    if (pl.handle) reinterpret_cast<IUnknown*>(pl.handle)->QueryInterface(IID_PPV_ARGS(&props));
+    static std::mutex         s_m;
+    static std::set<uint64_t> s_dumped;
+    std::string               groups;
+    uint32_t                  shaders = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const char* kind = kind_of(so[i].type);
+        if (kind && so[i].data) {
+            const auto* d = static_cast<const shader_desc*>(so[i].data);
+            for (uint32_t k = 0; k < so[i].count; ++k, ++shaders) {
+                const shader_desc& s = d[k];
+                if (!s.code || !s.code_size) continue;
+                const uint64_t h = Fnv1a64(s.code, s.code_size);
+                std::string    file = "(kept)";
+                {
+                    std::lock_guard l(s_m);
+                    if (s_dumped.insert(h).second) {
+                        char name[64];
+                        snprintf(name, sizeof name, "rtlib_%016llx.dxil", (unsigned long long)h);
+                        file = g_log.Bin(name, static_cast<const uint8_t*>(s.code), s.code_size, true);
+                        if (file.empty()) file = "(not written: budget)";
+                    }
+                }
+                char id[40] = "-";
+                if (props && s.entry_point && *s.entry_point) {
+                    wchar_t w[256];
+                    const int wn = MultiByteToWideChar(CP_UTF8, 0, s.entry_point, -1, w, 256);
+                    const auto* p = wn > 0 ? static_cast<const uint8_t*>(props->GetShaderIdentifier(w)) : nullptr;
+                    if (p) snprintf(id, sizeof id, "%02x%02x%02x%02x%02x%02x%02x%02x", p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+                }
+                g_log.Line(true, "RTLIB pipe=%u kind=%s[%u] entry=%s lib=%016llx bytes=%zu id=%s %s", pidx, kind, k,
+                    s.entry_point ? s.entry_point : "(none)", (unsigned long long)h, s.code_size, id, file.c_str());
+            }
+        } else if (so[i].type == T::shader_groups && so[i].data) {
+            const auto* g = static_cast<const shader_group*>(so[i].data);
+            for (uint32_t k = 0; k < so[i].count; ++k) {
+                char b[64];
+                if (g[k].type == shader_group_type::hit_group_triangles || g[k].type == shader_group_type::hit_group_aabbs)
+                    snprintf(b, sizeof b, " %u:hit(ch%d,ah%d,is%d)", k, int(g[k].hit_group.closest_hit_shader_index),
+                        int(g[k].hit_group.any_hit_shader_index), int(g[k].hit_group.intersection_shader_index));
+                else
+                    snprintf(b, sizeof b, " %u:%s(%d)", k, g[k].type == shader_group_type::raygen ? "raygen" : g[k].type == shader_group_type::miss ? "miss" : "call",
+                        int(g[k].raygen.shader_index));
+                groups += b;
+                if (groups.size() > 800) {
+                    g_log.Line(true, "RTPIPE pipe=%u groups:%s", pidx, groups.c_str());
+                    groups.clear();
+                }
+            }
+        } else if (so[i].type == T::libraries)
+            g_log.Line(true, "RTPIPE pipe=%u links %u existing librar%s", pidx, so[i].count, so[i].count == 1 ? "y" : "ies");
+    }
+    if (!groups.empty()) g_log.Line(true, "RTPIPE pipe=%u groups:%s", pidx, groups.c_str());
+    g_log.Line(true, "RTPIPE pipe=%u handle=%llx subobjects=%u shaders=%u properties=%s", pidx, (unsigned long long)pl.handle, n, shaders,
+        props ? "yes" : "no");
 }
 
 // RTPAL (observe): a dispatch binding a ring; what else it binds, and what the UPLOAD ones hold.

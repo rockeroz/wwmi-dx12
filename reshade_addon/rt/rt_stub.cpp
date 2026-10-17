@@ -16,6 +16,7 @@ size_t RtSkinOutCount()
 void RtForgetSkinOutRange(uint64_t, uint64_t) {}
 void RtPalRecord(reshade::api::command_list*, const CmdState&, uint64_t, uint32_t, uint32_t, uint32_t) {}
 void RtNoteShader(uint64_t, const void*, size_t) {}
+void RtNotePipeline(uint32_t, const reshade::api::pipeline_subobject*, reshade::api::pipeline) {}
 void RtNoteVertexShader(uint64_t, const void*, size_t) {}
 bool RtBonesWindowOpen()
 {

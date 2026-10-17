@@ -33,6 +33,8 @@ void RtPalRecord(reshade::api::command_list* cmd_list, const CmdState& state, ui
 // A compute pipeline's shader at creation (pipeline_hooks.cpp), by the core's hash: the module keeps a copy so
 // the shaders it sees binding a ring can be dumped for offline disassembly. Records only.
 void RtNoteShader(uint64_t cs_hash, const void* code, size_t code_size);
+// A ray tracing pipeline (state object) created: its shaders' libraries dumped, entries / groups / identifiers logged (M4).
+void RtNotePipeline(uint32_t subobject_count, const reshade::api::pipeline_subobject* subobjects, reshade::api::pipeline pipeline);
 // The same for a graphics pipeline's vertex shader (dumped when a held RT draw of a mod component uses it).
 void RtNoteVertexShader(uint64_t vs_hash, const void* code, size_t code_size);
 // RTBONES / RTSKINREAD (g_debug): what her skin-cache dispatches bind, read once.
