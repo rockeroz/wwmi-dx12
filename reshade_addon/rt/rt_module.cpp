@@ -831,6 +831,7 @@ TlasRec                                              g_m3_tlas[8];
 uint32_t                                             g_m3_tlas_next = 0;
 std::map<std::string, uint64_t>                      g_m3_why; // refusals by reason
 uint64_t                                             g_m3_builds = 0, g_m3_updates = 0, g_m3_redirects = 0;
+std::map<std::string, uint64_t>                      g_m3_full_why; // full builds of our BLAS by reason
 std::atomic<bool>                                    g_m3_any{ false };
 std::atomic<int>                                     g_m3_on{ -1 };
 ComPtr<ID3D12Device5>                                g_dev5;
@@ -1059,8 +1060,17 @@ void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const ac
     }
     // rt_m3_update = 0: every build a full one (before this, every build was, by a bug: need_full was set before it was read)
     static const bool s_updates = g_addon_ini_path.empty() || GetPrivateProfileIntW(L"wwmi-dx12", L"rt_m3_update", 1, g_addon_ini_path.c_str()) != 0;
-    const bool full = !s_updates || topo || need_full || !mb.built || mode == acceleration_structure_build_mode::build || mb.updates >= 300 ||
-                      cur_cnt != mb.built_cnt || cur_verts != mb.built_verts || cur_flags != mb.built_flags;
+    // (the game's own build mode does not matter: ours has its own topology, counts and history)
+    const char* full_why = !s_updates                                                                     ? "rt_m3_update=0"
+                           : topo                                                                         ? "topology changed"
+                           : need_full                                                                    ? "previous build skipped"
+                           : !mb.built                                                                    ? "first build"
+                           : mb.updates >= 300                                                            ? "300 updates in a row"
+                           : cur_cnt != mb.built_cnt || cur_verts != mb.built_verts || cur_flags != mb.built_flags ? "counts / flags changed"
+                                                                                                          : nullptr;
+    (void)mode;
+    const bool full = full_why != nullptr;
+    if (full) ++g_m3_full_why[full_why];
     if (full) {
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pi{};
         g_dev5->GetRaytracingAccelerationStructurePrebuildInfo(&in, &pi);
@@ -1800,6 +1810,9 @@ void M3Summary()
                 (unsigned long long)mb.rays_covered, (unsigned long long)mb.rays_live, (unsigned long long)mb.rays_found,
                 mb.redirected ? int(g_frame_id - mb.redirected) : -1, mb.builds);
     for (const auto& [why, n] : g_m3_why) g_log.Line(true, "RTM3WHY %llu: %s", (unsigned long long)n, why.c_str());
+    std::string fw;
+    for (const auto& [why, n] : g_m3_full_why) fw += " | " + std::to_string(n) + " " + why;
+    if (!fw.empty()) g_log.Line(true, "RTM3FULL full BLAS builds by reason:%s", fw.c_str());
 }
 
 } // namespace
