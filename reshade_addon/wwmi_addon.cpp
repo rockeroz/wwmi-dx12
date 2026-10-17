@@ -413,9 +413,11 @@ static void ActivateD3D12()
     reshade::register_event<reshade::addon_event::bind_descriptor_tables>(HP(bind_descriptor_tables));
     reshade::register_event<reshade::addon_event::reset_command_list>(HP(reset_command_list)); // the record follows D3D12: nothing survives a Reset
     reshade::register_event<reshade::addon_event::close_command_list>(HP(close_command_list));
+    reshade::register_event<reshade::addon_event::destroy_command_list>(RtResetRecording);
     reshade::register_event<reshade::addon_event::build_acceleration_structure>(HP(build_acceleration_structure)); // RT ACTIVE + the game's RT work in the pin's tallies
     reshade::register_event<reshade::addon_event::dispatch_rays>(HP(dispatch_rays));
     reshade::register_event<reshade::addon_event::push_descriptors>(HP(push_descriptors));
+    reshade::register_event<reshade::addon_event::push_constants>(on_push_constants);
     reshade::register_event<reshade::addon_event::bind_vertex_buffers>(HP(bind_vertex_buffers));
     reshade::register_event<reshade::addon_event::bind_index_buffer>(HP(bind_index_buffer));
     reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(HP(bind_render_targets));

@@ -1,6 +1,7 @@
 #pragma once
 #include <reshade.hpp>
 #include <d3d12.h>
+#include "compute_root_state.h"
 #include <mutex>
 #include <atomic>
 #include <unordered_map>
@@ -126,6 +127,7 @@ struct HeapBind {
 using CmdHeaps = std::array<HeapBind, 2>; // by heap type: CBV_SRV_UAV, sampler
 struct CmdBlock {
     CmdState             gfx;
+    ComputeRootState     compute;
     CmdCbvBinds          cbv;
     CmdRT                rt;
     CmdHeaps             heaps;
@@ -201,6 +203,33 @@ inline CmdState&   CmdGfx(const void* cmd_list)
     if (b) return b->gfx;
     std::lock_guard l(g_cmd_mutex);
     return g_cmd_state[reinterpret_cast<uintptr_t>(cmd_list)]; // a null list
+}
+inline ComputeRootState& CmdCompute(const void* cmd_list)
+{
+    CmdBlock* b = g_cmd_blocks.get(reinterpret_cast<uintptr_t>(cmd_list));
+    if (b) return b->compute;
+    static thread_local ComputeRootState missing;
+    missing.complete = false;
+    return missing;
+}
+inline void RestoreComputeRoots(ID3D12GraphicsCommandList* cl, const ComputeRootState& state)
+{
+    cl->SetComputeRootSignature(reinterpret_cast<ID3D12RootSignature*>(state.layout));
+    for (uint32_t p = 0; p < state.args.size(); ++p) {
+        const auto& a = state.args[p];
+        switch (a.kind) {
+        case ComputeRootState::Kind::table: cl->SetComputeRootDescriptorTable(p, { a.value }); break;
+        case ComputeRootState::Kind::cbv: cl->SetComputeRootConstantBufferView(p, a.value); break;
+        case ComputeRootState::Kind::srv:
+        case ComputeRootState::Kind::acceleration_structure: cl->SetComputeRootShaderResourceView(p, a.value); break;
+        case ComputeRootState::Kind::uav: cl->SetComputeRootUnorderedAccessView(p, a.value); break;
+        case ComputeRootState::Kind::constants:
+            for (uint32_t i = 0; i < 64; ++i)
+                if (a.defined & (uint64_t(1) << i)) cl->SetComputeRoot32BitConstant(p, a.words[i], i);
+            break;
+        default: break;
+        }
+    }
 }
 inline CmdCbvBinds& CmdCbv(const void* cmd_list)
 {

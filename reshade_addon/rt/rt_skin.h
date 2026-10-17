@@ -1,3 +1,4 @@
+#include <memory>
 // rt_skin.h -- the RT module's M2: a mod component posed with the native skin cache's palette and drawn through the
 // game's pass-through vertex factory while the game ray traces. See rt_skin.cpp.
 #pragma once
@@ -50,6 +51,8 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
 // pool alternates) last posed -- the mod that draws it, our posed positions (FLOAT3, `verts` of them) and the index
 // ranges of the mod's index buffer (R32) posed there. The positions buffer is marked in use this frame.
 struct GeomPose {
+    std::shared_ptr<int> lease; // prevents the source slot from being overwritten while M3 copies it
+    ID3D12Resource* pos = nullptr;
     int                                        mod = -1;
     uint64_t                                   pos_va = 0;
     uint32_t                                   verts = 0;

@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <reshade.hpp>
+#include "rt_completion.h"
 #include "../hooks/cmd_state.h" // CmdState
 #include "../mods/wwmi_mod.h"   // WwmiMod::Component
 
@@ -102,10 +103,15 @@ void RtObserveDraw(reshade::api::command_list* cmd_list, uint32_t index_count, u
 void RtNoteCopy(reshade::api::command_list* cmd_list, reshade::api::resource src, uint64_t src_off, reshade::api::resource dst,
     uint64_t dst_off, uint64_t size);
 // A list submitted (ExecuteCommandLists): from now on what it reads from UPLOAD memory may already be on the GPU.
-void RtNoteExecute(reshade::api::command_list* cmd_list);
-void RtNoteRays(reshade::api::command_list* cmd_list, reshade::api::resource rg_res, uint64_t rg_off, uint64_t rg_size,
+void RtNoteExecute(reshade::api::command_queue* queue, reshade::api::command_list* cmd_list);
+// Completion is established after the recording is reset/destroyed and every
+// queue that executed it passes a fence. Unsubmitted recordings are abandoned.
+rtm::CompletionPtr RtRecordingCompletion(reshade::api::command_list* cmd_list);
+void RtResetRecording(reshade::api::command_list* cmd_list);
+bool RtNoteRays(reshade::api::command_list* cmd_list, reshade::api::resource rg_res, uint64_t rg_off, uint64_t rg_size,
     reshade::api::resource miss_res, uint64_t miss_off, uint64_t miss_size, uint64_t miss_stride, reshade::api::resource hit_res,
-    uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, uint32_t w, uint32_t h, uint32_t d);
+    uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, reshade::api::resource callable, uint64_t callable_off,
+    uint64_t callable_size, uint64_t callable_stride, uint32_t w, uint32_t h, uint32_t d);
 // Once per frame from the present path, while the add-on is enabled: the module's hold transitions
 // (entering the hold gives every stamped texture slot back to the game) and its periodic work.
 void RtPresentTick();

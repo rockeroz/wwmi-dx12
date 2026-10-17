@@ -310,7 +310,7 @@ bool on_build_acceleration_structure(reshade::api::command_list* cmd_list, resha
 }
 bool on_dispatch_rays(reshade::api::command_list* cmd_list, reshade::api::resource rg_res, uint64_t rg_off, uint64_t rg_size,
     reshade::api::resource miss_res, uint64_t miss_off, uint64_t miss_size, uint64_t miss_stride, reshade::api::resource hit_res,
-    uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, reshade::api::resource, uint64_t, uint64_t, uint64_t, uint32_t width,
+    uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, reshade::api::resource callable, uint64_t callable_off, uint64_t callable_size, uint64_t callable_stride, uint32_t width,
     uint32_t height, uint32_t depth)
 {
     RtBlockWithoutModule();
@@ -318,8 +318,8 @@ bool on_dispatch_rays(reshade::api::command_list* cmd_list, reshade::api::resour
     const unsigned long long               n = s_n.fetch_add(1, std::memory_order_relaxed);
     if (n == 0 || n == 1000 || n == 100000)
         logger::report("RT ACTIVE: DispatchRays #%llu (%u x %u x %u) at frame %u", n + 1, width, height, depth, g_frame_id);
-    RtNoteRays(cmd_list, rg_res, rg_off, rg_size, miss_res, miss_off, miss_size, miss_stride, hit_res, hit_off, hit_size, hit_stride,
-        width, height, depth);
+    if (RtNoteRays(cmd_list, rg_res, rg_off, rg_size, miss_res, miss_off, miss_size, miss_stride, hit_res, hit_off, hit_size, hit_stride,
+        callable, callable_off, callable_size, callable_stride, width, height, depth)) return true;
     if (cmd_list) RemovalPin::Ours(reinterpret_cast<const void*>(cmd_list->get_native()), "game-dispatch-rays");
     return false;
 }

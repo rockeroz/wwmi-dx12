@@ -48,3 +48,6 @@ struct BindTrace {
 }; // the table's first 8 slots
 bool ResolveBound(reshade::api::command_list* cmd_list, char stage, TargetClass kind, uint32_t reg,
     ID3D12Resource** out_res, uint64_t* out_va, uint32_t* out_size, BindTrace* trace = nullptr);
+
+void on_push_constants(reshade::api::command_list*, reshade::api::shader_stage, reshade::api::pipeline_layout,
+    uint32_t, uint32_t, uint32_t, const uint32_t*);

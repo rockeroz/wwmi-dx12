@@ -5,6 +5,7 @@
 #include "../migoto/dx12_bridge.h"
 #include "../instrumentation/diag.h"
 #include "../instrumentation/hot_path.h"
+#include "../rt/rt_hooks.h"
 #include "pipeline_hooks.h" // the PSO -> shader-hash table on_bind_pipeline stamps from
 #include "../hud/uid_hide.h"
 
@@ -278,6 +279,25 @@ void on_push_descriptors(command_list* cmd_list, shader_stage stages, pipeline_l
         CmdCmpLayout(cmd_list) = layout.handle;
     }
 
+    if ((uint32_t)(stages & shader_stage::all_compute) != 0 && g_is_dx12) {
+        auto& cs = CmdCompute(cmd_list);
+        cs.Signature(layout.handle);
+        using K = ComputeRootState::Kind;
+        if (!update.descriptors) cs.complete = false;
+        else if (update.type == descriptor_type::constant_buffer) {
+            const auto& r = *static_cast<const buffer_range*>(update.descriptors);
+            const uint64_t va = r.buffer.handle ? reinterpret_cast<ID3D12Resource*>(r.buffer.handle)->GetGPUVirtualAddress() + r.offset : r.offset;
+            cs.Descriptor(layout_param, K::cbv, va);
+        } else if (update.type == descriptor_type::buffer_shader_resource_view ||
+                   update.type == descriptor_type::buffer_unordered_access_view ||
+                   update.type == descriptor_type::acceleration_structure) {
+            // Pinned ReShade D3D12 root hooks pass the raw GPU VA for these types.
+            const uint64_t va = *static_cast<const uint64_t*>(update.descriptors);
+            cs.Descriptor(layout_param, update.type == descriptor_type::acceleration_structure ? K::acceleration_structure :
+                update.type == descriptor_type::buffer_unordered_access_view ? K::uav : K::srv, va);
+        } else cs.complete = false;
+    }
+
     if (update.type == descriptor_type::shader_resource_view || update.type == descriptor_type::unordered_access_view) {
         resource res = cmd_list->get_device()->get_resource_from_view(static_cast<const resource_view*>(update.descriptors)[0]);
         if (res.handle != 0) {
@@ -319,12 +339,14 @@ void on_reset_command_list(command_list* cmd_list)
 {
     PROF(PROF_CmdReset);
     if (!cmd_list) return;
+    RtResetRecording(cmd_list);
     HotPath::OnReset(cmd_list);
     RemovalPin::OnReset(reinterpret_cast<const void*>(cmd_list->get_native())); // the tally is per recording
     MigotoPort::ListBuffersForget(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
     const uintptr_t key = reinterpret_cast<uintptr_t>(cmd_list);
     CmdBlock*       b = g_cmd_blocks.get(key);
     if (b) {
+        b->compute = {}; // correctness state is cleared even when diagnostic carry-over is enabled
         ++b->gen; // a new recording (CmdGen): independent of the clear A/B below
         for (HeapBind& hb : b->heaps) hb.fresh = false;
     }
@@ -383,6 +405,13 @@ void on_bind_descriptor_tables(command_list* cmd_list, shader_stage stages, [[ma
     if (g_addon_disabled) return;
     auto&          state = CmdGfx(cmd_list);
     const bool     to_compute = ((uint32_t)(stages & shader_stage::all_compute) != 0);
+    if (to_compute && g_is_dx12) {
+        CmdCmpLayout(cmd_list) = layout.handle;
+        auto& cs = CmdCompute(cmd_list);
+        cs.Signature(layout.handle); // includes the count=0 root-signature notification
+        for (uint32_t i = 0; i < count; ++i)
+            cs.Descriptor(first + i, ComputeRootState::Kind::table, tables[i].handle);
+    }
     const uint32_t n = first < 64 ? std::min<uint32_t>(count, 64 - first) : 0;
     for (uint32_t i = 0; i < n; ++i) {
         RootParam& rp = state.root[first + i];
@@ -394,4 +423,13 @@ void on_bind_descriptor_tables(command_list* cmd_list, shader_stage stages, [[ma
         rp.ctable_note = { .layout = layout.handle, .frame = g_frame_id, .seq = ++state.ctable_seq_next };
 #endif
     }
+}
+
+void on_push_constants(command_list* cmd_list, shader_stage stages, pipeline_layout layout, uint32_t param,
+    uint32_t first, uint32_t count, const uint32_t* values)
+{
+    if (!g_is_dx12 || !cmd_list || (uint32_t(stages & shader_stage::all_compute) == 0)) return;
+    auto& cs = CmdCompute(cmd_list);
+    cs.Signature(layout.handle);
+    cs.Constants(param, first, count, values);
 }

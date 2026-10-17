@@ -1,3 +1,4 @@
+#include <deque>
 // rt_skin.cpp -- the RT module's M2: mod components posed with the native skin cache's palettes and drawn through
 // the game's pass-through vertex factory while the game ray traces (rt_mode=2).
 //
@@ -89,6 +90,8 @@ constexpr uint32_t                     kStartForget = 1800; // frames a start no
 // by its section count, see LookupSection)
 
 struct Slot {
+    std::shared_ptr<int> lease = std::make_shared<int>(0);
+    rtm::CompletionPtr producer;
     ComPtr<ID3D12Resource>      pos, tan;
     D3D12_CPU_DESCRIPTOR_HANDLE pos_view{}, tan_view{};
     uint32_t                    tan_fmt = 0;
@@ -122,6 +125,7 @@ struct Mesh {
     Pose                    merged_cur, merged_prev; // the last merged palettes built (velocity-free history)
     // M3: per component, the slots its sub-draws were posed into, this frame and the one before (the BLAS takes one)
     struct RtPose {
+        rtm::CompletionPtr producer;
         int                                        slot = -1;
         std::vector<std::pair<uint32_t, uint32_t>> ranges;
         uint64_t                                   sum = 0;
@@ -130,6 +134,7 @@ struct Mesh {
         uint32_t            frame = 0;
         std::vector<RtPose> recs;
     };
+    std::map<int, std::deque<RtPoseGen>> rt_history; // enough generations for CPU/GPU overlap
     std::map<int, std::pair<RtPoseGen, RtPoseGen>> rt_poses; // comp -> (latest frame's, the one before)
 };
 // M3: which mod drew a section of a ring (both of the character's rings), and when
@@ -143,6 +148,11 @@ void NoteRtPose(Mesh& m, int comp, int slot, uint32_t frame, uint32_t s2, uint32
 {
     auto& g = m.rt_poses[comp];
     if (g.first.frame != frame) {
+        if (!g.second.recs.empty()) {
+            auto& history = m.rt_history[comp];
+            history.push_front(std::move(g.second));
+            if (history.size() > 8) history.pop_back();
+        }
         g.second = std::move(g.first);
         g.first = Mesh::RtPoseGen{};
         g.first.frame = frame;
@@ -155,6 +165,7 @@ void NoteRtPose(Mesh& m, int comp, int slot, uint32_t frame, uint32_t s2, uint32
         g.first.recs.push_back({});
         rec = &g.first.recs.back();
         rec->slot = slot;
+        rec->producer = m.slots[size_t(slot)].producer;
     }
     const std::pair<uint32_t, uint32_t> r{ s2, c };
     if (rec->ranges.size() >= 64 || std::find(rec->ranges.begin(), rec->ranges.end(), r) != rec->ranges.end()) return;
@@ -408,7 +419,7 @@ bool AcquireSlot(Mesh& m, reshade::api::command_list* cmd_list, uint64_t gen, ui
     int pick = -1;
     for (int i = 0; i < int(m.slots.size()); ++i) {
         const Slot& s = m.slots[size_t(i)];
-        if (!named[size_t(i)] && (s.used == UINT32_MAX || frame - s.used >= 2) && (!s.stamp || GpuPassed(s.stamp))) {
+        if (s.lease.use_count() == 1 && !named[size_t(i)] && (s.used == UINT32_MAX || frame - s.used >= 2) && (!s.stamp || GpuPassed(s.stamp))) {
             pick = i;
             break;
         }
@@ -912,6 +923,10 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
             snprintf(line, sizeof line, "RTM2 mod=%d comp=%d drawn with its last pose (the skin cache did not pose the section this frame)", mod, comp);
             LogOnce(key, line);
         } else {
+        if (!CmdCompute(cmd_list).complete) {
+            SkipLocked("compute root state could not be preserved", mod, comp);
+            return out;
+        }
         // pose: COMMON | read -> UAV, dispatch, -> read
         const D3D12_RESOURCE_STATES from = bind->state == 2 ? kRead : D3D12_RESOURCE_STATE_COMMON;
         if (bind->state != 1) Transition(cl, sl.pos.Get(), sl.tan.Get(), from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -927,11 +942,13 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         cl->SetComputeRootUnorderedAccessView(6, sl.pos->GetGPUVirtualAddress());
         cl->SetComputeRootUnorderedAccessView(7, sl.tan->GetGPUVirtualAddress());
         cl->Dispatch((c + 63) / 64, 1, 1);
+        RestoreComputeRoots(cl, CmdCompute(cmd_list));
         RemovalPin::Ours(cl, "rt-m2 skin");
         Transition(cl, sl.pos.Get(), sl.tan.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
         bind->state = 2;
         sl.used = frame;
         sl.stamp = GpuStamp();
+        sl.producer = RtRecordingCompletion(cmd_list);
         {
             auto& pp = m.poses[comp];
             if (pp.first.frame != frame) pp.second = pp.first;
@@ -987,13 +1004,26 @@ bool PoseFor(uint64_t ring, int comp, uint32_t frame, GeomPose* out)
     Mesh&      m = mi->second;
     const auto pi = m.rt_poses.find(comp);
     if (pi == m.rt_poses.end()) return false;
-    // the newest complete frame: this frame's poses may still be coming (the raster draws after the BLAS update)
-    const Mesh::RtPoseGen& g = pi->second.first.frame < frame || pi->second.second.recs.empty() ? pi->second.first : pi->second.second;
-    const Mesh::RtPose*    best = nullptr;
-    for (const Mesh::RtPose& r : g.recs)
-        if (r.slot >= 0 && size_t(r.slot) < m.slots.size() && (!best || r.sum > best->sum)) best = &r;
-    if (!best || best->ranges.empty() || int32_t(frame - g.frame) > int32_t(kCachedPose)) return false;
+    const Mesh::RtPose* best = nullptr;
+    uint32_t pose_frame = 0;
+    auto consider = [&](const Mesh::RtPoseGen& generation) {
+        if (best || generation.frame >= frame || int32_t(frame - generation.frame) > 8) return;
+        for (const auto& r : generation.recs) {
+            if (r.slot < 0 || size_t(r.slot) >= m.slots.size() || r.ranges.empty()) continue;
+            const auto& slot = m.slots[size_t(r.slot)];
+            if (!r.producer || r.producer != slot.producer || !r.producer->Ready()) continue;
+            if (!best || r.sum > best->sum) best = &r;
+        }
+        if (best) pose_frame = generation.frame;
+    };
+    consider(pi->second.first);
+    consider(pi->second.second);
+    if (auto h = m.rt_history.find(comp); h != m.rt_history.end())
+        for (const auto& generation : h->second) consider(generation);
+    if (!best) return false;
     Slot& sl = m.slots[size_t(best->slot)];
+    out->lease = sl.lease;
+    out->pos = sl.pos.Get();
     sl.used = frame; // read by this frame's BLAS and rays: not handed to another recording for two frames
     sl.stamp = GpuStamp();
     out->mod = m.mod;
@@ -1002,7 +1032,7 @@ bool PoseFor(uint64_t ring, int comp, uint32_t frame, GeomPose* out)
     out->idx = m.idx.Get();
     out->indices = m.indices;
     out->ranges = best->ranges;
-    out->frame = g.frame;
+    out->frame = pose_frame;
     return true;
 }
 

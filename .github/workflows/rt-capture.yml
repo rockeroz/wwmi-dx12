@@ -40,6 +40,12 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force build_addon\rt_capture | Out-Null
           ./tools/ci/annotate.ps1 -VcVars -Title "rt_registry_test" -Command "cl /nologo /std:c++20 /EHsc /W4 /WX /MT tests\rt_registry_test.cpp /Febuild_addon\rt_capture\rt_registry_test.exe /Fobuild_addon\rt_capture\rt_registry_test.obj && build_addon\rt_capture\rt_registry_test.exe"
+      - name: CPU test rt_safety_test
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build_addon\rt_capture | Out-Null
+          ./tools/ci/annotate.ps1 -VcVars -Title "rt_safety_test" -Command "cl /nologo /std:c++20 /EHsc /W4 /WX /MT tests\rt_safety_test.cpp /Febuild_addon\rt_capture\rt_safety_test.exe /Fobuild_addon\rt_capture\rt_safety_test.obj && build_addon\rt_capture\rt_safety_test.exe"
       - name: Test offline analysis
         run: python -m unittest discover -s tests -p "test_rt_*py"
       - uses: actions/upload-artifact@v4

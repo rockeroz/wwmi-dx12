@@ -1,3 +1,4 @@
+#include "SkinWeights.hlsli"
 // RtSkinMod -- the RT module's mod skinning (M2). With ray tracing on, Wuthering Waves poses characters in UE's GPU
 // skin cache (SkinCacheUpdateBatchCS, one dispatch per mesh section, each with its own bone palette) and draws them
 // through a pass-through vertex factory that reads posed positions (IA slot 0) and fetches the rest by vertex id.
@@ -91,7 +92,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (sum) {
         const float4 h = float4(p, 1.0);
         q = float3(dot(r0, h), dot(r1, h), dot(r2, h));
-        if (sum != 255u) q = lerp(p, q, 255.0 / float(sum)); // renormalise partial weights
+        if (sum != 255u) q *= RtSkinWeightScale(sum); // normalise the accumulated transform
     }
     if (!all(isfinite(q))) q = p;
     OutPositions.Store3(OutPosOffset + v * 12u, asuint(q));
