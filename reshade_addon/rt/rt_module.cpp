@@ -275,11 +275,11 @@ const char* ModeText(int m)
                   : "off: the add-on stops while the game ray traces";
 }
 
-std::string M3Status();
+void M3Summary();
 
 void Summary()
 {
-    std::string m2 = Mode() == 2 ? rtskin::Status() + M3Status() : std::string("m2 off");
+    std::string m2 = Mode() == 2 ? rtskin::Status() : std::string("m2 off");
     {
         std::lock_guard l(g_held_m);
         for (const auto& [why, n] : g_held_why) m2 += " | held " + std::to_string(n) + ": " + why;
@@ -310,6 +310,7 @@ void Summary()
         (unsigned long long)g_sig_rings.load(), (unsigned long long)g_rt_draws.load(), (unsigned long long)g_c.skin_records.load(),
         (unsigned long long)g_c.claims_drawn.load(), (unsigned long long)g_c.sections.load(), (unsigned long long)g_c.section_misses.load(),
         (unsigned long long)g_c.m2_drawn.load(), (unsigned long long)g_c.m2_not_drawn.load(), m2.c_str(), g_ring_count.load(), rings.c_str());
+    if (Mode() == 2) M3Summary(); // its own lines (RTSUM is cut at 1024 characters)
 }
 
 uint64_t BufferVa(resource res, uint64_t offset) // ReShade DX12: a null resource carries the VA in `offset`
@@ -804,6 +805,8 @@ struct ModBlas {
     uint32_t patched = 0;                   // frame a TLAS build last got our BLAS in its instance
     std::vector<uint32_t> redirected_idx; // the instances our last TLAS rebuild put it in
     uint32_t              redirected_seq = 0; // ...of which TLAS (its build's sequence number)
+    uint64_t              rays_live = 0, rays_covered = 0; // ray dispatches it was live for / every instance ours then
+    uint64_t              rays_found = 0;                   // ...of which its instance was found in the TLAS
 };
 struct TlasRec {
     const void*     cl = nullptr;
@@ -816,6 +819,7 @@ struct TlasRec {
     uint32_t        flags = 0; // its build flags
     uint64_t        dest = 0;  // the TLAS it builds
     uint64_t        gate = 0;  // the gate value its list waits for (0 = not gated)
+    bool            decided = false; // the rays came before its list was submitted: written then, never gated
 };
 std::mutex                                           g_m3_m; // everything below
 std::map<uint64_t, ModBlas>                          g_m3;   // the game's BLAS (dest VA) -> ours
@@ -1453,6 +1457,8 @@ std::vector<AsCheck> g_m3_check; // instance addresses we wrote this frame (chec
 uint64_t             g_m3_overwritten = 0;
 uint64_t            g_gate_next = 0, g_gate_done = 0; // last value handed out / signaled
 uint64_t            g_gate_count = 0, g_gate_early = 0;
+uint64_t            g_m3_unsubmitted = 0; // TLAS written at the rays before its list was even submitted (no gate needed)
+uint64_t            g_m3_rays = 0;        // DispatchRays seen with M3 live
 
 void M3ReleaseGate(uint64_t value) // g_m3_m held: every gate up to `value` opens
 {
@@ -1468,7 +1474,7 @@ bool M3GateClosed(const TlasRec& t)
 // ExecuteCommandLists of a list holding a TLAS build of this frame: put the gate in front of it.
 void M3GateSubmit(command_queue* queue, TlasRec& t)
 {
-    if (M3Mode() != 1 || !queue || t.gate) return;
+    if (M3Mode() != 1 || !queue || t.gate || t.decided) return;
     bool any = false;
     for (const auto& [game, mb] : g_m3) any = any || (mb.ok && int32_t(g_frame_id - mb.built) <= int32_t(kM3Window));
     if (!any) return;
@@ -1521,6 +1527,14 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
     CopyRec         copy{};
     const bool      src = M3HitSource(cmd_list, hit_res, hit_off, hit_size, frame, &rd, &rd_va, &why, &copy);
     const bool      closed = M3GateClosed(t);
+    // the GPU has not read this TLAS's instances yet: its build waits at our gate, or its list is not even submitted
+    const bool      writable = closed || (!t.executed && !t.gate && !t.decided);
+    ++g_m3_rays;
+    struct Cover {
+        uint32_t found = 0, good = 0;
+        bool     live = false;
+    };
+    std::map<ModBlas*, Cover> cover;
     struct Cand {
         ModBlas* mb;
         uint32_t idx;
@@ -1537,7 +1551,16 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
         // old BLAS)
         const bool     live = mb.ok && int32_t(frame - mb.built) <= int32_t(kM3Window) && int32_t(frame - mb.topo_frame) >= 3;
         const uint64_t ours = mb.blas->GetGPUVirtualAddress();
-        for (uint32_t idx : FindInstances(t.res, t.va, t.count, game, ours, mb, frame)) {
+        const auto     found = FindInstances(t.res, t.va, t.count, game, ours, mb, frame);
+        Cover&         cv = cover[&mb];
+        cv.live = live;
+        cv.found = uint32_t(found.size());
+        if (live && found.empty()) M3Refuse("rays: a live character's BLAS is named by no instance of the TLAS");
+        if (!live && !found.empty())
+            M3Refuse(!mb.ok                                     ? "rays: instance kept the game's (our BLAS not built for it this time)"
+                     : int32_t(frame - mb.built) > int32_t(kM3Window) ? "rays: instance kept the game's (our BLAS not built in the last frames)"
+                                                                      : "rays: instance kept the game's (topology changed under 3 frames ago)");
+        for (uint32_t idx : found) {
             uint8_t inst[64];
             if (GuardedPrivateRead(t.res, t.va + uint64_t(idx) * 64, inst, 64) != 64) continue;
             uint64_t as;
@@ -1556,7 +1579,11 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
                     stale.push_back({ &mb, idx, game, sig });
                 continue;
             }
-            if (!closed || !live) continue;
+            if (!live) continue;
+            if (!writable) {
+                M3Refuse("rays: instance kept the game's (its TLAS was already released to the GPU)");
+                continue;
+            }
             if (!valid) {
                 M3Refuse(src ? "an instance's records are not the character's (it keeps the game's BLAS)" : why);
                 continue;
@@ -1581,9 +1608,12 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
         mine.clear();
         ++g_m3_restores;
     };
+    bool backed = false;
     if (!stale.empty()) {
-        if (closed)
+        if (writable) {
             all_back();
+            backed = true;
+        }
         else {
             static std::atomic<uint32_t> s_warn{ 0 };
             if (s_warn.fetch_add(1) < 16)
@@ -1591,8 +1621,9 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
                     stale.size());
         }
     }
-    bool redirected = false;
+    bool redirected = false, committed = false;
     if (!txs.empty() && M3CommitRecs(txs)) {
+        committed = true;
         size_t done = 0;
         for (; done < cands.size(); ++done)
             if (!write_as(cands[done], cands[done].mb->blas->GetGPUVirtualAddress())) break;
@@ -1600,13 +1631,16 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
             // an instance write failed: the written ones back, and the records back
             for (size_t i = 0; i < done; ++i) write_as(cands[i], cands[i].game);
             for (const RecTx& tx : txs) M3WriteRecs(tx, false);
+            committed = false;
             M3Refuse("an instance write failed (nothing redirected)");
         } else
             redirected = !cands.empty();
     } else if (!txs.empty()) {
         // the records could not all be written (the written ones put back)
-        if (closed)
+        if (writable) {
             all_back();
+            backed = true;
+        }
         else {
             static std::atomic<uint32_t> s_warn{ 0 };
             if (s_warn.fetch_add(1) < 16)
@@ -1629,35 +1663,61 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
             g_log.Line(true, "RTM3 redirect f=%u: TLAS %llx (%u instances, gate %llu) reads our BLAS for %zu instance(s); records patched", frame,
                 (unsigned long long)t.dest, t.count, (unsigned long long)t.gate, cands.size());
     }
-    if (closed) M3ReleaseGate(t.gate); // the game's TLAS build may run now
+    // coverage: which characters' instances all trace our BLAS with our records after this
+    if (!backed && committed) {
+        for (const Cand& c : mine) ++cover[c.mb].good;
+        for (const Cand& c : cands) ++cover[c.mb].good;
+    }
+    for (auto& [mb, cv] : cover) {
+        if (!cv.live) continue;
+        ++mb->rays_live;
+        if (cv.found) ++mb->rays_found;
+        if (cv.found && cv.good == cv.found) ++mb->rays_covered;
+    }
+    if (closed)
+        M3ReleaseGate(t.gate); // the game's TLAS build may run now
+    else if (writable) {
+        t.decided = true; // written before its list was submitted: no gate when it is
+        if (redirected) ++g_m3_unsubmitted;
+    }
 }
 
-std::string M3Status()
+// RTM3SUM / RTM3CHAR / RTM3WHY lines (every summary).
+void M3Summary()
 {
-    if (!M3On()) return " | m3 off (rt_m3=0)";
-    if (M3Mode() == 2) return " | m3 DIAGNOSTIC rt_m3=2 (our BLAS only)" + std::string();
-    if (M3Mode() == 3) {
-        std::lock_guard l(g_m3_m);
-        return " | m3 DIAGNOSTIC rt_m3=3 (game TLAS rebuilt in place, unchanged): rebuilds=" + std::to_string(g_m3_rebuilds);
+    if (!M3On()) {
+        g_log.Line(true, "RTM3SUM off (rt_m3=0)");
+        return;
     }
     std::lock_guard l(g_m3_m);
-    char b[256];
-    size_t ok = 0;
-    for (const auto& [g, mb] : g_m3) ok += mb.ok ? 1 : 0;
-    snprintf(b, sizeof b, " | m3 chars=%zu/%zu builds=%llu updates=%llu redirected_frames=%llu tlas_with_ours=%llu restores=%llu gates=%llu (opened without rays %llu) overwritten=%llu grave=%zu",
-        ok, g_m3.size(), (unsigned long long)g_m3_builds, (unsigned long long)g_m3_updates, (unsigned long long)g_m3_redirects,
-        (unsigned long long)g_m3_rebuilds, (unsigned long long)g_m3_restores, (unsigned long long)g_gate_count, (unsigned long long)g_gate_early,
-        (unsigned long long)g_m3_overwritten, g_m3_grave.size());
-    std::string s = b;
+    if (M3Mode() != 1) {
+        g_log.Line(true, "RTM3SUM DIAGNOSTIC rt_m3=%d%s builds=%llu updates=%llu tlas_rebuilds=%llu", M3Mode(),
+            M3Mode() == 2 ? " (our BLAS only)" : " (game TLAS rebuilt in place, unchanged)", (unsigned long long)g_m3_builds,
+            (unsigned long long)g_m3_updates, (unsigned long long)g_m3_rebuilds);
+        return;
+    }
+    size_t   ok = 0;
+    uint64_t live = 0, found = 0, covered = 0;
+    for (const auto& [g, mb] : g_m3) {
+        ok += mb.ok ? 1 : 0;
+        live += mb.rays_live;
+        found += mb.rays_found;
+        covered += mb.rays_covered;
+    }
+    g_log.Line(true,
+        "RTM3SUM chars=%zu/%zu builds=%llu updates=%llu rays=%llu coverage=%llu/%llu (instance found %llu) redirects=%llu tlas_redirected=%llu "
+        "(before submit %llu) restores=%llu gates=%llu (opened without rays %llu) overwritten=%llu grave=%zu",
+        ok, g_m3.size(), (unsigned long long)g_m3_builds, (unsigned long long)g_m3_updates, (unsigned long long)g_m3_rays,
+        (unsigned long long)covered, (unsigned long long)live, (unsigned long long)found, (unsigned long long)g_m3_redirects,
+        (unsigned long long)g_m3_rebuilds, (unsigned long long)g_m3_unsubmitted, (unsigned long long)g_m3_restores,
+        (unsigned long long)g_gate_count, (unsigned long long)g_gate_early, (unsigned long long)g_m3_overwritten, g_m3_grave.size());
     for (const auto& [g, mb] : g_m3)
-        if (mb.ok) {
-            char c[128];
-            snprintf(c, sizeof c, " [%llx contrib %d redirected %s]", (unsigned long long)g, mb.contrib == UINT32_MAX ? -1 : int(mb.contrib),
-                int32_t(g_frame_id - mb.redirected) <= int32_t(kM3Window) ? "yes" : "no");
-            s += c;
-        }
-    for (const auto& [why, n] : g_m3_why) s += " | m3 refused " + std::to_string(n) + ": " + why;
-    return s;
+        if (mb.ok || mb.rays_live)
+            g_log.Line(true, "RTM3CHAR game=%llx ok=%d contrib=%d geometries=%u coverage=%llu/%llu found=%llu last_redirect=%d frame(s) ago builds=%u",
+                (unsigned long long)g, mb.ok ? 1 : 0, mb.contrib == UINT32_MAX ? -1 : int(mb.contrib), mb.geoms,
+                (unsigned long long)mb.rays_covered, (unsigned long long)mb.rays_live, (unsigned long long)mb.rays_found,
+                mb.redirected ? int(g_frame_id - mb.redirected) : -1, mb.builds);
+    for (const auto& [why, n] : g_m3_why) g_log.Line(true, "RTM3WHY %llu: %s", (unsigned long long)n, why.c_str());
 }
 
 } // namespace
