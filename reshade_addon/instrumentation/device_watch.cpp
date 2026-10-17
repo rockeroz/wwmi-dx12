@@ -156,6 +156,8 @@ void StartRemovalWatchdog(swapchain* sc)
                     dev_for_watch->Release();
                 }).detach();
                 logger::report("DRED: removal watchdog started (%s)", ev ? "fence event + 200ms poll" : "200ms poll");
+                reshade::log::message(reshade::log::level::info, ev ? "wwmi-dx12: device removal watchdog started (fence event)"
+                                                                    : "wwmi-dx12: device removal watchdog started (200 ms poll)");
             }
         }
     }

@@ -1733,6 +1733,11 @@ void RtPresentTick()
     if (!s_started) {
         s_started = true;
         ReshadeLog(reshade::log::level::info, "wwmi-dx12 RT module M2 is in this build; rt_mode=%d (%s)", Mode(), ModeText(Mode()));
+        ReshadeLog(reshade::log::level::info, "wwmi-dx12 RT module M3: rt_m3=%d (%s)", M3Mode(),
+            M3Mode() == 0   ? "off"
+            : M3Mode() == 1 ? "mod geometry in the ray traced scene"
+            : M3Mode() == 2 ? "DIAGNOSTIC: our BLAS built only"
+                            : "DIAGNOSTIC: the game's TLAS rebuilt in place, unchanged");
         g_log.Line(true, "RTSTART module M2, rt_mode=%d (%s); waiting for ray tracing (BLAS builds / DispatchRays)", Mode(), ModeText(Mode()));
     }
     {
