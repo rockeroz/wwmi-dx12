@@ -40,7 +40,8 @@ bool PoseCached(int mod, int comp); // do we have a recent pose of ours of this 
 // The mod's meshes: asked for from any thread, loaded on the present thread (RtPresentTick).
 bool MeshReady(int mod);
 void RequestMesh(int mod);
-void PresentTick(); // loads requested meshes, retires bindings
+void PresentTick(); // hands requested meshes to the background loader, retires bindings
+void PreloadAll();  // every loaded mod's mesh, in the background (ray tracing just started)
 
 // The draw (draw_section_draw.cpp -> RtSkinDraw): pose the sub-draw [s2, s2 + c) of component `comp` of mod `mod`,
 // bind it, redirect the VS's fetch buffers and LocalVF. Returns what the core must restore / whether to skip.

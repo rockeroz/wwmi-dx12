@@ -164,6 +164,11 @@ void NoteRtPose(Mesh& m, int comp, int slot, uint32_t frame, uint32_t s2, uint32
 }
 std::map<int, Mesh> g_meshes;
 std::set<int>       g_requested;
+// Meshes are loaded on a background thread (a big mod's files and upload took long enough on the frame thread to
+// freeze the game when its character first appeared). g_m.
+std::set<int>       g_loading;
+std::deque<int>     g_load_queue;
+bool                g_loader_running = false;
 
 struct BindKey {
     uintptr_t cl;
@@ -699,33 +704,64 @@ void RequestMesh(int mod)
     g_requested.insert(mod);
 }
 
-void PresentTick()
+void LoaderThread()
 {
-    std::set<int> todo;
-    {
-        std::lock_guard l(g_m);
-        todo.swap(g_requested);
-        // a mod asked for again while it was loading is not loaded twice: a live mesh is never replaced (its
-        // output buffers may still be read by the GPU)
-        for (auto it = todo.begin(); it != todo.end();)
-            it = g_meshes.count(*it) ? todo.erase(it) : std::next(it);
-        if (!todo.empty()) EnsurePipeline();
-        // bindings of recordings from earlier frames are done with (their lists were submitted long ago)
-        for (auto it = g_binds.begin(); it != g_binds.end();)
-            it = g_frame_id - it->second.frame > 3 ? g_binds.erase(it) : std::next(it);
-    }
-    for (int mod : todo) {
-        Mesh m;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) {
+        int mod;
+        {
+            std::lock_guard l(g_m);
+            if (g_load_queue.empty()) {
+                g_loader_running = false;
+                return;
+            }
+            mod = g_load_queue.front();
+            g_load_queue.pop_front();
+        }
+        Mesh          m;
         m.mod = mod;
+        LARGE_INTEGER f, t0, t1;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&t0);
         const bool ok = LoadMesh(m);
-        Log(true, "RTM2 mesh mod=%d %s: verts=%u indices=%u influences=%u uv_stride=%u color=%d merged_skeleton=%u bones (%zu sections)%s%s", mod,
-            ok ? "loaded" : "FAILED", m.verts, m.indices, m.influences, m.uv_stride, m.has_color ? 1 : 0, m.merged_bones, m.merged.size(),
-            ok ? "" : " -- ", ok ? "" : m.why.c_str());
+        QueryPerformanceCounter(&t1);
+        Log(true, "RTM2 mesh mod=%d %s in %.0f ms (background): verts=%u indices=%u influences=%u uv_stride=%u color=%d merged_skeleton=%u bones (%zu sections)%s%s",
+            mod, ok ? "loaded" : "FAILED", double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(f.QuadPart ? f.QuadPart : 1), m.verts, m.indices,
+            m.influences, m.uv_stride, m.has_color ? 1 : 0, m.merged_bones, m.merged.size(), ok ? "" : " -- ", ok ? "" : m.why.c_str());
         std::lock_guard l(g_m);
         m.ready = ok;
         m.failed = !ok;
         g_meshes.emplace(mod, std::move(m)); // never over an existing one
+        g_loading.erase(mod);
     }
+}
+
+void PresentTick()
+{
+    std::lock_guard l(g_m);
+    std::set<int>   todo;
+    todo.swap(g_requested);
+    // a mod asked for again while it was loading is not loaded twice: a live mesh is never replaced (its output
+    // buffers may still be read by the GPU)
+    for (int mod : todo)
+        if (!g_meshes.count(mod) && g_loading.insert(mod).second) g_load_queue.push_back(mod);
+    if (!g_load_queue.empty()) {
+        EnsurePipeline();
+        if (!g_loader_running) {
+            g_loader_running = true;
+            std::thread(LoaderThread).detach();
+        }
+    }
+    // bindings of recordings from earlier frames are done with (their lists were submitted long ago)
+    for (auto it = g_binds.begin(); it != g_binds.end();)
+        it = g_frame_id - it->second.frame > 3 ? g_binds.erase(it) : std::next(it);
+}
+
+void PreloadAll()
+{
+    std::lock_guard l(g_m);
+    for (size_t i = 0; i < g_geomods.size(); ++i)
+        if (!g_meshes.count(int(i))) g_requested.insert(int(i));
 }
 
 VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* cl, int mod, int comp, uint32_t c, uint32_t s2)

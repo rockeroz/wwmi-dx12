@@ -2034,6 +2034,13 @@ void RtPresentTick()
                                                           : "wwmi-dx12 RT module: ray tracing stopped");
         }
         s_drawing = drawing;
+        // rt_preload = 0: a mod's mesh is loaded only when its character is first drawn (the original shows meanwhile)
+        static const bool s_preload = g_addon_ini_path.empty() || GetPrivateProfileIntW(L"wwmi-dx12", L"rt_preload", 1, g_addon_ini_path.c_str()) != 0;
+        static size_t     s_preloaded = 0;
+        if (drawing && s_preload && g_geomods.size() != s_preloaded) {
+            s_preloaded = g_geomods.size();
+            rtskin::PreloadAll();
+        }
     }
     if (Mode() == 2) rtskin::PresentTick();
     if (!s_last_summary || g_frame_id - s_last_summary >= kSummaryEvery) { // a heartbeat, ray tracing or not
