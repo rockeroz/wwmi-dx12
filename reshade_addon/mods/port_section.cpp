@@ -100,7 +100,7 @@ bool PortRunSection(const std::wstring& fq_section, PortHooks& hk,
             g_chain_trace.Line("RunCommandList", c->fq.c_str(), line);
             if (logger::enabled(1)) {
                 static std::atomic<int> budget{ 400 };
-                if (budget.fetch_sub(1) > 0) {
+                if (budget.fetch_sub(1) > 0 || t_trace_binds) {
                     std::wstring cns;
                     if (line && line[0] == L'[') {
                         const wchar_t* close = wcschr(line, L']');

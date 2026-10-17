@@ -56,6 +56,7 @@ void                                              ForgetCharMeshVb0(uint64_t va,
 bool                                              IbAnchorNoteAndAsk(uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_idx); // ib_bytes: the bound IB's extent
 void                                              IbAnchorForget(uint64_t va, uint64_t bytes);
 bool                                              IbAnchorResolve(uint64_t index_va, uint32_t index_bytes, int* mod_id, uint64_t* ib_base_va);
+bool                                              IbAnchorJustLearned(uint64_t index_va); // this is the first frame its draws are claimed
 extern std::unordered_set<uint32_t>               g_frame_skel;
 extern std::unordered_set<uint64_t>               g_char_lod_vb0;
 extern std::mutex                                 g_char_skel_mtx;

@@ -36,6 +36,7 @@ inline bool              g_decensor = false;
 inline bool              g_hide_uid = false;         // A5: the UID cut out of the UI text (hud/uid_hide.h)
 inline std::wstring      g_addon_ini_path;           // wwmi_dx12.ini, read at startup and written back by the overlay
 inline bool              g_skip_engine_tick = false; // A9: perf A/B only -- no [Present] lists, no present pass; mods stop updating
+inline bool              g_frame_end_step = true;    // presents from another thread (frame generation): the per-frame step at the game's own frame end (Numpad 7)
 inline bool              g_hide_outline = false;
 inline std::atomic<bool> g_reload_requested{ false }; // overlay -> reload at the next frame boundary
 
@@ -81,6 +82,16 @@ inline std::atomic<const void*> g_claim_last_list{ nullptr };
 inline std::atomic<const void*> g_claim_exec_queue{ nullptr };
 inline std::atomic<uint32_t>    g_claim_thread{ 0 };
 inline std::atomic<uint64_t>    g_claim_exec_seen{ 0 };
+inline std::atomic<bool>        g_game_frame_submitted{ false }; // a list with a game draw went to the GPU since the last step
+inline std::atomic<uint32_t>    g_game_submit_tid{ 0 };          // the thread that submits the game's drawing lists
+inline std::atomic<uint64_t>    g_game_submit_queue{ 0 };        // ...and the queue they go to (native)
+inline std::atomic<uint32_t>    g_presenter_tid{ 0 };
+inline std::atomic<void*>       g_present_queue{ nullptr };      // native: the redraw's lists run there
+inline std::atomic<bool>        g_frame_end_armed{ false };      // presents come from another thread: the game's frame end is watched for
+inline std::atomic<uint32_t>    g_bb_width{ 0 };
+inline std::atomic<uint32_t>    g_bb_height{ 0 };
+inline std::atomic<uint64_t>    g_frame_end_step_ms{ 0 };        // when the step last ran at the game's frame end
+inline std::atomic<bool>        g_frame_end_stepped{ false };    // ...and that it did since the last present
 inline std::atomic<uint64_t>    g_presentq_same{ 0 };
 inline std::atomic<uint64_t>    g_presentq_diff{ 0 };
 inline bool                     g_present_on_game_queue = false;

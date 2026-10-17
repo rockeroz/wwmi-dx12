@@ -614,6 +614,7 @@ void STDMETHODCALLTYPE Dx12Context::DrawInstanced(UINT VertexCountPerInstance, U
 void STDMETHODCALLTYPE Dx12Context::Dispatch(UINT ThreadGroupCountX, UINT ThreadGroupCountY,
     UINT ThreadGroupCountZ)
 {
+    if (g_present_redraw) return;
     NoteEmittedDispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
     IssueDispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
 }
@@ -720,6 +721,7 @@ void STDMETHODCALLTYPE Dx12Context::Unmap(ID3D11Resource* pResource, UINT)
 
 void STDMETHODCALLTYPE Dx12Context::CopyResource(ID3D11Resource* pDst, ID3D11Resource* pSrc)
 {
+    if (g_present_redraw) return;
     WrapResource* d = AsWrapResource(pDst);
     WrapResource* s = AsWrapResource(pSrc);
     if (!d || !s || !d->dx12 || !s->dx12) {
@@ -918,6 +920,7 @@ void STDMETHODCALLTYPE Dx12Context::CopySubresourceRegion(ID3D11Resource* pDst, 
     UINT DstX, UINT DstY, UINT DstZ, ID3D11Resource* pSrc, UINT SrcSubresource,
     const D3D11_BOX* pSrcBox)
 {
+    if (g_present_redraw) return;
     const Dx12Bridge& b = GetDx12Bridge();
     if (!b.cl) {
         NotImplOnce("CopySubresourceRegion (no DX12 command list bound)");
@@ -981,6 +984,7 @@ void STDMETHODCALLTYPE Dx12Context::CopySubresourceRegion(ID3D11Resource* pDst, 
 void STDMETHODCALLTYPE Dx12Context::UpdateSubresource(ID3D11Resource* pDst, UINT DstSubresource,
     const D3D11_BOX* pDstBox, const void* pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch)
 {
+    if (g_present_redraw) return;
     WrapResource* d = AsWrapResource(pDst);
     if (!d || !d->dx12 || !pSrcData) {
         NotImplOnce("UpdateSubresource with a resource that is not one of our wrappers");
@@ -1012,6 +1016,7 @@ void STDMETHODCALLTYPE Dx12Context::UpdateSubresource(ID3D11Resource* pDst, UINT
 void STDMETHODCALLTYPE Dx12Context::ResolveSubresource(ID3D11Resource* pDst, UINT DstSubresource,
     ID3D11Resource* pSrc, UINT SrcSubresource, DXGI_FORMAT Format)
 {
+    if (g_present_redraw) return;
     const Dx12Bridge& b = GetDx12Bridge();
     if (!b.cl) {
         NotImplOnce("ResolveSubresource (no DX12 command list bound)");
@@ -1098,6 +1103,7 @@ bool PrepareUavClear(ID3D11UnorderedAccessView* uav, WrapView** out_view,
 void STDMETHODCALLTYPE Dx12Context::ClearUnorderedAccessViewFloat(ID3D11UnorderedAccessView* pUAV,
     const FLOAT                                                                              Values[4])
 {
+    if (g_present_redraw) return;
     WrapView*                   v = nullptr;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
     D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
@@ -1123,6 +1129,7 @@ void STDMETHODCALLTYPE Dx12Context::ClearUnorderedAccessViewFloat(ID3D11Unordere
 void STDMETHODCALLTYPE Dx12Context::ClearUnorderedAccessViewUint(ID3D11UnorderedAccessView* pUAV,
     const UINT                                                                              Values[4])
 {
+    if (g_present_redraw) return;
     WrapView*                   v = nullptr;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
     D3D12_CPU_DESCRIPTOR_HANDLE cpu{};

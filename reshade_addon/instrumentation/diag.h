@@ -5,6 +5,7 @@
 #include <mutex>
 #include <map>
 #include <utility>
+#include <vector>
 #include "../../src/fnv.h"
 #include "../../src/log.h"
 
@@ -21,9 +22,6 @@
 
 // The present counter: bumped once per frame by on_present, compared wherever an age in frames matters.
 inline uint32_t              g_frame_id = 1;
-// Frame generation (DLSS-G and the like) presents twice per frame the game renders: the in-between present carries no
-// draw of the game's. A present with no game draw since the last one (never two in a row) is not a frame.
-inline std::atomic<bool>     g_game_drew{ false };
 inline std::atomic<uint32_t> g_sections_this_frame{ 0 };
 
 inline bool g_debug = false;     // diagnostics + logging master (overlay A2)
@@ -99,7 +97,22 @@ inline unsigned long long DiagFnv(const char* s)
 }
 
 inline std::atomic<uint32_t> g_probe_until{ 0 }; // probes may fire while g_frame_id < this
-inline bool                  ProbeArmed()
+inline std::atomic<int>      g_present_log_left{ 0 }; // B23: presents still to log (PRESENTLOG)
+inline std::atomic<uint32_t> g_present_log_draws{ 0 };
+inline std::atomic<uint32_t> g_present_log_execs{ 0 };
+inline std::atomic<uint32_t> g_frame_end_draws{ 0 }; // B23: game draws since the last FRAMEEND
+inline std::atomic<int64_t>  g_present_log_qpc{ 0 };
+struct PresentLogSubmitter {
+    uint32_t tid = 0;
+    uint64_t queue = 0;
+    uint32_t lists = 0;
+    uint32_t claimed = 0;
+    int64_t  last_qpc = 0;
+};
+inline std::mutex                       g_present_log_mtx;
+inline std::vector<PresentLogSubmitter> g_present_log_subs; // B23: who submitted since the last present
+inline std::vector<uint64_t>            g_present_log_bbs;  // B23: the swapchain's back buffers
+inline bool                ProbeArmed()
 {
     return g_frame_id < g_probe_until.load(std::memory_order_relaxed);
 }

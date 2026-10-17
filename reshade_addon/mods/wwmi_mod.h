@@ -21,6 +21,7 @@ struct Component {
                               // match_first_index to THIS; used for (ib_hash, first_index) matching
     uint32_t             match_first_index = 0;
     uint32_t             match_index_count = 0;
+    int                  match_priority = 0;
     uint32_t             vg_offset = 0;    // $\WWMIv1\vg_offset (merge destination)
     uint32_t             vg_count = 0;     // $\WWMIv1\vg_count (merge source count)
     bool                 remapped = false; // true if its RemappedSkeletonComponentN is actually produced

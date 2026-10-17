@@ -98,20 +98,30 @@ bool InjectClaimedDraw(const DrawArgs& da, DrawClaim& dc)
             } else if (mc) {
                 int                       dm = (mc->mod_id >= 0 && mc->mod_id < (int)g_geomods.size()) ? mc->mod_id : 0;
                 const WwmiMod::Component* wc = WmodComp(dm, mc->comp_idx);
-                bool                      drew = draw_comp(dm, wc);
+                const int                 mc_slot = (int)(mc - g_merged_comps.data());
+                RfxDrawState              rfx_draw;
+                bool                      drew = false;
+                bool                      mc_drew = false;
+                auto                      run_slot = [&](int s) {
+                    const MergedComp& co = g_merged_comps[s];
+                    const bool        own = s == mc_slot;
+                    if (!own && (co.vanilla || co.hide)) return;
+                    if (drew) restore_state();
+                    const bool d = own ? draw_comp(dm, wc) : draw_comp(co.mod_id, WmodComp(co.mod_id, co.comp_idx));
+                    if (own) mc_drew = d;
+                    drew = d || drew;
+                };
+                fr.rfx_shared = &rfx_draw;
+                if (mc->run_order.empty()) run_slot(mc_slot);
+                for (const int s : mc->run_order) run_slot(s);
+                fr.rfx_shared = nullptr;
                 if (g_debug) { // SKELDBG: per (comp, skeleton-root) -- so depth pass (b4r=9) logs apart
                     if (DiagOnce("DEPTH-CB13", (mc->comp_idx << 8) | (game_cb13_root & 0xff))) {
                         uint64_t psh = 0;
                         cmd_list->get_private_data(s_iid_ps_hash, &psh);
                         logger::write("SKELDBG comp=%d cb13root=%d ps=%016llx remapped=%d drew=%d",
-                            mc->comp_idx, game_cb13_root, psh, (int)(wc && wc->remapped), (int)drew);
+                            mc->comp_idx, game_cb13_root, psh, (int)(wc && wc->remapped), (int)mc_drew);
                     }
-                }
-                for (const int s : mc->with) {
-                    const MergedComp& co = g_merged_comps[s];
-                    if (co.vanilla || co.hide) continue;
-                    if (drew) restore_state();
-                    drew = draw_comp(co.mod_id, WmodComp(co.mod_id, co.comp_idx)) || drew;
                 }
                 if (drew) {
                     restore_state();

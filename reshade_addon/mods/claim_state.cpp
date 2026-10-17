@@ -151,6 +151,16 @@ bool IbAnchorResolve(uint64_t index_va, uint32_t index_bytes, int* mod_id, uint6
     return true;
 }
 
+bool IbAnchorJustLearned(uint64_t index_va)
+{
+    if (!index_va) return false;
+    std::lock_guard l(g_ib_anchor_mtx);
+    auto            it = g_ib_anchor.upper_bound(index_va);
+    if (it == g_ib_anchor.begin()) return false;
+    --it;
+    return index_va - it->first < it->second.bytes && it->second.learned + 1 == g_frame_id;
+}
+
 void IbAnchorForget(uint64_t va, uint64_t bytes)
 {
     if (!va) return;

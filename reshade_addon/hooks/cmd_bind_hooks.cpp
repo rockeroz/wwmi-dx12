@@ -324,6 +324,7 @@ void on_reset_command_list(command_list* cmd_list)
 {
     PROF(PROF_CmdReset);
     if (!cmd_list) return;
+    ++t_list_resets;
     HotPath::OnReset(cmd_list);
     RemovalPin::OnReset(reinterpret_cast<const void*>(cmd_list->get_native())); // the tally is per recording
     MigotoPort::ListBuffersForget(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));

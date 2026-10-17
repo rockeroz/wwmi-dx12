@@ -50,6 +50,8 @@ FrameAnalysisContext g_ctx{ nullptr, nullptr };
 bool                 g_loaded = false;
 static unsigned      g_constants_generation = ~0u;
 unsigned             g_generation = 0;
+static EngineValues  g_step_inputs;               // what the step's [Present] started from: a redraw runs from the same
+static bool          g_step_inputs_taken = false; // ...for this load of the inis
 
 FrameAnalysisContext* FrameAnalysisCtx()
 {
@@ -93,6 +95,7 @@ bool Load(const wchar_t* ini_root)
 
     g_loaded = true;
     ++g_generation;
+    g_step_inputs_taken = false;
     logger::write("PORT: engine loaded -- %zu command lists, %zu custom shaders, %zu resources, "
                   "%zu texture overrides, %zu shader overrides, %d ini params",
         registered_command_lists.size(), customShaders.size(), customResources.size(),
@@ -239,6 +242,7 @@ static void FrameDriverConfig()
         ReloadConfig(&g_dev);
         RebuildParseSnapshots(); // MANDATORY after every parse
         BumpGeneration();
+        g_step_inputs_taken = false;
         MigotoPort::ClearSelectionVars();
     }
 
@@ -277,6 +281,8 @@ void PresentPre()
     RunConstantsOnce();
     G->frame_no++;
     MigotoPort::SweepSelectionVars();
+    g_step_inputs.Take();
+    g_step_inputs_taken = true;
     RunCommandList(&g_dev, &g_ctx, &G->present_command_list, nullptr, false);
     RunSkelCopyUpdates();
     FrameDriverConfig();
@@ -289,6 +295,22 @@ void PresentPost()
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
     if (!g_loaded) return;
     RunCommandList(&g_dev, &g_ctx, &G->post_present_command_list, nullptr, true);
+}
+
+void PresentRedraw()
+{
+    if (!HaveCommandList("[Present] redraw")) return;
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (!g_loaded) return;
+    EngineValues before;
+    before.Take();
+    if (g_step_inputs_taken) g_step_inputs.PutBack();
+    MigotoPort::g_present_redraw = true;
+    RunCommandList(&g_dev, &g_ctx, &G->present_command_list, nullptr, false);
+    RunCommandList(&g_dev, &g_ctx, &G->post_present_command_list, nullptr, true);
+    MigotoPort::g_present_redraw = false;
+    before.PutBack();
+    g_ctx.ResetCallCounters();
 }
 
 void SetKeyGate(bool (*fn)(const wchar_t* ns))

@@ -125,6 +125,13 @@ struct HeapBind {
     bool                  fresh = false;
 };
 using CmdHeaps = std::array<HeapBind, 2>; // by heap type: CBV_SRV_UAV, sampler
+#ifdef WWMI_DEBUG
+struct BbNote {
+    uint64_t res = 0;
+    uint32_t old_s = 0;
+    uint32_t new_s = 0;
+};
+#endif
 struct CmdBlock {
     CmdState             gfx;
     CmdCbvBinds          cbv;
@@ -133,7 +140,13 @@ struct CmdBlock {
     uint64_t             gfx_layout = 0; // active graphics root signature for this list
     uint64_t             cmp_layout = 0; // ... and the compute one
     uint64_t             gen = 1;
+    uint64_t             drew_gen = 0; // the recording (gen) a game draw was recorded in
+    uint64_t             frame_end_gen = 0; // the recording a back-buffer-sized texture went to COMMON in: the game's frame end
     std::vector<UavNote> uav_recent; // most recent last; written by on_barrier, read at dispatch, both on the recording thread
+#ifdef WWMI_DEBUG
+    std::vector<BbNote> bb_notes; // B23: back-buffer-sized textures moved to or from COMMON in recording bb_notes_gen (BBCOMMON)
+    uint64_t            bb_notes_gen = 0;
+#endif
 };
 struct CmdBlockMap {
     struct Entry {
@@ -242,11 +255,29 @@ inline uint64_t& CmdCmpLayout(const void* cmd_list)
     overflow_cmp = 0;
     return overflow_cmp;
 }
+// Lists this thread began recording. A submission this thread made before its last Reset has reached the queue:
+// ReShade raises every list's execute event first and submits the batch after them.
+inline thread_local uint64_t t_list_resets = 0;
 // 0 for a null list: the port then keeps its old carry-over instead of guessing a recording.
 inline uint64_t CmdGen(const void* cmd_list)
 {
     CmdBlock* b = g_cmd_blocks.get(reinterpret_cast<uintptr_t>(cmd_list));
     return b ? b->gen : 0;
+}
+// A game draw in the list's current recording: its submission is game work a step can follow (present_hook.cpp).
+inline void CmdNoteDraw(const void* cmd_list)
+{
+    if (CmdBlock* b = g_cmd_blocks.get(reinterpret_cast<uintptr_t>(cmd_list))) b->drew_gen = b->gen;
+}
+inline bool CmdDrewThisRecording(const void* cmd_list)
+{
+    const CmdBlock* b = g_cmd_blocks.get(reinterpret_cast<uintptr_t>(cmd_list));
+    return b && b->drew_gen == b->gen;
+}
+inline bool CmdEndsGameFrame(const void* cmd_list)
+{
+    const CmdBlock* b = g_cmd_blocks.get(reinterpret_cast<uintptr_t>(cmd_list));
+    return b && b->frame_end_gen == b->gen;
 }
 template <class F>
 inline void CmdBlocksForEach(F&& fn)

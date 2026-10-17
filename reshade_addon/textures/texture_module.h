@@ -201,3 +201,5 @@ bool on_copy_texture_region(reshade::api::command_list*, reshade::api::resource 
     const reshade::api::subresource_box*, reshade::api::filter_mode);
 bool on_copy_resource(reshade::api::command_list*, reshade::api::resource source, reshade::api::resource dest);
 void DrainTexReadback();
+// A game list submitted: the texture readbacks recorded on it are timed by a fence signalled behind it.
+void TexReadbackOnExecute(reshade::api::command_queue* queue, reshade::api::command_list* list);

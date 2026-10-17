@@ -503,7 +503,7 @@ void DrawOverlay(effect_runtime*)
             g_addon_ini_path.c_str());
     ImGui::TextDisabled("  on = faster drawing of modded characters.\n"
                         "  off = kept in system memory, for cards short on video memory; costs frame rate with large mods.\n"
-                        "  Applies after Reload mods (B1) or at the next launch.");
+                        "  Applies at the next launch.");
     {
         int mods = 0;
         ModLoader::GetLastStats(mods);
@@ -528,11 +528,11 @@ void DrawOverlay(effect_runtime*)
         VerboseArm(600);
     if (logger::unlimited())
         ImGui::TextColored({ 1, 1, 0, 1 }, "verbose log ON");
-#endif
     if (NButton("B1", "Reload mods (re-reads every mod ini)")) {
         g_reload_requested.store(true);
         logger::write("RELOAD: requested from overlay -- will run at the next frame boundary");
     }
+#endif
     ImGui::Separator();
     {
         bool perf = g_prof_enabled;
@@ -608,7 +608,8 @@ void DrawOverlay(effect_runtime*)
             ImGui::TextColored({ 0, 1, 0, 1 }, "Draw replacements this frame: %u  (last: %016llx  sub_draws=%u)",
                 rc, g_last_replace_hash, g_last_replace_ib_count);
         else
-            ImGui::TextDisabled("Draw replacements this frame: 0");
+            ImGui::TextDisabled("Draw replacements this frame: 0  (last: %016llx  sub_draws=%u)", g_last_replace_hash,
+                g_last_replace_ib_count);
     }
     // Merged-skeleton (WWMI-faithful bone CB injection) status
     {
@@ -673,6 +674,16 @@ void DrawOverlay(effect_runtime*)
     }
     NCheckbox("B19", "Disable VB Injection", &g_disable_vb);
     NCheckbox("B20", "One merged skeleton per copy of a character drawn at once (off: the copies share one and can mix)", &g_skel_copies);
+    if (NButton("B23", "Log the next 240 presents: thread, time since the previous one, the game's draws and submissions in between (PRESENTLOG), and each submission that hands a full-screen target to present (FRAMEEND)")) {
+        g_present_log_draws.store(0);
+        g_present_log_execs.store(0);
+        g_frame_end_draws.store(0);
+        {
+            std::lock_guard l(g_present_log_mtx);
+            g_present_log_subs.clear();
+        }
+        g_present_log_left.store(240);
+    }
 
     ImGui::Separator();
     ImGui::TextColored({ 1, 0.6f, 1, 1 }, "*** TEXTURE OVERRIDE ***");

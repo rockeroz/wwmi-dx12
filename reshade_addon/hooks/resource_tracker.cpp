@@ -24,13 +24,34 @@ bool BufferLive(const void* res)
     return g_res_to_va.find(reinterpret_cast<uint64_t>(res)) != g_res_to_va.end();
 }
 
-void on_barrier(command_list* cmd_list, uint32_t count, const resource* res, const resource_usage* /*old_s*/, const resource_usage* new_s)
+static bool IsBackBufferSized(command_list* cmd_list, resource res)
+{
+    const resource_desc d = cmd_list->get_device()->get_resource_desc(res);
+    return d.type == resource_type::texture_2d && d.texture.width == g_bb_width.load(std::memory_order_relaxed) &&
+        d.texture.height == g_bb_height.load(std::memory_order_relaxed);
+}
+
+void on_barrier(command_list* cmd_list, uint32_t count, const resource* res, [[maybe_unused]] const resource_usage* old_s,
+    const resource_usage* new_s)
 {
     PROF(PROF_Barrier);
     HotPath::GpuNoteBarriers(count);
     CmdBlock* const blk = g_cmd_blocks.get(reinterpret_cast<uintptr_t>(cmd_list));
     for (uint32_t i = 0; i < count; ++i)
         if (res[i].handle) {
+            if (blk && new_s[i] == resource_usage::general && g_frame_end_armed.load(std::memory_order_relaxed) &&
+                IsBackBufferSized(cmd_list, res[i]))
+                blk->frame_end_gen = blk->gen;
+#ifdef WWMI_DEBUG
+            if (blk && (new_s[i] == resource_usage::general || old_s[i] == resource_usage::general) &&
+                g_present_log_left.load(std::memory_order_relaxed) > 0 && IsBackBufferSized(cmd_list, res[i])) {
+                if (blk->bb_notes_gen != blk->gen) {
+                    blk->bb_notes.clear();
+                    blk->bb_notes_gen = blk->gen;
+                }
+                blk->bb_notes.push_back({ res[i].handle, (uint32_t)old_s[i], (uint32_t)new_s[i] });
+            }
+#endif
             g_res_state.put(res[i].handle, (uint32_t)new_s[i]);
             if (blk && ((uint32_t)new_s[i] & (uint32_t)resource_usage::unordered_access)) {
                 auto&  v = blk->uav_recent;

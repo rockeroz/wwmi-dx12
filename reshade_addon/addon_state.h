@@ -35,6 +35,7 @@ inline std::wstring NsKey(const std::wstring& ns)
 inline ID3D12Device*         g_d3d12_device = nullptr;
 inline bool                  g_capture_mode = false;     // Numpad 0 (present_engine.cpp): the capture hotkeys are live only while set
 inline reshade::api::device* g_reshade_device = nullptr; // the same device as ReShade hands it out
+inline uint32_t              g_reshade_api = 0;          // the add-on API ReShade accepted: RESHADE_API_VERSION, or an older one as a fallback
 // Set once in on_init_device; every hook that assumes a D3D12 device gates on it. Defined in
 // wwmi_addon.cpp, where the device arrives.
 extern bool g_is_dx12;

@@ -198,6 +198,34 @@ void LoadGeometryMods()
                         g_merged_comps[a].with.size() + 1);
             }
         }
+        {
+            auto priority = [](int s) {
+                const WwmiMod::Component* c = WmodComp(g_merged_comps[s].mod_id, g_merged_comps[s].comp_idx);
+                return c ? c->match_priority : 0;
+            };
+            auto section = [](int s) {
+                const MergedComp&         m = g_merged_comps[s];
+                const WwmiMod::Component* c = WmodComp(m.mod_id, m.comp_idx);
+                return c ? PortComponentSection(m.mod_id, c->index, c->tail, g_geomods[m.mod_id].wcl_ns) : std::wstring();
+            };
+            for (size_t a = 0; a < g_merged_comps.size(); ++a) {
+                MergedComp& mc = g_merged_comps[a];
+                mc.run_order.assign(1, (int)a);
+                mc.run_order.insert(mc.run_order.end(), mc.with.begin(), mc.with.end());
+                if (mc.run_order.size() < 2) continue;
+                std::stable_sort(mc.run_order.begin(), mc.run_order.end(), [&](int x, int y) {
+                    const int px = priority(x);
+                    const int py = priority(y);
+                    return px != py ? px < py : section(x) < section(y);
+                });
+                if ((int)a != mc.run_order.front()) continue;
+                std::string order;
+                for (const int s : mc.run_order)
+                    order += " mod" + std::to_string(g_merged_comps[s].mod_id) + "(" + std::to_string(priority(s)) + ")";
+                logger::write("WwmiGeom: first=%u count=%u -- its sections run lowest match_priority first:%s",
+                    mc.first_index, mc.match_count, order.c_str());
+            }
+        }
         if (!g_geomods.empty()) FinalizeMergedRemap(); // one-time shared setup + g_merged_loaded
         g_geom_loaded = true;
     }

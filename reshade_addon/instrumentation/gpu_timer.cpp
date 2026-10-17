@@ -11,23 +11,26 @@ static constexpr UINT kStamps = GpuTimer::kRing * GpuTimer::kPairs * 2;
 
 bool GpuTimer::Ensure(ID3D12Device* dev)
 {
-    if (heap_ && rb_) return true;
+    if (ready_.load(std::memory_order_relaxed)) return true;
     if (!dev) return false;
     D3D12_QUERY_HEAP_DESC qd{};
     qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
     qd.Count = kStamps;
-    if (FAILED(dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&heap_)))) return false;
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> heap;
+    Microsoft::WRL::ComPtr<ID3D12Resource>  rb;
+    if (FAILED(dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&heap)))) return false;
     if (FAILED(CreateD3D12Buffer(dev, D3D12_HEAP_TYPE_READBACK, kStamps * sizeof(uint64_t),
-            D3D12_RESOURCE_STATE_COPY_DEST, &rb_))) {
-        heap_.Reset();
+            D3D12_RESOURCE_STATE_COPY_DEST, &rb)))
         return false;
-    }
+    heap_ = heap;
+    rb_ = rb;
+    ready_.store(true, std::memory_order_release);
     return true;
 }
 
 int GpuTimer::Begin(ID3D12GraphicsCommandList* cl, int bucket)
 {
-    if (!g_prof_enabled || !cl || !heap_ || bucket < 0 || bucket >= GT_COUNT) return -1;
+    if (!g_prof_enabled || !cl || !ready_.load(std::memory_order_acquire) || bucket < 0 || bucket >= GT_COUNT) return -1;
     const UINT r = region_.load(std::memory_order_acquire);
     const UINT p = next_pair_[r].fetch_add(1, std::memory_order_relaxed);
     if (p >= kPairs) {

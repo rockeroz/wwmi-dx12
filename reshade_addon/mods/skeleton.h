@@ -24,7 +24,8 @@ struct MergedComp {
     bool             hide = false;
     bool             vanilla = false;
     bool             freeze = false;
-    std::vector<int> with; // other mods' components on this range of the same mesh: their sections run on its draw too
+    std::vector<int> with;      // other mods' components on this range of the same mesh: their sections run on its draw too
+    std::vector<int> run_order; // this slot and `with`, as DX11 runs them: match_priority, then section name
 };
 inline std::vector<MergedComp>                        g_merged_comps;
 inline std::unordered_map<uint64_t, int>              g_first_to_comp;

@@ -1,8 +1,10 @@
 #pragma once
 #include "port_api.h"
+#include <DirectXMath.h>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include <cstdint>
 
 class HackerDevice;
@@ -36,5 +38,15 @@ void RunSkelCopyUpdates();
 // A .dds the background loader has not published yet, loaded now: a copy or a compute bind is about to read it
 // (port_vars.cpp).
 void LoadDeferredNow(CustomResource* r);
+
+// Every variable's value, the ini params and each custom shader's runs this frame, put back after a run that is to
+// leave none of its writes (port_vars.cpp). Caller holds the engine lock across both.
+struct EngineValues {
+    std::vector<float>                    vars;
+    std::vector<DirectX::XMFLOAT4>        params;
+    std::vector<std::pair<unsigned, int>> shader_runs; // frame_no, executions_this_frame
+    void                                  Take();
+    void                                  PutBack() const;
+};
 
 } // namespace PortApi

@@ -32,6 +32,9 @@ public:
 
 void PresentPre();
 void PresentPost();
+// A present no game frame came before (frame generation): [Present] and its post list again for what they draw --
+// no copy, compute or UAV clear, and every variable and ini param back as it was.
+void PresentRedraw();
 
 // Their Input.cpp: edge-detects every registered [Key] binding, including the XInput ones.
 void TickInput();

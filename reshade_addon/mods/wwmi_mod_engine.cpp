@@ -168,6 +168,10 @@ void OnKey(const wchar_t* key, const wchar_t* val, void* user)
         k->comp->match_index_count = (uint32_t)wcstoul(v.c_str(), nullptr, 10);
         return;
     }
+    if (lk == L"match_priority") {
+        k->comp->match_priority = (int)wcstol(v.c_str(), nullptr, 10);
+        return;
+    }
 
     // WWMI passes the merge window as namespaced variables rather than section keys.
     if (lk.find(L"vg_offset") != std::wstring::npos) {

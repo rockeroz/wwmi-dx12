@@ -47,9 +47,10 @@ struct SkCopyMod {
     bool                              noted = false;
     bool                              off = false;
     unsigned                          oversplit = 0;
-    std::vector<SkCopySeen>           cur;
-    std::vector<unsigned>             prev_slots;
-    std::vector<std::vector<SkBones>> prev_bones;
+    std::vector<SkCopySeen>                    cur;
+    std::vector<unsigned>                      prev_slots;
+    std::vector<std::vector<SkBones>>          prev_bones;
+    std::vector<std::pair<uint64_t, unsigned>> prev_keys; // last frame's vs-cb2 -> skeleton, joined ones included
 };
 constexpr unsigned            kSkOversplitFrames = 3;
 static std::mutex             g_skcopy_mtx;
@@ -130,6 +131,11 @@ static void SkCopyRoll(SkCopyMod& m, int dm)
                 if (e.cb4[c].va) pb[c] = e.cb4[c].bones;
         }
     }
+    m.prev_keys.clear();
+    for (const SkCopySeen& e : m.cur) {
+        m.prev_keys.emplace_back(e.key, e.slot);
+        for (const uint64_t k : e.keys) m.prev_keys.emplace_back(k, e.slot);
+    }
     m.cur.clear();
 }
 
@@ -179,6 +185,20 @@ static unsigned SkCopySlot(reshade::api::command_list* cl, int dm, int comp, ID3
                     (unsigned long long)o.key);
             break;
         }
+    auto prev_slot_of = [&](uint64_t k) {
+        unsigned s = ~0u;
+        for (const auto& pk : m.prev_keys)
+            if (pk.first == k) s = pk.second;
+        return s;
+    };
+    const unsigned was = prev_slot_of(key);
+    if (at == m.cur.size() && was != ~0u)
+        for (size_t i = 0; i < m.cur.size(); ++i)
+            if (m.cur[i].slot == was && prev_slot_of(m.cur[i].key) == was) {
+                at = i;
+                m.cur[i].keys.push_back(key);
+                break;
+            }
     if (at == m.cur.size()) {
         std::vector<char> taken;
         for (const SkCopySeen& e : m.cur) {
@@ -189,12 +209,18 @@ static unsigned SkCopySlot(reshade::api::command_list* cl, int dm, int comp, ID3
         unsigned    slot = ~0u;
         double      best = -1;
         const char* why = "a new copy";
-        if (!m.prev_bones.empty() && cb4_res && cb4_va) {
+        if (was != ~0u && free_slot(was)) {
+            slot = was;
+            why = "its skeleton of last frame";
+        }
+        if (slot == ~0u && !m.prev_bones.empty() && cb4_res && cb4_va) {
             const SkBones mine = SkBonesOf(cb4_res, cb4_va);
             for (unsigned k : m.prev_slots) {
                 if (!free_slot(k) || k >= m.prev_bones.size()) continue;
-                for (const SkBones& pb : m.prev_bones[k]) {
-                    const double d = SkBonesRms(mine, pb);
+                const std::vector<SkBones>& pbs = m.prev_bones[k];
+                for (size_t c = 0; c < pbs.size(); ++c) {
+                    if (c != (size_t)comp) continue;
+                    const double d = SkBonesRms(mine, pbs[c]);
                     if (d >= 0 && (best < 0 || d < best)) {
                         best = d;
                         slot = k;
@@ -215,6 +241,13 @@ static unsigned SkCopySlot(reshade::api::command_list* cl, int dm, int comp, ID3
             while (!free_slot(slot)) ++slot;
         }
         m.cur.push_back(SkCopySeen{ key, slot });
+        if (was != ~0u && was != slot && g_debug && LogBudget("SKCOPIES-MOVED", g_geomods[dm].wcl_ns, 64))
+            logger::write("SKCOPIES-MOVED mod=%d comp=%d f=%u: vs-cb2 %llx drew on skeleton #%u last frame, now on #%u (%s, rms %.3f)",
+                dm, comp, g_frame_id, (unsigned long long)key, was, slot, why, best);
+        if (was == ~0u && m.prev_keys.size() >= 2 && DiagOnce("SKCOPIES-NEWKEY", dm))
+            logger::write("SKCOPIES mod=%d comp=%d f=%u: vs-cb2 %llx was not drawn last frame -- with copies on screen, "
+                          "its address is new each frame, so only bones tell the copies apart",
+                dm, comp, g_frame_id, (unsigned long long)key);
         if (slot && DiagOnce("SKCOPIES-SECOND", dm))
             logger::write("SKCOPIES mod=%d comp=%d f=%u: another copy of this character (vs-cb2 %llx) -- it merges and draws "
                           "with its own skeleton #%u",
@@ -576,14 +609,16 @@ bool DrawComponent(InjectFrame& fr, int dm, const WwmiMod::Component* wc)
             static std::wstring s_rfx_fxmap_fq;
             std::wstring&       rfx_glowmap_fq = s_rfx_glowmap_fq; // last GlowMap ref no Run has consumed yet
             std::wstring&       rfx_fxmap_fq = s_rfx_fxmap_fq;     // last FXMap ref: the cutout's input
-            RfxGlowState        rfx_glow;                          // draw_inject.h
-            std::wstring        rfx_diffuse_fq;
-            std::wstring        rfx_normal_fq;
-            std::wstring        rfx_light_fq;
-            std::wstring        rfx_material_fq;
-            std::wstring        rfx_cutout_fq;
-            std::wstring        rfx_special_fq;
-            RfxTexLatch         rfx_tex; // draw_inject.h
+            RfxDrawState        rfx_own;
+            RfxDrawState&       rfx = fr.rfx_shared ? *fr.rfx_shared : rfx_own; // draw_inject.h
+            RfxGlowState&       rfx_glow = rfx.glow;
+            std::wstring&       rfx_diffuse_fq = rfx.diffuse_fq;
+            std::wstring&       rfx_normal_fq = rfx.normal_fq;
+            std::wstring&       rfx_light_fq = rfx.light_fq;
+            std::wstring&       rfx_material_fq = rfx.material_fq;
+            std::wstring&       rfx_cutout_fq = rfx.cutout_fq;
+            std::wstring&       rfx_special_fq = rfx.special_fq;
+            RfxTexLatch&        rfx_tex = rfx.tex;
             hk.resource_ref = [&](const std::wstring& lhs_fq, const std::wstring& rhs_fq) {
                 if (lhs_fq.find(L"rabbitfx") == std::wstring::npos) return;
                 if (lhs_fq.find(L"glowmap") != std::wstring::npos)
@@ -1032,8 +1067,24 @@ bool DrawComponent(InjectFrame& fr, int dm, const WwmiMod::Component* wc)
                 std::optional<PortApi::SkelCopyScope> sk_scope;
                 if (sk_copy || sk_first) sk_scope.emplace(uns.c_str(), sk_copy);
                 PublishDrawShaders(cmd_list, vs_hash);
+#ifdef WWMI_DEBUG
+                const CmdState& bt_gs = CmdGfx(cmd_list);
+                if (logger::enabled(1) && IbAnchorJustLearned(bt_gs.ib.va)) {
+                    char bt_ia[768] = "";
+                    int  bt_n = 0;
+                    for (unsigned s = 0; s < 16 && bt_n >= 0 && bt_n < (int)sizeof(bt_ia); ++s)
+                        if (bt_gs.vb[s].va)
+                            bt_n += snprintf(bt_ia + bt_n, sizeof(bt_ia) - bt_n, " vb%u=%llx+%u(%p)", s,
+                                (unsigned long long)bt_gs.vb[s].va, bt_gs.vb[s].size, (void*)bt_gs.vb[s].res);
+                    logger::write("BINDTRACE mod=%d comp=%d f=%u: the first frame claimed on this index buffer -- the game's IA:%s "
+                                  "ib=%llx+%u(%p); the section's commands and binds follow as CHAIN lines",
+                        dm, wc->index, g_frame_id, bt_ia, (unsigned long long)bt_gs.ib.va, bt_gs.ib.size, (void*)bt_gs.ib.res);
+                    t_trace_binds = true;
+                }
+#endif
                 ran = PortRunSection(fq, hk, index_count, first_index, first_instance,
                     CmdGfx(cmd_list).gfx_pso, skip_orig);
+                t_trace_binds = false;
             }
             for (unsigned r = 0; r < kSectionTexRegs; ++r)
                 if (sect_tex & (1u << r)) PortApi::UnpushGameTexture('p', r);

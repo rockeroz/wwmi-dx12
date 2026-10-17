@@ -6,6 +6,7 @@
 #include "../instrumentation/morph_dump.h"
 #include "../migoto/dx12_bridge.h"
 #include "../../src/gpu_progress.h"
+#include "../../src/d3d12_name.h"
 
 BufferRelocator g_buffer_reloc;
 
@@ -125,6 +126,7 @@ bool BufferRelocator::Ensure(command_list* cmd_list, ID3D12Resource* orig, unsig
         return false;
     }
     ID3D12Resource* big = reinterpret_cast<ID3D12Resource*>(big_h.handle);
+    DevName(big, L"wwmi relocated buffer");
     MigotoPort::OwnBuffer(big);
 
     // Seed it with the game's data. The tail past that is where the mod's extra vertices live, zeroed by D3D12.

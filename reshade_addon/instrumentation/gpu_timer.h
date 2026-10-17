@@ -60,6 +60,7 @@ private:
     void                                    ReadRegion(UINT r);
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> heap_;
     Microsoft::WRL::ComPtr<ID3D12Resource>  rb_;                // the readback: 2 stamps per pair, mapped per read
+    std::atomic<bool>                       ready_{ false };    // set once heap_ and rb_ both exist; Begin reads it from the draw threads
     double                                  ms_per_tick_ = 0.0; // from the queue's timestamp frequency
     std::atomic<UINT>                       region_{ 0 };       // where Begin lands now
     std::atomic<UINT>                       next_pair_[kRing] = {};

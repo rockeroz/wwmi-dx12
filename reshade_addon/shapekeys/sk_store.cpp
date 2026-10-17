@@ -4,6 +4,7 @@
 #include "../instrumentation/removal_pin.h"
 #include "../migoto/dx12_bridge.h"
 #include "../../src/gpu_progress.h"
+#include "../../src/d3d12_name.h"
 
 using SkStoreKey = std::pair<std::wstring, ID3D12Resource*>;
 static std::mutex                      g_store_mtx;
@@ -94,6 +95,7 @@ static ID3D12Resource* SkMakeZeroSource(reshade::api::device* dev, unsigned byte
     }
     memset(mp, 0, bytes);
     dev->unmap_buffer_region(h);
+    DevName(reinterpret_cast<ID3D12Resource*>(h.handle), L"wwmi shapekey zero source");
     return reinterpret_cast<ID3D12Resource*>(h.handle);
 }
 
@@ -277,6 +279,7 @@ void SkSnapshotCb0(reshade::api::command_list* cmd_list, const std::wstring& ns,
             return;
         }
         snap = reinterpret_cast<ID3D12Resource*>(sh.handle);
+        DevName(snap, L"wwmi cb snapshot");
         const uint64_t snap_gpu_va = snap->GetGPUVirtualAddress();
         if (undersized) {
             std::lock_guard<std::mutex> lk(g_store_mtx);

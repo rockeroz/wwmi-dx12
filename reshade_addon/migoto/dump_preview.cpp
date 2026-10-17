@@ -6,6 +6,7 @@
 #include "dump_watchdog.h"      // DumpStage: the preview names its position for a failure report
 #include "../../src/log.h"
 #include "../../src/d3d12_barrier.h"
+#include "../../src/d3d12_name.h"
 #include <ScreenGrab.h>
 #include <wincodec.h>
 #include <d3d12.h>
@@ -216,6 +217,7 @@ bool DumpPreviewJpeg(ID3D11Device* dev11, ID3D11DeviceContext* ctx, ID3D11Textur
             Once("destination texture failed");
             return false;
         }
+        DevName(dst, L"wwmi dump preview");
     }
     ID3D11Texture2D* staging = nullptr;
     {

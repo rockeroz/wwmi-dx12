@@ -44,7 +44,7 @@ bool LayoutParamRange(const pipeline_layout_param& p, uint32_t i,
     case pipeline_layout_param_type::push_descriptors_with_ranges_and_flags: {
         const descriptor_range_with_flags& rf = p.descriptor_table_with_flags.ranges[i];
         out = static_cast<const descriptor_range&>(rf);
-        if (flags) *flags = rf.flags;
+        if (flags && g_reshade_api == RESHADE_API_VERSION) *flags = rf.flags;
     }
         if (is_table) *is_table = (p.type == pipeline_layout_param_type::descriptor_table_with_flags);
         return true;

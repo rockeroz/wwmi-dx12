@@ -82,6 +82,8 @@ bool ShimObjectForeign(void* object);
 inline thread_local bool g_touched_viewport = false;
 inline thread_local bool g_touched_blend = false;
 inline thread_local bool g_touched_stencil = false;
+// [Present] run again for a present no game frame came before (port_api.cpp PresentRedraw): its draws only.
+inline thread_local bool g_present_redraw = false;
 
 bool TakeHeapsChanged();
 } // namespace MigotoPort

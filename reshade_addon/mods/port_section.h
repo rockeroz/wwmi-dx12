@@ -39,3 +39,5 @@ bool         PortRunSection(const std::wstring& fq_section, PortHooks& hk,
     uint32_t index_count, uint32_t first_index, uint32_t first_instance, uint64_t pso,
     bool& skip_orig);
 bool         LogBudget(const char* tag, const std::wstring& ns, int limit);
+
+inline thread_local bool t_trace_binds = false; // PortRunSection logs every command past its session budget

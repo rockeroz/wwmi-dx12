@@ -215,7 +215,8 @@ void RunList(CommandList* list, DrawCallInfo* ci, bool post)
 bool RunExplicitHook(CommandListCommand* inner, CommandListState* state)
 {
     auto* rc = static_cast<RunExplicitCommandList*>(inner);
-    if (!rc->command_list_section || rc->run_pre_and_post_together || state->recursion > MAX_COMMAND_LIST_RECURSION)
+    if (MigotoPort::g_present_redraw || !rc->command_list_section || rc->run_pre_and_post_together ||
+        state->recursion > MAX_COMMAND_LIST_RECURSION)
         return false;
     CommandList* list = state->post ? &rc->command_list_section->post_command_list : &rc->command_list_section->command_list;
     Trace*       t = TraceOf(list, state->post);
@@ -872,17 +873,41 @@ bool PureSelectList(CommandList* cl, std::vector<CustomResource*>& srcs, std::ve
     return true;
 }
 
+void SelectionWrites(CommandList* cl, std::vector<CommandListVariable*>& vars, std::vector<int>& params, int depth)
+{
+    if (!cl || depth > 8) return;
+    for (const auto& cmd : cl->ResolveCommandList()->commands) {
+        CommandListCommand* c = MigotoPort::UnwrapObserved(cmd.get());
+        if (auto* va = dynamic_cast<VariableAssignment*>(c)) {
+            if (va->var) vars.push_back(va->var);
+        } else if (auto* po = dynamic_cast<ParamOverride*>(c)) {
+            if (po->param_idx >= 0) params.push_back(po->param_idx);
+        } else if (auto* ic = dynamic_cast<IfCommand*>(c)) {
+            SelectionWrites(ic->true_commands_pre.get(), vars, params, depth + 1);
+            SelectionWrites(ic->true_commands_post.get(), vars, params, depth + 1);
+            SelectionWrites(ic->false_commands_pre.get(), vars, params, depth + 1);
+            SelectionWrites(ic->false_commands_post.get(), vars, params, depth + 1);
+        } else if (auto* re = dynamic_cast<RunExplicitCommandList*>(c)) {
+            if (!re->command_list_section) continue;
+            SelectionWrites(&re->command_list_section->command_list, vars, params, depth + 1);
+            SelectionWrites(&re->command_list_section->post_command_list, vars, params, depth + 1);
+        }
+    }
+}
+
 struct SelSnap {
     ID3D11Resource* res;
     bool            is_null;
 };
 struct SelEntry {
-    bool                         pure = false;
-    std::vector<CustomResource*> srcs;
-    unsigned                     gen = 0;
-    ID3D11Resource*              pre = nullptr;
-    ID3D11Resource*              post = nullptr;
-    std::vector<SelSnap>         snap;
+    bool                              pure = false;
+    std::vector<CustomResource*>      srcs;
+    unsigned                          gen = 0;
+    ID3D11Resource*                   pre = nullptr;
+    ID3D11Resource*                   post = nullptr;
+    std::vector<SelSnap>              snap;
+    std::vector<CommandListVariable*> writes;       // an impure list's `$var =` targets: put back after each selection,
+    std::vector<int>                  param_writes; // and its `xN =` ini params -- DX11 runs these lists only in draws
 };
 
 SelEntry& SelEntryOf(TextureOverride* to)
@@ -899,9 +924,15 @@ SelEntry& SelEntryOf(TextureOverride* to)
     SelEntry                  e;
     std::vector<const float*> vars;
     e.pure = PureSelectList(&to->command_list, e.srcs, vars) && PureSelectList(&to->post_command_list, e.srcs, vars);
-    if (!e.pure)
+    if (!e.pure) {
         e.srcs.clear();
-    else {
+        SelectionWrites(&to->command_list, e.writes, e.param_writes, 0);
+        SelectionWrites(&to->post_command_list, e.writes, e.param_writes, 0);
+        if (logger::enabled(1) && (!e.writes.empty() || !e.param_writes.empty()))
+            logger::write("SELWRITES %ls: choosing its texture writes %zu variable(s) and %zu ini param(s) -- put back after "
+                          "each choice, as DX11 runs this list only in the draws that bind the texture",
+                to->ini_section.c_str(), e.writes.size(), e.param_writes.size());
+    } else {
         for (const float* v : vars) MigotoPort::WatchSelectionVar(v);
         for (CustomResource* cr : e.srcs) MigotoPort::WatchSelectionRes(cr);
     }
@@ -929,6 +960,16 @@ bool RunSelection(TextureOverride* to, ID3D11Resource*& picked)
         if (e.post) picked = e.post;
         return true;
     }
+    const bool                     keep = !e.writes.empty() || !e.param_writes.empty();
+    std::vector<float>             vars_were;
+    std::vector<DirectX::XMFLOAT4> params_were;
+    if (keep) {
+        vars_were.reserve(e.writes.size());
+        for (const CommandListVariable* v : e.writes) vars_were.push_back(v->fval);
+        params_were.reserve(e.param_writes.size());
+        for (const int p : e.param_writes)
+            params_were.push_back(p < (int)G->iniParams.size() ? G->iniParams[p] : DirectX::XMFLOAT4{});
+    }
     ID3D11Resource* slot = nullptr;
     RunResourceCommandList(&g_dev, &g_ctx, &to->command_list, &slot, false);
     if (slot) picked = slot;
@@ -938,6 +979,11 @@ bool RunSelection(TextureOverride* to, ID3D11Resource*& picked)
     if (slot) picked = slot;
     e.post = slot;
     e.gen = 0;
+    if (keep) {
+        for (size_t i = 0; i < e.writes.size(); ++i) e.writes[i]->fval = vars_were[i];
+        for (size_t i = 0; i < e.param_writes.size(); ++i)
+            if (e.param_writes[i] < (int)G->iniParams.size()) G->iniParams[e.param_writes[i]] = params_were[i];
+    }
     if (!memo) return false;
     e.snap.resize(e.srcs.size());
     for (size_t i = 0; i < e.srcs.size(); ++i) e.snap[i] = SelSnap{ e.srcs[i]->resource, e.srcs[i]->is_null };

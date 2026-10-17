@@ -87,7 +87,7 @@ with a `wwmi-dx12` window showing "Active mods" above 0.
 ## Known Issues
 
 - WWMI's own hotkeys and guides are not available
-- Loading mods without a restart (**Reload mods**) is untested; restart the game after adding a mod
+- Mods load when the game starts; restart the game after adding or changing a mod
 - Decensor and RabbitFX mods prepare shaders on first sight (one-time stutter, saved for next launch)
 
 ## Mod Installation
@@ -113,7 +113,6 @@ with a `wwmi-dx12` window showing "Active mods" above 0.
 | Use look-alike texture matches | on by default (see Texture matches); saved to `wwmi_dx12.ini` |
 | Use texture match cache | on by default; off: no texture matches are learned, read or saved (see Texture matches) |
 | Mod buffers in video memory | on by default (faster); saved to `wwmi_dx12.ini` |
-| Reload mods | re-reads every mod ini (untested) |
 | Clear caches at next launch | rebuilds saved shader patches and texture matches; try it if mods look wrong after an update |
 | Performance monitor | what the add-on costs in processor and graphics card time, live |
 | Save a 10-second performance report | writes `<Win64>\wwmi_dx12_perf_<date>_<time>.txt`; send it with a slowdown report |

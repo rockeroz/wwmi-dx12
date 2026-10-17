@@ -28,6 +28,7 @@
 #include <chrono>
 #include <smmintrin.h>                 // _mm_stream_load_si128 -- reads from the write-combined upload heap
 #include "../hooks/resource_tracker.h" // RestampResource -- the late re-stamp the lineage paths fire
+#include "../hooks/cmd_state.h"        // CmdGen / t_list_resets -- when a readback's list reached its queue
 #include "../instrumentation/tex_timing.h"
 #include "../migoto/dx12_bridge.h" // DumpDir: D15 writes under it
 #include <cstdio>
@@ -39,8 +40,9 @@ using Microsoft::WRL::ComPtr;
 // A texture whose bytes never passed an upload hook: its mip0 copied to a readback buffer, hashed frames later.
 class TexReadback {
 public:
-    bool Schedule(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* src, ID3D12Resource* dst,
-        const D3D12_RESOURCE_DESC& sd);
+    bool Schedule(ID3D12Device* dev, command_list* list, ID3D12GraphicsCommandList* cl, ID3D12Resource* src,
+        ID3D12Resource* dst, const D3D12_RESOURCE_DESC& sd);
+    void OnExecute(command_queue* queue, command_list* list);
     void Drain();
     void Forget(ID3D12Resource* dst)
     {
@@ -48,19 +50,34 @@ public:
         tried_.erase(dst);
     } // destroyed: its address is free again
 private:
+    struct QueueFence {
+        ID3D12CommandQueue* queue = nullptr;
+        ComPtr<ID3D12Fence> fence;
+        uint64_t            next = 0;
+    };
     struct Pending {
-        ID3D12Resource*        dst;
-        uint32_t               off;
-        uint32_t               rowPitch;
-        ComPtr<ID3D12Resource> own;
-    }; // own: not in the shared buffer
+        ID3D12Resource*        dst = nullptr;
+        uint32_t               off = 0;
+        uint32_t               rowPitch = 0;
+        ComPtr<ID3D12Resource> own;            // not in the shared buffer
+        const void*            list = nullptr; // the game's list the copy is recorded on
+        uint64_t               gen = 0;        // ...in this recording of it
+        QueueFence*            qf = nullptr;   // the queue it was submitted to
+        uint32_t               tid = 0;        // ...by this thread
+        uint64_t               resets = 0;     // ...at this t_list_resets
+        ULONGLONG              exec_ms = 0;
+        uint64_t               value = 0; // signalled on qf behind the submission; the copy has run once the fence reaches it
+    };
+    QueueFence* FenceOf(ID3D12CommandQueue* q);
+    template <class Behind>
+    unsigned SignalBehind(QueueFence* qf, Behind behind);
     static constexpr uint32_t           kBytes = 48u * 1024 * 1024;
+    ID3D12Device*                       dev_ = nullptr;
     ComPtr<ID3D12Resource>              rb_;
-    uint32_t                            cursor_ = 0;       // the shared buffer, used only while no batch drains
-    uint32_t                            drain_cursor_ = 0; // what the draining batch holds of it
-    int                                 frames_ = 0;
-    std::vector<Pending>                pending_;  // accumulating
-    std::vector<Pending>                draining_; // recorded, waiting for the GPU
+    uint32_t                            cursor_ = 0; // the shared buffer is free from here; back to 0 once no copy into it is outstanding
+    std::vector<Pending>                pending_;
+    std::deque<QueueFence>              fences_; // one per queue: queues finish out of order
+    std::atomic<uint32_t>               unsignalled_{ 0 }; // pending_ entries with no signal behind them yet
     std::unordered_set<ID3D12Resource*> tried_;
     std::mutex                          mtx_;
 };
@@ -75,6 +92,7 @@ static std::atomic<uint32_t> g_ts_mipk_target{ 0 };   // ...on a resource whose 
 static std::atomic<uint32_t> g_ts_mipk_held{ 0 };     // ...held because mip0 was not known yet
 static std::atomic<uint32_t> g_ts_held_resolved{ 0 }; // held entries resolved at mip0 (recorded or not a target)
 static std::atomic<uint32_t> g_ts_target_mip0{ 0 };   // mip0 identifications of a rule target
+static std::atomic<uint32_t> g_ts_rb_late{ 0 };       // readbacks whose fence went in a second after the submission, not behind a later one
 
 // BC formats: collapse unorm/srgb to the TYPELESS base (the resource format 3dmigoto hashes).
 uint32_t TexIdentityHash(uint32_t data_hash, uint32_t w, uint32_t h, uint32_t mips, uint32_t arr, uint32_t dxgi_fmt)
@@ -1242,7 +1260,7 @@ bool on_copy_texture_region(command_list* cl, resource source, uint32_t src_sub,
     auto* dev = reinterpret_cast<ID3D12Device*>(cl->get_device()->get_native());
     auto* d3dcl = reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native());
     if (!dev || !d3dcl) return false;
-    if (!g_tex_readback.Schedule(dev, d3dcl, src, dst, sd)) return false;
+    if (!g_tex_readback.Schedule(dev, cl, d3dcl, src, dst, sd)) return false;
     RemovalPin::Ours(d3dcl, "tex-readback");
     if (g_debug) {
         static ProbeBudget n;
@@ -1257,14 +1275,20 @@ void DrainTexReadback()
     if (g_debug) { // TEXSTREAM: the arrival paths, cumulative, every 600 frames
         static uint32_t tick = 0;
         if (++tick % 600 == 0)
-            logger::write("TEXSTREAM tex2tex=%u stream=%u streamBigUnknown=%u | buf mip0=%u mipK=%u mipKtarget=%u held=%u heldResolved=%u | targets=%u",
+            logger::write("TEXSTREAM tex2tex=%u stream=%u streamBigUnknown=%u | buf mip0=%u mipK=%u mipKtarget=%u held=%u heldResolved=%u | targets=%u | readbackLate=%u",
                 g_ts_tex2tex.load(), g_ts_stream.load(), g_ts_stream_nobig.load(), g_ts_buf_mip0.load(), g_ts_buf_mipk.load(),
-                g_ts_mipk_target.load(), g_ts_mipk_held.load(), g_ts_held_resolved.load(), g_ts_target_mip0.load());
+                g_ts_mipk_target.load(), g_ts_mipk_held.load(), g_ts_held_resolved.load(), g_ts_target_mip0.load(),
+                g_ts_rb_late.load());
     }
     g_tex_readback.Drain();
 }
 
-bool TexReadback::Schedule(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* src,
+void TexReadbackOnExecute(command_queue* queue, command_list* list)
+{
+    g_tex_readback.OnExecute(queue, list);
+}
+
+bool TexReadback::Schedule(ID3D12Device* dev, command_list* list, ID3D12GraphicsCommandList* cl, ID3D12Resource* src,
     ID3D12Resource* dst, const D3D12_RESOURCE_DESC& sd)
 {
     if (!rb_) {
@@ -1281,10 +1305,10 @@ bool TexReadback::Schedule(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3
     {
         std::lock_guard l(mtx_);
         if (tried_.count(dst)) return false; // one-shot per resource
+        dev_ = dev;
         ComPtr<ID3D12Resource> own;
         const uint32_t         aligned = (cursor_ + 511u) & ~511u;
-        const bool             shared_ok = frames_ == 0 && (uint64_t)aligned + total <= kBytes; // the draining batch owns the buffer
-        if (shared_ok) {
+        if ((uint64_t)aligned + total <= kBytes) {
             base = aligned;
             cursor_ = base + (uint32_t)total;
         } else {
@@ -1292,7 +1316,15 @@ bool TexReadback::Schedule(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3
             if (!own) return false;
         }
         own_or_shared = own ? own.Get() : rb_.Get();
-        pending_.push_back({ dst, base, fp.Footprint.RowPitch, own });
+        Pending p;
+        p.dst = dst;
+        p.off = base;
+        p.rowPitch = fp.Footprint.RowPitch;
+        p.own = own;
+        p.list = list;
+        p.gen = CmdGen(list);
+        pending_.push_back(std::move(p));
+        unsignalled_.fetch_add(1, std::memory_order_relaxed);
         tried_.insert(dst);
     }
     dst->AddRef(); // keep alive until Drain hashes it
@@ -1309,38 +1341,99 @@ bool TexReadback::Schedule(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3
     return true;
 }
 
+TexReadback::QueueFence* TexReadback::FenceOf(ID3D12CommandQueue* q)
+{
+    for (QueueFence& f : fences_)
+        if (f.queue == q) return &f;
+    QueueFence f;
+    if (!dev_ || FAILED(dev_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f.fence)))) return nullptr;
+    q->AddRef();
+    f.queue = q;
+    fences_.push_back(std::move(f));
+    return &fences_.back();
+}
+
+template <class Behind>
+unsigned TexReadback::SignalBehind(QueueFence* qf, Behind behind)
+{
+    bool any = false;
+    for (const Pending& p : pending_) any |= p.qf == qf && !p.value && behind(p);
+    if (!any || FAILED(qf->queue->Signal(qf->fence.Get(), qf->next + 1))) return 0;
+    ++qf->next;
+    unsigned n = 0;
+    for (Pending& p : pending_)
+        if (p.qf == qf && !p.value && behind(p)) {
+            p.value = qf->next;
+            unsignalled_.fetch_sub(1, std::memory_order_relaxed);
+            ++n;
+        }
+    return n;
+}
+
+void TexReadback::OnExecute(command_queue* queue, command_list* list)
+{
+    if (!queue || !list || unsignalled_.load(std::memory_order_relaxed) == 0) return;
+    auto* const    q = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
+    const uint32_t tid = GetCurrentThreadId();
+    const uint64_t gen = CmdGen(list);
+    std::lock_guard l(mtx_);
+    for (QueueFence& f : fences_)
+        if (f.queue == q) SignalBehind(&f, [&](const Pending& p) { return p.tid == tid && p.resets != t_list_resets; });
+    for (Pending& p : pending_)
+        if (!p.exec_ms && p.list == list && p.gen == gen) {
+            p.qf = FenceOf(q);
+            p.tid = tid;
+            p.resets = t_list_resets;
+            p.exec_ms = GetTickCount64();
+            if (!p.qf) unsignalled_.fetch_sub(1, std::memory_order_relaxed);
+        }
+}
+
 void TexReadback::Drain()
 {
     std::vector<ID3D12Resource*> done;
     {
         std::lock_guard l(mtx_);
-        if (frames_ > 0 && --frames_ == 0) {
-            void*       p = nullptr;
-            D3D12_RANGE rr = { 0, drain_cursor_ };
-            if (drain_cursor_ && rb_ && SUCCEEDED(rb_->Map(0, &rr, &p)) && p) {
-                for (auto& t : draining_)
-                    if (!t.own) TexHashFromUpload(t.dst, (const uint8_t*)p + t.off, t.rowPitch);
-                D3D12_RANGE wr = { 0, 0 };
-                rb_->Unmap(0, &wr);
+        const ULONGLONG now = GetTickCount64();
+        for (QueueFence& f : fences_)
+            g_ts_rb_late.fetch_add(SignalBehind(&f, [&](const Pending& p) { return now - p.exec_ms >= 1000; }),
+                std::memory_order_relaxed);
+        void*  shared = nullptr;
+        size_t keep = 0;
+        bool   shared_left = false;
+        for (size_t i = 0; i < pending_.size(); ++i) {
+            Pending&   p = pending_[i];
+            const bool dropped = !p.exec_ms && CmdGen(p.list) != p.gen;
+            const bool ran = p.value ? p.qf->fence->GetCompletedValue() >= p.value : (p.exec_ms && !p.qf && now - p.exec_ms >= 2000);
+            if (!dropped && !ran) {
+                shared_left |= !p.own;
+                if (keep != i) pending_[keep] = std::move(p);
+                ++keep;
+                continue;
             }
-            for (auto& t : draining_) {
+            if (dropped) unsignalled_.fetch_sub(1, std::memory_order_relaxed);
+            if (ran && p.own) {
                 void* q = nullptr;
-                if (t.own && SUCCEEDED(t.own->Map(0, nullptr, &q)) && q) {
-                    TexHashFromUpload(t.dst, (const uint8_t*)q, t.rowPitch);
+                if (SUCCEEDED(p.own->Map(0, nullptr, &q)) && q) {
+                    TexHashFromUpload(p.dst, (const uint8_t*)q, p.rowPitch);
                     D3D12_RANGE wr = { 0, 0 };
-                    t.own->Unmap(0, &wr);
+                    p.own->Unmap(0, &wr);
                 }
-                done.push_back(t.dst);
+            } else if (ran) {
+                if (!shared) {
+                    D3D12_RANGE rr = { 0, cursor_ };
+                    if (FAILED(rb_->Map(0, &rr, &shared))) shared = nullptr;
+                }
+                if (shared) TexHashFromUpload(p.dst, (const uint8_t*)shared + p.off, p.rowPitch);
             }
-            draining_.clear();
-            drain_cursor_ = 0;
-            cursor_ = 0;
+            done.push_back(p.dst);
         }
-        if (frames_ == 0 && !pending_.empty()) {
-            draining_.swap(pending_);
-            drain_cursor_ = cursor_;
-            frames_ = 3; // wait 3 frames for the recorded copies to retire on the GPU
+        if (shared) {
+            D3D12_RANGE wr = { 0, 0 };
+            rb_->Unmap(0, &wr);
         }
+        pending_.erase(pending_.begin() + keep, pending_.end());
+        if (!shared_left) cursor_ = 0;
     }
     for (ID3D12Resource* r : done) r->Release();
 }

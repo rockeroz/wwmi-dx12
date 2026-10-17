@@ -62,6 +62,7 @@ static void on_destroy_swapchain(swapchain*, bool resize)
         return;
     }
     ::logger::write("Exit: swapchain destroyed -- stopping the watchdogs and saving the persistent settings");
+    FrameEndForgetSwapchain();
     StallWatchdogStop();
     DredWatchdogStop();
     PortApi::SaveSettingsOnExit();
@@ -80,17 +81,43 @@ static void on_destroy_device(device*)
     PortApi::SaveSettingsOnExit();
 }
 
+static device* DeviceOf(device* dev)
+{
+    return dev;
+}
+static device* DeviceOf(device_object* obj)
+{
+    return obj->get_device();
+}
+
+template <auto Fn>
+struct OwnDevice;
+template <typename R, typename First, typename... A, R (*Fn)(First, A...)>
+struct OwnDevice<Fn> {
+    static R call(First first, A... a)
+    {
+        if (DeviceOf(first) != g_reshade_device) return R();
+        return Fn(first, a...);
+    }
+};
+#define OWN_DEVICE(hook) (&OwnDevice<hook>::call)
+
 static void ActivateD3D12();
 
 static void on_init_device(device* dev)
 {
     ::logger::write("Init: on_init_device entered (api=%d)", (int)dev->get_api());
     if (dev->get_api() != device_api::d3d12) {
-        ::logger::write("Init: not a D3D12 device -- the addon stays inactive");
+        ::logger::write("Init: not a D3D12 device -- its events are ignored");
+        return;
+    }
+    if (g_reshade_device) {
+        ::logger::write("Init: a further D3D12 device -- its events are ignored, the addon stays on the first");
         return;
     }
     {
         g_is_dx12 = true;
+        g_reshade_device = dev;
         ActivateD3D12();
         ::logger::write("Init: d3d12 device; calling ModLoader::Init");
         ModLoader::Init(dev);
@@ -98,7 +125,6 @@ static void on_init_device(device* dev)
 
         auto* d3d12_dev = reinterpret_cast<ID3D12Device*>(dev->get_native());
         g_d3d12_device = d3d12_dev;
-        g_reshade_device = dev;
         if (g_dx12_debug_layer && d3d12_dev && !g_infoq) {
             if (SUCCEEDED(d3d12_dev->QueryInterface(IID_PPV_ARGS(&g_infoq))) && g_infoq) {
                 g_infoq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, FALSE);
@@ -260,7 +286,13 @@ static bool X23Begin(command_list* cmd_list, uint32_t index_count, uint32_t inst
 static bool on_draw_indexed(command_list* cmd_list, uint32_t index_count, uint32_t instance_count,
     uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
 {
-    if (!g_game_drew.load(std::memory_order_relaxed)) g_game_drew.store(true, std::memory_order_relaxed);
+    CmdNoteDraw(cmd_list);
+#ifdef WWMI_DEBUG
+    if (g_present_log_left.load(std::memory_order_relaxed) > 0) {
+        g_present_log_draws.fetch_add(1, std::memory_order_relaxed);
+        g_frame_end_draws.fetch_add(1, std::memory_order_relaxed);
+    }
+#endif
     if (!MorphDump::Armed() || !g_merged_loaded || g_addon_disabled)
         return on_draw_indexed_guarded(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance);
     MorphDump::GameDrawRecord r{};
@@ -375,16 +407,16 @@ static void ActivateD3D12()
         ::logger::write("Config: wwmi_dx12.ini not found or wwmi_dir not set (looked at %S)", g_addon_ini_path.c_str());
     }
 
-    reshade::register_event<reshade::addon_event::destroy_device>(HP(destroy_device));
-    reshade::register_event<reshade::addon_event::destroy_swapchain>(HP(destroy_swapchain));
-    reshade::register_event<reshade::addon_event::create_resource>(HP(create_resource)); // ALLOW_UNORDERED_ACCESS on a shapekey buffer at creation
-    reshade::register_event<reshade::addon_event::init_resource>(HP(init_resource));
-    reshade::register_event<reshade::addon_event::update_texture_region>(HP(update_texture_region));
-    reshade::register_event<reshade::addon_event::copy_buffer_to_texture>(HP(copy_buffer_to_texture));
-    reshade::register_event<reshade::addon_event::copy_texture_region>(HP(copy_texture_region));
-    reshade::register_event<reshade::addon_event::copy_resource>(HP(copy_resource));
-    reshade::register_event<reshade::addon_event::copy_buffer_region>(HP(copy_buffer_region));
-    reshade::register_event<reshade::addon_event::barrier>(HP(barrier));
+    reshade::register_event<reshade::addon_event::destroy_device>(OWN_DEVICE(HP(destroy_device)));
+    reshade::register_event<reshade::addon_event::destroy_swapchain>(OWN_DEVICE(HP(destroy_swapchain)));
+    reshade::register_event<reshade::addon_event::create_resource>(OWN_DEVICE(HP(create_resource))); // ALLOW_UNORDERED_ACCESS on a shapekey buffer at creation
+    reshade::register_event<reshade::addon_event::init_resource>(OWN_DEVICE(HP(init_resource)));
+    reshade::register_event<reshade::addon_event::update_texture_region>(OWN_DEVICE(HP(update_texture_region)));
+    reshade::register_event<reshade::addon_event::copy_buffer_to_texture>(OWN_DEVICE(HP(copy_buffer_to_texture)));
+    reshade::register_event<reshade::addon_event::copy_texture_region>(OWN_DEVICE(HP(copy_texture_region)));
+    reshade::register_event<reshade::addon_event::copy_resource>(OWN_DEVICE(HP(copy_resource)));
+    reshade::register_event<reshade::addon_event::copy_buffer_region>(OWN_DEVICE(HP(copy_buffer_region)));
+    reshade::register_event<reshade::addon_event::barrier>(OWN_DEVICE(HP(barrier)));
     MigotoPort::SetResourceStateQuery(ResourceStateOf);
     {
         const auto cso = WwmiReadFile((g_cso_dir + L"\\DumpPreview.cso").c_str()); // the capture's .jpg beside each .dds
@@ -399,34 +431,34 @@ static void ActivateD3D12()
         if (bytes) *bytes = rb.bytes;
         return true;
     };
-    reshade::register_event<reshade::addon_event::execute_command_list>(HP(execute_command_list)); // submission order vs record order
+    reshade::register_event<reshade::addon_event::execute_command_list>(OWN_DEVICE(HP(execute_command_list))); // submission order vs record order
 
-    reshade::register_event<reshade::addon_event::destroy_resource>(HP(destroy_resource));
-    reshade::register_event<reshade::addon_event::init_resource_view>(HP(init_resource_view));
-    reshade::register_event<reshade::addon_event::update_descriptor_tables>(HP(update_descriptor_tables));
-    reshade::register_event<reshade::addon_event::copy_descriptor_tables>(HP(copy_descriptor_tables));
-    reshade::register_event<reshade::addon_event::create_pipeline>(HP(create_pipeline)); // shader replacement (DXIL swap by hash)
-    reshade::register_event<reshade::addon_event::init_pipeline>(HP(init_pipeline));
-    reshade::register_event<reshade::addon_event::init_pipeline_layout>(HP(init_pipeline_layout));
-    reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(HP(destroy_pipeline_layout));
-    reshade::register_event<reshade::addon_event::destroy_pipeline>(HP(destroy_pipeline));
-    reshade::register_event<reshade::addon_event::bind_pipeline>(HP(bind_pipeline));
-    reshade::register_event<reshade::addon_event::bind_descriptor_tables>(HP(bind_descriptor_tables));
-    reshade::register_event<reshade::addon_event::reset_command_list>(HP(reset_command_list)); // the record follows D3D12: nothing survives a Reset
-    reshade::register_event<reshade::addon_event::close_command_list>(HP(close_command_list));
-    reshade::register_event<reshade::addon_event::build_acceleration_structure>(HP(build_acceleration_structure)); // RT ACTIVE + the game's RT work in the pin's tallies
-    reshade::register_event<reshade::addon_event::dispatch_rays>(HP(dispatch_rays));
-    reshade::register_event<reshade::addon_event::push_descriptors>(HP(push_descriptors));
-    reshade::register_event<reshade::addon_event::bind_vertex_buffers>(HP(bind_vertex_buffers));
-    reshade::register_event<reshade::addon_event::bind_index_buffer>(HP(bind_index_buffer));
-    reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(HP(bind_render_targets));
+    reshade::register_event<reshade::addon_event::destroy_resource>(OWN_DEVICE(HP(destroy_resource)));
+    reshade::register_event<reshade::addon_event::init_resource_view>(OWN_DEVICE(HP(init_resource_view)));
+    reshade::register_event<reshade::addon_event::update_descriptor_tables>(OWN_DEVICE(HP(update_descriptor_tables)));
+    reshade::register_event<reshade::addon_event::copy_descriptor_tables>(OWN_DEVICE(HP(copy_descriptor_tables)));
+    reshade::register_event<reshade::addon_event::create_pipeline>(OWN_DEVICE(HP(create_pipeline))); // shader replacement (DXIL swap by hash)
+    reshade::register_event<reshade::addon_event::init_pipeline>(OWN_DEVICE(HP(init_pipeline)));
+    reshade::register_event<reshade::addon_event::init_pipeline_layout>(OWN_DEVICE(HP(init_pipeline_layout)));
+    reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(OWN_DEVICE(HP(destroy_pipeline_layout)));
+    reshade::register_event<reshade::addon_event::destroy_pipeline>(OWN_DEVICE(HP(destroy_pipeline)));
+    reshade::register_event<reshade::addon_event::bind_pipeline>(OWN_DEVICE(HP(bind_pipeline)));
+    reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OWN_DEVICE(HP(bind_descriptor_tables)));
+    reshade::register_event<reshade::addon_event::reset_command_list>(OWN_DEVICE(HP(reset_command_list))); // the record follows D3D12: nothing survives a Reset
+    reshade::register_event<reshade::addon_event::close_command_list>(OWN_DEVICE(HP(close_command_list)));
+    reshade::register_event<reshade::addon_event::build_acceleration_structure>(OWN_DEVICE(HP(build_acceleration_structure))); // RT ACTIVE + the game's RT work in the pin's tallies
+    reshade::register_event<reshade::addon_event::dispatch_rays>(OWN_DEVICE(HP(dispatch_rays)));
+    reshade::register_event<reshade::addon_event::push_descriptors>(OWN_DEVICE(HP(push_descriptors)));
+    reshade::register_event<reshade::addon_event::bind_vertex_buffers>(OWN_DEVICE(HP(bind_vertex_buffers)));
+    reshade::register_event<reshade::addon_event::bind_index_buffer>(OWN_DEVICE(HP(bind_index_buffer)));
+    reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OWN_DEVICE(HP(bind_render_targets)));
     // The game's non-PSO state, so IssueDraw can restore what it overwrites (their CommandList.cpp:2385).
-    reshade::register_event<reshade::addon_event::bind_viewports>(HP(bind_viewports));
-    reshade::register_event<reshade::addon_event::bind_scissor_rects>(HP(bind_scissor_rects));
-    reshade::register_event<reshade::addon_event::bind_pipeline_states>(HP(bind_pipeline_states));
-    reshade::register_event<reshade::addon_event::draw_indexed>(HP(draw_indexed));
-    reshade::register_event<reshade::addon_event::dispatch>(HP(dispatch));
-    reshade::register_event<reshade::addon_event::present>(HP(present));
+    reshade::register_event<reshade::addon_event::bind_viewports>(OWN_DEVICE(HP(bind_viewports)));
+    reshade::register_event<reshade::addon_event::bind_scissor_rects>(OWN_DEVICE(HP(bind_scissor_rects)));
+    reshade::register_event<reshade::addon_event::bind_pipeline_states>(OWN_DEVICE(HP(bind_pipeline_states)));
+    reshade::register_event<reshade::addon_event::draw_indexed>(OWN_DEVICE(HP(draw_indexed)));
+    reshade::register_event<reshade::addon_event::dispatch>(OWN_DEVICE(HP(dispatch)));
+    reshade::register_event<reshade::addon_event::present>(OWN_DEVICE(HP(present)));
 
     ProfBindLibSteps(); // the lib's timed steps -> their rows, before the overlay can enable the profiler
     DockOverlayPanelOnce();
@@ -435,9 +467,30 @@ static void ActivateD3D12()
     ::logger::write("Init: D3D12 device -- events + overlay registered");
 }
 
+static constexpr uint32_t kOldestReShadeApi = 18;
+
+static bool RegisterWithReShade(HMODULE addon_module)
+{
+    if (reshade::register_addon(addon_module)) {
+        g_reshade_api = RESHADE_API_VERSION;
+        return true;
+    }
+    const HMODULE rs = reshade::internal::get_reshade_module_handle();
+    const auto    reg = rs ? reinterpret_cast<bool (*)(void*, uint32_t)>(GetProcAddress(rs, "ReShadeRegisterAddon")) : nullptr;
+    const auto    imgui = rs ? reinterpret_cast<const imgui_function_table* (*)(uint32_t)>(GetProcAddress(rs, "ReShadeGetImGuiFunctionTable")) : nullptr;
+    if (!reg || !imgui) return false;
+    for (uint32_t v = RESHADE_API_VERSION - 1; v >= kOldestReShadeApi; --v) {
+        if (!reg(addon_module, v)) continue;
+        g_reshade_api = v;
+        imgui_function_table_instance() = imgui(IMGUI_VERSION_NUM);
+        return imgui_function_table_instance() != nullptr;
+    }
+    return false;
+}
+
 extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
 {
-    if (!reshade::register_addon(addon_module)) return false;
+    if (!RegisterWithReShade(addon_module)) return false;
     migoto_handle = addon_module;
     wchar_t addon_path[MAX_PATH];
     GetModuleFileNameW(addon_module, addon_path, MAX_PATH);
@@ -497,6 +550,9 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
         ::logger::write("DRED: unavailable (hr=....%04x) -- device likely already created; a removal will "
                         "report only a reason code",
             (unsigned)(-g_dred_armed));
+    if (g_reshade_api != RESHADE_API_VERSION)
+        ::logger::write("ReShade: add-on API %u accepted, not %u -- a ReShade older than 6.8.0, which is not supported",
+            g_reshade_api, (unsigned)RESHADE_API_VERSION);
 
     g_dx12_debug_layer = GetPrivateProfileIntW(L"wwmi-dx12", L"dx12_debug_layer", 0, ini_path.c_str()) != 0;
     g_addon_ini_path = ini_path;

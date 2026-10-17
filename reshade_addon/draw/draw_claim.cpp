@@ -429,6 +429,7 @@ std::optional<bool> ClaimDraw(const DrawArgs& da, BoneRoots& roots, DrawClaim& d
             }
             if ((is_mod_char || char_vb || char_ibset) && (g_wcl_draw || ModGeomEnabled(md)) && !rt_hold) {
                 mc = &g_merged_comps[mc_slot];
+                if (g_decensor) PsoNoteCharacterDraw(CmdGfx(cmd_list).gfx_pso);
                 RemovalPin::Mark(d3d12_cl, "game: claimed character draw"); // DRED breadcrumb context
                 rep_vs = vs_hash;
                 mc_cb13 = (cur.res && cur.va);

@@ -54,6 +54,7 @@ ID3D12Resource* CreateBufferDx12(UINT64 bytes, bool allow_uav, D3D12_RESOURCE_ST
     ID3D12Resource* res = nullptr;
     if (FAILED(CreateD3D12Buffer(b.device, heap, width, state, &res, flags)))
         return nullptr;
+    DevName(res, L"wwmi mod buffer");
     if (!upload) OwnBuffer(res);
     return res;
 }
@@ -165,6 +166,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture1D(const D3D11_TEXTURE1D_DESC
         NotImplOnce("Device::CreateTexture1D (CreateCommittedResource failed)");
         return E_FAIL;
     }
+    DevName(res, L"wwmi mod texture");
 
     WrapTexture1D* w = new WrapTexture1D();
     w->dx12 = res;
@@ -286,6 +288,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture2D(const D3D11_TEXTURE2D_DESC
         NotImplOnce("Device::CreateTexture2D (CreateCommittedResource failed)");
         return E_FAIL;
     }
+    DevName(res, L"wwmi mod texture");
     if (timed) QueryPerformanceCounter(&t1);
 
     {
@@ -352,6 +355,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture3D(const D3D11_TEXTURE3D_DESC
         NotImplOnce("Device::CreateTexture3D (CreateCommittedResource failed)");
         return E_FAIL;
     }
+    DevName(res, L"wwmi mod texture");
 
     WrapTexture3D* w = new WrapTexture3D();
     w->dx12 = res;

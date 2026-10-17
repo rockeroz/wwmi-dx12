@@ -27,6 +27,33 @@ void ForEachVariable(void (*cb)(const wchar_t* fq_name, float value, bool persis
     }
 }
 
+void EngineValues::Take()
+{
+    vars.clear();
+    vars.reserve(command_list_globals.size());
+    for (const auto& kv : command_list_globals) vars.push_back(kv.second.fval);
+    params = G->iniParams;
+    shader_runs.clear();
+    shader_runs.reserve(customShaders.size());
+    for (const auto& kv : customShaders) shader_runs.emplace_back(kv.second.frame_no, kv.second.executions_this_frame);
+}
+
+void EngineValues::PutBack() const
+{
+    size_t i = 0;
+    for (auto& kv : command_list_globals) {
+        if (i == vars.size()) break;
+        kv.second.fval = vars[i++];
+    }
+    G->iniParams = params;
+    size_t s = 0;
+    for (auto& kv : customShaders) {
+        if (s == shader_runs.size()) break;
+        kv.second.frame_no = shader_runs[s].first;
+        kv.second.executions_this_frame = shader_runs[s++].second;
+    }
+}
+
 static std::wstring VarKey(const wchar_t* fq_name)
 {
     std::wstring k = fq_name;

@@ -71,6 +71,13 @@ struct PresentPass {
         MigotoPort::ListBuffersToCommon(cl.Get());
         const HRESULT hr = cl->Close();
         if (FAILED(hr)) return hr;
+        if (game_queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT) { // a graphics list there removes the device
+            static std::atomic<bool> once{ false };
+            if (!once.exchange(true))
+                logger::write("PRESENTPASS: not submitted -- queue %p is not a graphics queue (type %d)", (void*)game_queue,
+                    (int)game_queue->GetDesc().Type);
+            return E_INVALIDARG;
+        }
         ID3D12CommandList* lists[] = { cl.Get() };
         RemovalPin::OnExecute(g_d3d12_device, cl.Get(), (int)D3D12_COMMAND_LIST_TYPE_DIRECT,
             (int)game_queue->GetDesc().Type, "present-pass submit");
@@ -84,6 +91,13 @@ struct PresentPass {
     }
 };
 static PresentPass g_present_pass;
+static PresentPass g_frame_end_pass; // the step's list when it runs at the game's frame end, on the game's thread
+static std::mutex  g_engine_frame_mtx;
+
+std::mutex& EngineFrameMutex()
+{
+    return g_engine_frame_mtx;
+}
 
 void PortProbeTick(command_queue* queue, swapchain* sc)
 {
@@ -150,46 +164,83 @@ void PortProbeTick(command_queue* queue, swapchain* sc)
     }
 }
 
-void EngineFrameTick(command_queue* queue, swapchain* sc)
+// The game window's client size (left as passed until it is known), and whether it has the focus.
+static void GameClient(float& rw, float& rh, bool& focused)
+{
+    static HWND s_game_hwnd = nullptr;
+    if (HWND fg = GetForegroundWindow()) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(fg, &pid);
+        if (pid == GetCurrentProcessId()) {
+            focused = true;
+            s_game_hwnd = fg;
+        } // latch it while we can
+    }
+    if (!s_game_hwnd) { // never focused yet (launched to background): find our own top-level window
+        struct E {
+            DWORD pid;
+            HWND  hit;
+        } e{ GetCurrentProcessId(), nullptr };
+        EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+            auto* s = (E*)lp;
+            DWORD p = 0;
+            GetWindowThreadProcessId(h, &p);
+            if (p == s->pid && GetWindow(h, GW_OWNER) == nullptr && IsWindowVisible(h)) { s->hit = h; return FALSE; }
+            return TRUE; }, (LPARAM)&e);
+        s_game_hwnd = e.hit;
+    }
+    if (s_game_hwnd) {
+        RECT rc;
+        if (GetClientRect(s_game_hwnd, &rc) && rc.right > 0 && rc.bottom > 0) {
+            rw = (float)rc.right;
+            rh = (float)rc.bottom; // valid focused OR not
+        }
+    }
+}
+
+void EngineRedrawTick(command_queue* queue, swapchain* sc)
+{
+    PROF(PROF_EngineTick);
+    if (!g_wwmi_geom || !g_present_pass.Init(g_d3d12_device)) return;
+    float rw = 0;
+    float rh = 0;
+    bool  focused = false;
+    GameClient(rw, rh, focused);
+    ID3D12GraphicsCommandList* const present_cl = g_present_pass.Begin();
+    if (!present_cl) return;
+    std::lock_guard l(g_engine_frame_mtx);
+    auto* const     dev12 = (ID3D12Device*)sc->get_device()->get_native();
+    auto* const q12 = (ID3D12CommandQueue*)queue->get_native();
+    PortApi::SetFrameContext(dev12, present_cl, q12, (unsigned)rw, (unsigned)rh, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
+        (ID3D12Resource*)sc->get_current_back_buffer().handle, D3D12_RESOURCE_STATE_PRESENT, nullptr);
+    const unsigned long long own_draws_before = MigotoPort::OwnListDrawsIssued();
+    PortApi::PresentRedraw();
+    ID3D12CommandQueue* subq = q12;
+    if (g_present_on_game_queue)
+        if (const void* gq = g_claim_exec_queue.load(std::memory_order_relaxed))
+            subq = reinterpret_cast<ID3D12CommandQueue*>(const_cast<void*>(gq));
+    if (g_present_flush_immediate_first && MigotoPort::OwnListDrawsIssued() != own_draws_before) queue->flush_immediate_command_list();
+    MigotoPort::FlushPendingUploads(present_cl);
+    MigotoPort::BackBufferRestore(present_cl, D3D12_RESOURCE_STATE_PRESENT);
+    g_present_pass.Submit(subq);
+    PortApi::SetFrameContext(dev12, nullptr, q12, (unsigned)rw, (unsigned)rh, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
+        nullptr, D3D12_RESOURCE_STATE_COMMON, nullptr);
+}
+
+void EngineFrameTick(command_queue* queue, swapchain* sc, bool bind_back_buffer)
 {
     {
         PROF(PROF_EngineTick); // this block is the bulk of "Present(total)" -- our per-frame engine tick, NOT the game
-        float       rw = 0, rh = 0;
-        bool        focused = false;
-        static HWND s_game_hwnd = nullptr;
-        if (HWND fg = GetForegroundWindow()) {
-            DWORD pid = 0;
-            GetWindowThreadProcessId(fg, &pid);
-            if (pid == GetCurrentProcessId()) {
-                focused = true;
-                s_game_hwnd = fg;
-            } // latch it while we can
-        }
-        if (!s_game_hwnd) { // never focused yet (launched to background): find our own top-level window
-            struct E {
-                DWORD pid;
-                HWND  hit;
-            } e{ GetCurrentProcessId(), nullptr };
-            EnumWindows([](HWND h, LPARAM lp) -> BOOL {
-                auto* s = (E*)lp;
-                DWORD p = 0;
-                GetWindowThreadProcessId(h, &p);
-                if (p == s->pid && GetWindow(h, GW_OWNER) == nullptr && IsWindowVisible(h)) { s->hit = h; return FALSE; }
-                return TRUE; }, (LPARAM)&e);
-            s_game_hwnd = e.hit;
-        }
-        if (s_game_hwnd) {
-            RECT rc;
-            if (GetClientRect(s_game_hwnd, &rc) && rc.right > 0 && rc.bottom > 0) {
-                rw = (float)rc.right;
-                rh = (float)rc.bottom; // valid focused OR not
-            }
-        }
+        float rw = 0;
+        float rh = 0;
+        bool  focused = false;
+        GameClient(rw, rh, focused);
+        ID3D12Resource* const bb12 = bind_back_buffer ? (ID3D12Resource*)sc->get_current_back_buffer().handle : nullptr;
+        PresentPass&          pass = bind_back_buffer ? g_present_pass : g_frame_end_pass;
 
         {
             auto* dev12 = (ID3D12Device*)sc->get_device()->get_native();
             auto* q12 = (ID3D12CommandQueue*)queue->get_native();
-            auto* bb12 = (ID3D12Resource*)sc->get_current_back_buffer().handle;
             PortApi::SetFrameContext(dev12, nullptr, q12, (unsigned)rw, (unsigned)rh,
                 DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
                 bb12, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
@@ -223,10 +274,10 @@ void EngineFrameTick(command_queue* queue, swapchain* sc)
         int                        present_gt = -1;
         void*                      present_hp = nullptr;
         const unsigned long long   own_draws_before = MigotoPort::OwnListDrawsIssued(); // X34
-        if (g_wwmi_geom && g_present_pass.Init(g_d3d12_device)) {
+        if (g_wwmi_geom && pass.Init(g_d3d12_device)) {
             {
                 PROF(PROF_ET_Begin);
-                present_cl = g_present_pass.Begin();
+                present_cl = pass.Begin();
             }
             if (present_cl) {
                 g_gpu_timer.PresentTick(g_d3d12_device);
@@ -235,7 +286,6 @@ void EngineFrameTick(command_queue* queue, swapchain* sc)
                 present_hp = HotPath::GpuBracketBegin(present_cl, GT_Present);
                 auto* dev12 = (ID3D12Device*)sc->get_device()->get_native();
                 auto* q12 = (ID3D12CommandQueue*)queue->get_native();
-                auto* bb12 = (ID3D12Resource*)sc->get_current_back_buffer().handle;
                 PortApi::SetFrameContext(dev12, present_cl, q12, (unsigned)rw, (unsigned)rh,
                     DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
                     bb12, D3D12_RESOURCE_STATE_PRESENT, nullptr);
@@ -330,9 +380,10 @@ void EngineFrameTick(command_queue* queue, swapchain* sc)
         {
             PROF(PROF_ET_Lists);
             {
-                ID3D12CommandQueue* qs[2] = { (ID3D12CommandQueue*)queue->get_native(),
-                    reinterpret_cast<ID3D12CommandQueue*>(const_cast<void*>(g_claim_exec_queue.load(std::memory_order_relaxed))) };
-                GpuProgressTick((ID3D12Device*)sc->get_device()->get_native(), qs, 2);
+                ID3D12CommandQueue* qs[3] = { (ID3D12CommandQueue*)queue->get_native(),
+                    reinterpret_cast<ID3D12CommandQueue*>(const_cast<void*>(g_claim_exec_queue.load(std::memory_order_relaxed))),
+                    reinterpret_cast<ID3D12CommandQueue*>(g_present_queue.load(std::memory_order_relaxed)) };
+                GpuProgressTick((ID3D12Device*)sc->get_device()->get_native(), qs, 3);
             }
             PortApi::PresentPre(); // their [Present] pre pass
             if (focused) PortApi::TickInput();
@@ -424,7 +475,7 @@ void EngineFrameTick(command_queue* queue, swapchain* sc)
                 }
             }
             const bool      pd_probe = MigotoPort::PresentDrawProbeArmed() && logger::enabled(1);
-            ID3D12Resource* pd_bb = pd_probe ? (ID3D12Resource*)sc->get_current_back_buffer().handle : nullptr;
+            ID3D12Resource* pd_bb = pd_probe ? bb12 : nullptr;
             {
                 static int s_x34_last = -1;
                 if ((int)g_present_flush_immediate_first != s_x34_last) {
@@ -442,7 +493,7 @@ void EngineFrameTick(command_queue* queue, swapchain* sc)
             MigotoPort::BackBufferRestore(present_cl, D3D12_RESOURCE_STATE_PRESENT);
             HotPath::GpuBracketEnd(present_cl, present_hp);
             g_gpu_timer.End(present_cl, present_gt);
-            const HRESULT pd_close = g_present_pass.Submit(subq);
+            const HRESULT pd_close = pass.Submit(subq);
             if (pd_probe) {
                 logger::write("PRESENTDRAW frame f=%u present_cl=%p close_hr=%08lX queue=%p (on_present queue %p) "
                               "bb=%p index=%u observed_state=0x%x swapchain=%p color_space=%u x34_flushed=%d",

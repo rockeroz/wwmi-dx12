@@ -5,6 +5,7 @@
 #include "../instrumentation/profiler.h"
 #include "../instrumentation/hot_path.h"
 #include "../rt/rt_hooks.h"
+#include "../present/present_parts.h" // FrameEndStepGuarded -- the game's frame end, when presents come from another thread
 
 struct SubmitLog {
     uint32_t                 frame = 0;
@@ -33,14 +34,64 @@ void on_execute_command_list(reshade::api::command_queue* queue, reshade::api::c
 {
     PROF(PROF_CmdExecute);
     if (!cl) return;
-    HotPath::OnExecute(queue, cl);
     RtNoteExecute(queue, cl); // RT M3: what this list reads from UPLOAD is out of reach from now on
     const void* native = (const void*)cl->get_native();
+    if (CmdDrewThisRecording(cl)) {
+        g_game_frame_submitted.store(true, std::memory_order_relaxed);
+        g_game_submit_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        if (queue) g_game_submit_queue.store(queue->get_native(), std::memory_order_relaxed);
+    }
+#ifdef WWMI_DEBUG
+    if (g_present_log_left.load(std::memory_order_relaxed) > 0) {
+        g_present_log_execs.fetch_add(1, std::memory_order_relaxed);
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        const uint32_t        tid = GetCurrentThreadId();
+        const uint64_t        q = queue ? (uint64_t)queue->get_native() : 0;
+        std::lock_guard       l(g_present_log_mtx);
+        PresentLogSubmitter*  s = nullptr;
+        for (PresentLogSubmitter& e : g_present_log_subs)
+            if (e.tid == tid && e.queue == q) s = &e;
+        if (!s) {
+            g_present_log_subs.push_back({});
+            s = &g_present_log_subs.back();
+            s->tid = tid;
+            s->queue = q;
+        }
+        ++s->lists;
+        if (native == g_claim_last_list.load(std::memory_order_relaxed)) ++s->claimed;
+        s->last_qpc = now.QuadPart;
+        const CmdBlock* fe = g_cmd_blocks.get(reinterpret_cast<uintptr_t>(cl));
+        LARGE_INTEGER   freq;
+        QueryPerformanceFrequency(&freq);
+        const int64_t last = g_present_log_qpc.load(std::memory_order_relaxed);
+        const double  since = last ? (double)(now.QuadPart - last) * 1000.0 / (double)freq.QuadPart : -1.0;
+        if (fe && fe->bb_notes_gen == fe->gen && !fe->bb_notes.empty()) {
+            std::string notes;
+            for (const BbNote& n : fe->bb_notes) {
+                char e[96];
+                snprintf(e, sizeof(e), " %llx%s:%x>%x", (unsigned long long)n.res,
+                    std::find(g_present_log_bbs.begin(), g_present_log_bbs.end(), n.res) != g_present_log_bbs.end() ? "(sc)" : "",
+                    n.old_s, n.new_s);
+                notes += e;
+            }
+            logger::report("BBCOMMON tid=%u queue=%llx list=%p since_present=%.2f ms:%s", tid, (unsigned long long)q, native, since,
+                notes.c_str());
+        }
+    }
+#endif
+    HotPath::OnExecute(queue, cl);
+    TexReadbackOnExecute(queue, cl);
     if (queue && native == g_claim_last_list.load(std::memory_order_relaxed)) {
         // FUNCTIONAL: [Present] reads this under g_present_on_game_queue. Always recorded.
         g_claim_exec_queue.store((const void*)queue->get_native(), std::memory_order_relaxed);
         if (g_debug) g_claim_exec_seen.fetch_add(1, std::memory_order_relaxed); // heartbeat only
     }
+    if (queue && g_frame_end_armed.load(std::memory_order_relaxed) && CmdEndsGameFrame(cl) &&
+        GetCurrentThreadId() == g_game_submit_tid.load(std::memory_order_relaxed) &&
+        queue->get_native() == g_game_submit_queue.load(std::memory_order_relaxed) &&
+        GetCurrentThreadId() != g_presenter_tid.load(std::memory_order_relaxed))
+        FrameEndStepGuarded(queue);
     if (!g_debug) return;
     if (queue) {
         auto* nl = reinterpret_cast<ID3D12CommandList*>(cl->get_native());

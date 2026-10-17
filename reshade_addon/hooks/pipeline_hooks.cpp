@@ -55,7 +55,9 @@ struct PsoSlot {
     std::atomic<bool>     text{ false };
     std::atomic<uint64_t> uc{ 0 };
     std::atomic<uint32_t> ucz{ 0 };
-}; // dc: 0 = not asked, 1 = asked / none, else the variant; psr: PipelinePsReadMask; text: its PS draws UI text; uc: as dc, the UID-cut variant for the back buffer size ucz
+    std::atomic<bool>     chr{ false };
+    std::atomic<uint32_t> chrg{ 0 };
+}; // dc: 0 = not asked, 1 = asked / none, else the variant; psr: PipelinePsReadMask; text: its PS draws UI text; uc: as dc, the UID-cut variant for the back buffer size ucz; chr: its PS was seen on a character draw, as of character-shader generation chrg
 struct PsoTab {
     uint32_t cap;
     PsoSlot* e;
@@ -104,6 +106,8 @@ PsoSlot* PsoSlotOf(uint64_t key, bool create)
             n->text.store(o.text.load(std::memory_order_relaxed), std::memory_order_relaxed);
             n->uc.store(o.uc.load(std::memory_order_relaxed), std::memory_order_relaxed);
             n->ucz.store(o.ucz.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            n->chr.store(o.chr.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            n->chrg.store(o.chrg.load(std::memory_order_relaxed), std::memory_order_relaxed);
             n->key.store(k, std::memory_order_release);
         }
         g_pso_tab.store(g, std::memory_order_release);
@@ -113,6 +117,23 @@ PsoSlot* PsoSlotOf(uint64_t key, bool create)
     s->key.store(key, std::memory_order_release);
     ++g_pso_used;
     return s;
+}
+std::mutex                   g_char_ps_mtx;
+std::unordered_set<uint64_t> g_char_ps; // under g_char_ps_mtx
+std::atomic<uint32_t>        g_char_ps_gen{ 0 };
+bool                         PsoCharacterPs(PsoSlot* s, uint64_t ps)
+{
+    const uint32_t gen = g_char_ps_gen.load(std::memory_order_acquire);
+    if (s->chrg.load(std::memory_order_acquire) != gen) {
+        bool chr;
+        {
+            std::lock_guard l(g_char_ps_mtx);
+            chr = g_char_ps.count(ps) != 0;
+        }
+        s->chr.store(chr, std::memory_order_release);
+        s->chrg.store(gen, std::memory_order_release);
+    }
+    return s->chr.load(std::memory_order_acquire);
 }
 }
 void PsoBoundHashes(uint64_t pso, uint64_t* vs_or_cs, uint64_t* ps, uint64_t* gs)
@@ -127,7 +148,9 @@ void PsoBoundHashes(uint64_t pso, uint64_t* vs_or_cs, uint64_t* ps, uint64_t* gs
 uint64_t PsoDecensorVariant(device* dev, uint64_t pso)
 {
     PsoSlot* s = PsoSlotOf(pso, false);
-    if (!s || !s->ps.load(std::memory_order_acquire)) return 0;
+    if (!s) return 0;
+    const uint64_t ps = s->ps.load(std::memory_order_acquire);
+    if (!ps || !PsoCharacterPs(s, ps)) return 0;
     const uint64_t v = s->dc.load(std::memory_order_acquire);
     if (v > 1) return v;
     uint64_t exp = 0;
@@ -137,6 +160,22 @@ uint64_t PsoDecensorVariant(device* dev, uint64_t pso)
 void PsoSetDecensorVariant(uint64_t pso, uint64_t variant)
 {
     if (PsoSlot* s = PsoSlotOf(pso, false)) s->dc.store(variant ? variant : 1, std::memory_order_release);
+}
+void PsoNoteCharacterDraw(uint64_t pso)
+{
+    PsoSlot* s = PsoSlotOf(pso, false);
+    if (!s) return;
+    const uint64_t ps = s->ps.load(std::memory_order_acquire);
+    if (!ps || s->chr.load(std::memory_order_acquire)) return;
+    std::lock_guard l(g_char_ps_mtx);
+    if (g_char_ps.insert(ps).second) {
+        g_char_ps_gen.fetch_add(1, std::memory_order_acq_rel);
+        if (g_debug)
+            logger::write("DECENSOR-CHAR ps=%016llx: drew a character -- decensored from its next bind (%zu character pixel shader(s))",
+                (unsigned long long)ps, g_char_ps.size());
+    }
+    s->chr.store(true, std::memory_order_release);
+    s->chrg.store(g_char_ps_gen.load(std::memory_order_acquire), std::memory_order_release);
 }
 uint64_t PsoUidVariant(device* dev, uint64_t pso, uint32_t target)
 {
@@ -369,6 +408,8 @@ void on_init_pipeline(device*, pipeline_layout layout, uint32_t subobject_count,
             s->text.store(text, std::memory_order_release);
             s->uc.store(0, std::memory_order_release);
             s->ucz.store(0, std::memory_order_release);
+            s->chr.store(false, std::memory_order_release);
+            s->chrg.store(0, std::memory_order_release);
             if (vs_hash) s->vc.store(vs_hash, std::memory_order_release);
             if (cs_hash) s->vc.store(cs_hash, std::memory_order_release);
             if (ps_hash) s->ps.store(ps_hash, std::memory_order_release);
@@ -436,6 +477,8 @@ void on_destroy_pipeline(device* device, pipeline pipeline)
             s->text.store(false);
             s->uc.store(0);
             s->ucz.store(0);
+            s->chr.store(false);
+            s->chrg.store(0);
         }
         std::lock_guard lock(g_addon_mutex);
         g_pipeline_ps_regs.erase(pipeline.handle);

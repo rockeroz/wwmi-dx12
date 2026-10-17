@@ -18,6 +18,7 @@
 // ===========================================================================
 #include "crash_handler.h"
 #include "../config.h" // g_faulted
+#include "../build_stamp.h" // WWMI_VERSION / WWMI_BUILD_SHA -- which build's map the offsets need
 #include "../../src/log.h" // logger::utf8_locale -- the context is a wide section name
 
 #include <windows.h>
@@ -125,8 +126,8 @@ LONG CALLBACK Handler(EXCEPTION_POINTERS* ep)
             (void*)rec->ExceptionInformation[1]);
     }
     if (t_context) Write(f, "  context: %ls\n", t_context);
-    Write(f, "  module base %p size 0x%zx  (subtract the base for map-file offsets)\n",
-        (void*)g_self_base, g_self_size);
+    Write(f, "  module base %p size 0x%zx, build %s %s  (subtract the base for that build's map-file offsets)\n",
+        (void*)g_self_base, g_self_size, WWMI_VERSION, WWMI_BUILD_SHA);
 
     Write(f, "  stack (%u frames, '*' = ours):\n", (unsigned)n);
     for (USHORT i = 0; i < n; ++i) {
@@ -174,7 +175,8 @@ int Filter(void* exception_pointers, const char* where)
                 ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr,
                 GetCurrentThreadId());
             if (t_context) Write(f, "  context: %ls\n", t_context);
-            Write(f, "  module base %p  (offsets resolve in wwmi_dx12.map)\n", (void*)g_self_base);
+            Write(f, "  module base %p, build %s %s  (offsets resolve in that build's wwmi_dx12.map)\n", (void*)g_self_base,
+                WWMI_VERSION, WWMI_BUILD_SHA);
             void*        frames[32] = {};
             const USHORT fn = RtlCaptureStackBackTrace(0, 32, frames, nullptr);
             for (USHORT i = 0; i < fn; ++i) {

@@ -6,9 +6,12 @@
 
 // The shader hashes of a PSO (vs or cs, ps, gs; 0 = none), read without a lock -- the bind hook's path.
 void PsoBoundHashes(uint64_t pso, uint64_t* vs_or_cs, uint64_t* ps, uint64_t* gs);
-// The PSO's decensor-only variant, lock-free; 0 = none (yet). The first ask queues the build.
+// The PSO's decensor-only variant, lock-free; 0 = none (yet), or its pixel shader has not drawn a character.
+// The first ask queues the build.
 uint64_t PsoDecensorVariant(reshade::api::device* dev, uint64_t pso);
 void     PsoSetDecensorVariant(uint64_t pso, uint64_t variant);
+// A claimed character draw runs on `pso`: its pixel shader is one PsoDecensorVariant answers for, from now on.
+void PsoNoteCharacterDraw(uint64_t pso);
 // The PSO's UID-cut variant for a back buffer of `target` (UidHide::Target), lock-free; 0 = none (yet), or the
 // PSO does not draw UI text. The first ask for a target queues the build.
 uint64_t PsoUidVariant(reshade::api::device* dev, uint64_t pso, uint32_t target);

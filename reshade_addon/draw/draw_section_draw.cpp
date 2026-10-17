@@ -179,10 +179,8 @@ void SectionDrawIndexed(SectionDraw& sd, uint32_t c, uint32_t s2, uint32_t b2)
                 dm, wc ? (int)wc->index : -1);
     }
     const SectionPsStamps sect_ps = PlanSectionPsSlots(cmd_list, hk.srv_gen0, hk.this_gen, dm, wc ? (int)wc->index : -1);
-    if (sect_ps.shared)
-        sect_ps.QueueForShadow();
-    else
-        sect_ps.StampInPlace();
+    sect_ps.QueueForShadow();
+    if (!sect_ps.shared) sect_ps.StampInPlace();
     ID3D12PipelineState*    rfxp_pso = nullptr;
     uint64_t                rfxp_restore = 0;
     bool                    rfxp_glow = false; // the variant carries the glow block AND this component armed it
