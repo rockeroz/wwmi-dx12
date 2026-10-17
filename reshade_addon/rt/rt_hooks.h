@@ -104,7 +104,7 @@ void RtNoteCopy(reshade::api::command_list* cmd_list, reshade::api::resource src
 // The device was removed (device_watch.cpp): the module's state into ReShade.log.
 void RtOnDeviceRemoved();
 // A list submitted (ExecuteCommandLists): from now on what it reads from UPLOAD memory may already be on the GPU.
-void RtNoteExecute(reshade::api::command_list* cmd_list);
+void RtNoteExecute(reshade::api::command_queue* queue, reshade::api::command_list* cmd_list);
 void RtNoteRays(reshade::api::command_list* cmd_list, reshade::api::resource rg_res, uint64_t rg_off, uint64_t rg_size,
     reshade::api::resource miss_res, uint64_t miss_off, uint64_t miss_size, uint64_t miss_stride, reshade::api::resource hit_res,
     uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, uint32_t w, uint32_t h, uint32_t d);

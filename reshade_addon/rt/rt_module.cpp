@@ -815,6 +815,7 @@ struct TlasRec {
     uint32_t        seq = 0;
     uint32_t        flags = 0; // its build flags
     uint64_t        dest = 0;  // the TLAS it builds
+    uint64_t        gate = 0;  // the gate value its list waits for (0 = not gated)
 };
 std::mutex                                           g_m3_m; // everything below
 std::map<uint64_t, ModBlas>                          g_m3;   // the game's BLAS (dest VA) -> ours
@@ -1436,191 +1437,199 @@ bool M3RebuildTlas(command_list* cmd_list, const TlasRec& t, const std::vector<s
     return true;
 }
 
-// Which recorded TLAS the rays' bindings name: a compute root SRV or a descriptor of a bound compute table whose
-// address is a TLAS build's destination. `status`: what was found (RTM3 bind lines). g_m3_m held.
-const TlasRec* M3BoundTlas(command_list* cmd_list, std::string* status)
+// ---- the TLAS gate (rt_m3=1) ---------------------------------------------------------------------------------------
+// The game writes a TLAS's instances after recording -- even after submitting -- its build; by the time the rays are
+// recorded they are final (7f1c9af..859fc4b tests), and rebuilding the TLAS in place hangs the GPU even unchanged
+// (rt_m3=3 test). So the list holding the TLAS build is made to wait, on the GPU, for a fence of ours (a queue Wait put
+// in front of its ExecuteCommandLists); at the rays (CPU) the instances naming a character's BLAS are pointed at ours
+// and their records at our buffers, and then the fence is signaled: the game's own build, where and when it always
+// runs, reads them. Released at the latest at the next present or the next gated TLAS (a frame without rays). g_m3_m.
+ComPtr<ID3D12Fence> g_gate;
+struct AsCheck {
+    ID3D12Resource* res;
+    uint64_t        va, as;
+};
+std::vector<AsCheck> g_m3_check; // instance addresses we wrote this frame (checked at present: did the game overwrite?)
+uint64_t             g_m3_overwritten = 0;
+uint64_t            g_gate_next = 0, g_gate_done = 0; // last value handed out / signaled
+uint64_t            g_gate_count = 0, g_gate_early = 0;
+
+void M3ReleaseGate(uint64_t value) // g_m3_m held: every gate up to `value` opens
 {
-    const CmdState&  st = CmdGfx(cmd_list);
-    device*          dv = cmd_list->get_device();
-    const TlasRec*   hit = nullptr;
-    char             b[160];
-    auto             match = [&](uint64_t va) -> const TlasRec* {
-        const TlasRec* m = nullptr;
-        for (const TlasRec& r : g_m3_tlas)
-            if (r.res && r.dest && r.dest == va && (!m || r.seq > m->seq)) m = &r;
-        return m;
-    };
-    // weaker: a view of the buffer a TLAS was built into (a view whose exact address is not known)
-    auto match_res = [&](ID3D12Resource* res) -> const TlasRec* {
-        if (!res) return nullptr;
-        const uint64_t base = res->GetGPUVirtualAddress(), width = res->GetDesc().Width;
-        const TlasRec* m = nullptr;
-        for (const TlasRec& r : g_m3_tlas)
-            if (r.res && r.dest >= base && r.dest < base + width && (!m || r.seq > m->seq)) m = &r;
-        return m;
-    };
-    for (uint32_t p = 0; p < 64; ++p) {
-        const RootParam& rp = st.root[p];
-        if (rp.view_va || rp.va) {
-            const TlasRec* m = match(rp.view_va);
-            snprintf(b, sizeof b, " p%u:root%s va=%llx view=%llx%s", p, rp.desc_type == 3 ? "UAV" : "SRV", (unsigned long long)rp.va,
-                (unsigned long long)rp.view_va, m ? "=TLAS" : "");
-            if (status && status->size() < 1500) *status += b;
-            if (m && (!hit || m->seq > hit->seq)) hit = m;
-        }
-        const descriptor_table tab = rp.compute_table();
-        if (!tab.handle || !dv) continue;
-        const TableStart ts = TableStartOf(dv, tab);
-        if (!ts) continue;
-        uint32_t found = 0, nullres = 0, k_hit = UINT32_MAX;
-        for (uint32_t k = 0; k < 64; ++k) {
-            ResInfo ri{};
-            if (!g_heap_to_res.find({ ts.heap, ts.base + k }, ri)) continue;
-            ++found;
-            if (!ri.res) ++nullres;
-            const TlasRec* m = match(ri.cached_va);
-            if (!m && ri.res && ri.res->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) m = match_res(ri.res);
-            if (m) {
-                if (!hit || m->seq > hit->seq) hit = m;
-                if (k_hit == UINT32_MAX) k_hit = k;
-            }
-        }
-        snprintf(b, sizeof b, " p%u:table(%u known, %u without resource%s)", p, found, nullres, k_hit != UINT32_MAX ? ", TLAS here" : "");
-        if (status && status->size() < 1500) *status += b;
-    }
-    return hit;
+    if (!g_gate || value <= g_gate_done) return;
+    g_gate_done = value;
+    g_gate->Signal(value);
+}
+bool M3GateClosed(const TlasRec& t)
+{
+    return g_gate && t.gate && t.gate > g_gate_done;
 }
 
-// DispatchRays (its list is being recorded: the hit table's copy in it, the TLAS's instances final). Every instance
-// naming a character's BLAS whose records are the character's gets our BLAS -- in our rebuild of that TLAS, right
-// here -- and its records our buffers; an instance whose records are not (a proxy) keeps the game's. A later dispatch
-// over the rebuilt TLAS whose records cannot all follow gets the game's TLAS back and no record written.
+// ExecuteCommandLists of a list holding a TLAS build of this frame: put the gate in front of it.
+void M3GateSubmit(command_queue* queue, TlasRec& t)
+{
+    if (M3Mode() != 1 || !queue || t.gate) return;
+    bool any = false;
+    for (const auto& [game, mb] : g_m3) any = any || (mb.ok && int32_t(g_frame_id - mb.built) <= int32_t(kM3Window));
+    if (!any) return;
+    if (!g_gate && (!g_d3d12_device || FAILED(g_d3d12_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_gate))))) return;
+    // an older gate still closed (its rays never came): open it first, it cannot be waited for any longer
+    if (g_gate_next > g_gate_done) {
+        ++g_gate_early;
+        M3ReleaseGate(g_gate_next);
+    }
+    auto* q = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
+    if (!q) return;
+    const uint64_t v = ++g_gate_next;
+    if (FAILED(q->Wait(g_gate.Get(), v))) {
+        --g_gate_next;
+        return;
+    }
+    t.gate = v;
+    ++g_gate_count;
+}
+
+// DispatchRays (rt_m3=1). The TLAS these rays trace (the newest built) is still gated: every instance naming a
+// character's BLAS whose records are the character's (and of a kind whose records were) is pointed at our BLAS in the
+// game's own instance memory, its records at our buffers -- all or none -- and the gate opens. A TLAS whose gate is
+// already open only gets the records of the instances that name our BLAS. g_m3_m held by the caller? no: taken here.
 void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride)
 {
     if (!M3On() || !g_m3_any.load(std::memory_order_relaxed) || hit_stride < 64 || !cmd_list) return;
     const uint32_t  frame = g_frame_id;
     std::lock_guard l(g_m3_m);
-    bool            any = false;
-    for (const auto& [game, mb] : g_m3) any = any || (mb.ok && int32_t(frame - mb.built) <= int32_t(kM3Window));
-    if (!any && !g_m3_rebuilt_seq) return;
     if (M3Mode() == 2) return; // diagnostic: our BLAS built, nothing redirected
-    // the TLAS these rays trace: the one their bindings name when that can be told, else the newest built
-    std::string    bind;
-    const TlasRec* bound = M3BoundTlas(cmd_list, &bind);
-    const TlasRec* t = bound;
-    if (!t)
-        for (const TlasRec& r : g_m3_tlas)
-            if (r.res && r.dest && (!t || r.seq > t->seq)) t = &r;
-    {
-        static std::atomic<uint32_t> s_bind{ 0 };
-        if (s_bind.fetch_add(1) < 12)
-            g_log.Line(true, "RTM3 bind f=%u: %s | bindings:%s", frame,
-                bound ? "the rays' bindings name a recorded TLAS" : "no binding names a recorded TLAS (newest used)", bind.c_str());
-    }
-    if (!t || int32_t(frame - t->frame) > 1) return;
-    ID3D12Resource* rd = nullptr;
-    uint64_t        rd_va = 0;
-    const char*     why = nullptr;
-    CopyRec         copy{};
-    const bool      src = M3HitSource(cmd_list, hit_res, hit_off, hit_size, frame, &rd, &rd_va, &why, &copy);
-    const bool      rebuilt = g_m3_rebuilt_seq == t->seq;
+    const TlasRec* tp = nullptr; // the TLAS these rays trace: the newest built
+    for (const TlasRec& r : g_m3_tlas)
+        if (r.res && r.dest && (!tp || r.seq > tp->seq)) tp = &r;
+    if (!tp || int32_t(frame - tp->frame) > 1) return;
+    TlasRec& t = const_cast<TlasRec&>(*tp);
     if (M3Mode() == 3) {
         // diagnostic: the TLAS rebuilt in place from the game's instances as they are, once per TLAS build
-        if (rebuilt) return;
+        if (g_m3_rebuilt_seq == t.seq) return;
         const char* w = nullptr;
-        if (M3RebuildTlas(cmd_list, *t, {}, &w)) {
-            g_m3_rebuilt_seq = t->seq;
+        if (M3RebuildTlas(cmd_list, t, {}, &w)) {
+            g_m3_rebuilt_seq = t.seq;
             ++g_m3_rebuilds;
         } else
             M3Refuse(w);
         return;
     }
-    std::vector<std::pair<uint32_t, uint64_t>> patches;
-    std::vector<ModBlas*>                      owners;
-    std::vector<RecTx>                         txs;
-    bool                                       lost = false; // a redirected instance whose records cannot be ours here
+    ID3D12Resource* rd = nullptr;
+    uint64_t        rd_va = 0;
+    const char*     why = nullptr;
+    CopyRec         copy{};
+    const bool      src = M3HitSource(cmd_list, hit_res, hit_off, hit_size, frame, &rd, &rd_va, &why, &copy);
+    const bool      closed = M3GateClosed(t);
+    struct Cand {
+        ModBlas* mb;
+        uint32_t idx;
+        uint64_t game;
+        int      sig;
+    };
+    std::vector<Cand>  cands;    // to point at our BLAS (gate closed)
+    std::vector<RecTx> txs;      // records to make ours: the candidates', then those of instances naming ours already
+    std::vector<Cand>  stale;    // instances naming ours whose records cannot follow
+    std::vector<Cand>  mine;     // instances naming ours whose records can (their RecTx are in txs too)
     for (auto& [game, mb] : g_m3) {
         if (!mb.blas || !mb.ib) continue;
         // (not within 3 frames of a topology change: a rays list recorded meanwhile could pair the new records with the
         // old BLAS)
         const bool     live = mb.ok && int32_t(frame - mb.built) <= int32_t(kM3Window) && int32_t(frame - mb.topo_frame) >= 3;
-        const bool     in_rebuilt = rebuilt && mb.redirected_seq == t->seq;
         const uint64_t ours = mb.blas->GetGPUVirtualAddress();
-        if (!live && !in_rebuilt) continue;
-        for (uint32_t idx : FindInstances(t->res, t->va, t->count, game, ours, mb, frame)) {
+        for (uint32_t idx : FindInstances(t.res, t.va, t.count, game, ours, mb, frame)) {
             uint8_t inst[64];
-            if (GuardedPrivateRead(t->res, t->va + uint64_t(idx) * 64, inst, 64) != 64) continue;
+            if (GuardedPrivateRead(t.res, t.va + uint64_t(idx) * 64, inst, 64) != 64) continue;
             uint64_t as;
             memcpy(&as, inst + 56, 8);
-            if (as != game) continue; // (the game's own memory is never ours now)
             const uint32_t contrib = inst[52] | inst[53] << 8 | inst[54] << 16;
+            const int      sig = inst[51] << 8 | inst[55];
             mb.contrib = contrib;
             RecTx      tx;
             const bool valid = src && M3Records(mb, rd, rd_va, hit_size, hit_stride, contrib, &tx);
-            if (rebuilt) {
-                // this TLAS already carries our BLAS for the instances redirected at its first dispatch: their records in
-                // this table must all follow, or none is written and the game's TLAS comes back
-                if (in_rebuilt && std::find(mb.redirected_idx.begin(), mb.redirected_idx.end(), idx) != mb.redirected_idx.end()) {
-                    if (valid) txs.push_back(std::move(tx));
-                    else lost = true;
-                }
+            if (as == ours) {
+                // already ours (this frame's first dispatch, or left from an earlier frame): its records must follow
+                if (valid) {
+                    txs.push_back(std::move(tx));
+                    mine.push_back({ &mb, idx, game, sig });
+                } else
+                    stale.push_back({ &mb, idx, game, sig });
                 continue;
             }
-            if (!live || !valid) {
-                if (live) M3Refuse(src ? "an instance's records are not the character's (it keeps the game's BLAS)" : why);
+            if (!closed || !live) continue;
+            if (!valid) {
+                M3Refuse(src ? "an instance's records are not the character's (it keeps the game's BLAS)" : why);
                 continue;
             }
-            patches.push_back({ idx, ours });
-            owners.push_back(&mb);
+            cands.push_back({ &mb, idx, game, sig });
             txs.push_back(std::move(tx));
         }
     }
-    if (rebuilt) {
-        if (!lost && M3CommitRecs(txs)) return;
-        // put the game's TLAS back for these rays (no record of this table was left ours)
-        const char* w = nullptr;
-        if (M3RebuildTlas(cmd_list, *t, {}, &w)) {
-            ++g_m3_restores;
-            g_m3_rebuilt_seq = 0;
-            static std::atomic<uint32_t> s_r{ 0 };
-            if (s_r.fetch_add(1) < 8) g_log.Line(true, "RTM3 restore f=%u: a later dispatch's records could not all follow -- the game's TLAS rebuilt", frame);
-        } else {
+    auto write_as = [&](const Cand& c, uint64_t as) -> bool {
+        uint8_t* p = MapUpload(t.res, t.va + uint64_t(c.idx) * 64 + 56, 8);
+        if (!p) return false;
+        const bool ok = GuardedCopy(p, &as, 8);
+        UnmapUpload(t.res);
+        return ok;
+    };
+    // every instance naming our BLAS back to the game's (the TLAS has not read them yet): nothing of ours goes in
+    auto all_back = [&]() {
+        for (const Cand& c : stale) write_as(c, c.game);
+        for (const Cand& c : mine) write_as(c, c.game);
+        cands.clear();
+        txs.clear();
+        mine.clear();
+        ++g_m3_restores;
+    };
+    if (!stale.empty()) {
+        if (closed)
+            all_back();
+        else {
             static std::atomic<uint32_t> s_warn{ 0 };
             if (s_warn.fetch_add(1) < 16)
-                g_log.Line(true, "RTM3 WARNING f=%u: rays over our rebuilt TLAS whose records could not follow, and no restore (%s)", frame, w);
+                g_log.Line(true, "RTM3 WARNING f=%u: %zu instance(s) of an already built TLAS name our BLAS and their records cannot follow", frame,
+                    stale.size());
         }
-        return;
     }
-    if (patches.empty()) return;
-    // the rebuild first (it can refuse), then the records -- all, or the game's TLAS rebuilt over ours and none
-    if (!M3RebuildTlas(cmd_list, *t, patches, &why)) {
-        M3Refuse(why);
-        return;
-    }
-    if (!M3CommitRecs(txs)) {
-        const char* w = nullptr;
-        if (!M3RebuildTlas(cmd_list, *t, {}, &w)) {
+    bool redirected = false;
+    if (!txs.empty() && M3CommitRecs(txs)) {
+        size_t done = 0;
+        for (; done < cands.size(); ++done)
+            if (!write_as(cands[done], cands[done].mb->blas->GetGPUVirtualAddress())) break;
+        if (done < cands.size()) {
+            // an instance write failed: the written ones back, and the records back
+            for (size_t i = 0; i < done; ++i) write_as(cands[i], cands[i].game);
+            for (const RecTx& tx : txs) M3WriteRecs(tx, false);
+            M3Refuse("an instance write failed (nothing redirected)");
+        } else
+            redirected = !cands.empty();
+    } else if (!txs.empty()) {
+        // the records could not all be written (the written ones put back)
+        if (closed)
+            all_back();
+        else {
             static std::atomic<uint32_t> s_warn{ 0 };
-            if (s_warn.fetch_add(1) < 16) g_log.Line(true, "RTM3 WARNING f=%u: records could not be written after the rebuild, and no restore (%s)", frame, w);
+            if (s_warn.fetch_add(1) < 16)
+                g_log.Line(true, "RTM3 WARNING f=%u: records of an already built TLAS's instances naming our BLAS could not be written", frame);
         }
-        ++g_m3_restores;
-        return;
+        cands.clear();
     }
-    g_m3_rebuilt_seq = t->seq;
-    ++g_m3_rebuilds;
-    for (auto& [game, mb] : g_m3) mb.redirected_idx.clear();
-    for (size_t i = 0; i < owners.size(); ++i) {
-        ModBlas& mb = *owners[i];
-        if (mb.redirected != frame) ++g_m3_redirects;
-        mb.redirected = frame;
-        mb.patched = frame;
-        mb.redirected_seq = t->seq;
-        mb.redirected_idx.push_back(patches[i].first);
+    if (redirected) {
+        ++g_m3_rebuilds; // (TLAS builds that read our BLAS)
+        for (const Cand& c : cands) {
+            ModBlas& mb = *c.mb;
+            if (g_m3_check.size() < 64) g_m3_check.push_back({ t.res, t.va + uint64_t(c.idx) * 64 + 56, mb.blas->GetGPUVirtualAddress() });
+            if (mb.redirected != frame) ++g_m3_redirects;
+            mb.redirected = frame;
+            mb.patched = frame;
+            mb.redirected_seq = t.seq;
+        }
+        static std::atomic<uint32_t> s_first{ 0 };
+        if (s_first.fetch_add(1) < 4)
+            g_log.Line(true, "RTM3 redirect f=%u: TLAS %llx (%u instances, gate %llu) reads our BLAS for %zu instance(s); records patched", frame,
+                (unsigned long long)t.dest, t.count, (unsigned long long)t.gate, cands.size());
     }
-    static std::atomic<uint32_t> s_first{ 0 };
-    if (s_first.fetch_add(1) < 4)
-        g_log.Line(true, "RTM3 rebuild f=%u: TLAS %llx (%u instances%s) rebuilt before the rays with %zu instance(s) on our BLAS, records patched",
-            frame, (unsigned long long)t->dest, t->count, bound ? ", named by the rays' bindings" : ", the newest built", patches.size());
+    if (closed) M3ReleaseGate(t.gate); // the game's TLAS build may run now
 }
 
 std::string M3Status()
@@ -1635,9 +1644,10 @@ std::string M3Status()
     char b[256];
     size_t ok = 0;
     for (const auto& [g, mb] : g_m3) ok += mb.ok ? 1 : 0;
-    snprintf(b, sizeof b, " | m3 chars=%zu/%zu builds=%llu updates=%llu redirected_frames=%llu tlas_rebuilds=%llu restores=%llu grave=%zu", ok,
-        g_m3.size(), (unsigned long long)g_m3_builds, (unsigned long long)g_m3_updates, (unsigned long long)g_m3_redirects,
-        (unsigned long long)g_m3_rebuilds, (unsigned long long)g_m3_restores, g_m3_grave.size());
+    snprintf(b, sizeof b, " | m3 chars=%zu/%zu builds=%llu updates=%llu redirected_frames=%llu tlas_with_ours=%llu restores=%llu gates=%llu (opened without rays %llu) overwritten=%llu grave=%zu",
+        ok, g_m3.size(), (unsigned long long)g_m3_builds, (unsigned long long)g_m3_updates, (unsigned long long)g_m3_redirects,
+        (unsigned long long)g_m3_rebuilds, (unsigned long long)g_m3_restores, (unsigned long long)g_gate_count, (unsigned long long)g_gate_early,
+        (unsigned long long)g_m3_overwritten, g_m3_grave.size());
     std::string s = b;
     for (const auto& [g, mb] : g_m3)
         if (mb.ok) {
@@ -1697,9 +1707,13 @@ void RtOnDeviceRemoved()
             m3 = "(M3 lock held)";
     }
     ReshadeLog(reshade::log::level::error, "wwmi-dx12 RT module at device removal, frame %u: %s", g_frame_id, m3.c_str());
+    {
+        std::lock_guard l(g_m3_m);
+        M3ReleaseGate(g_gate_next);
+    }
 }
 
-void RtNoteExecute(command_list* cmd_list)
+void RtNoteExecute(command_queue* queue, command_list* cmd_list)
 {
     if (!cmd_list || Mode() != 2 || !g_m3_any.load(std::memory_order_relaxed)) return;
     const uint64_t gen = CmdGen(cmd_list);
@@ -1707,6 +1721,7 @@ void RtNoteExecute(command_list* cmd_list)
     std::lock_guard l(g_m3_m);
     for (TlasRec& r : g_m3_tlas)
         if (r.cl == cmd_list && r.gen == gen && !r.executed) {
+            M3GateSubmit(queue, r); // its build waits for the rays' decision
             r.executed = true;
         }
     std::lock_guard l2(g_copy_m);
@@ -1725,8 +1740,29 @@ void RtNoteRays(command_list* cmd_list, resource rg_res, uint64_t rg_off, uint64
     if (Mode() == 2) M3Redirect(cmd_list, hit_res, hit_off, hit_size, hit_stride);
 }
 
+// Present: a gate still closed for an earlier frame's TLAS (no rays came for it) opens.
+void M3PresentTick()
+{
+    std::lock_guard l(g_m3_m);
+    for (const TlasRec& r : g_m3_tlas)
+        if (M3GateClosed(r)) { // the frame's rays were recorded by now
+            ++g_gate_early;
+            M3ReleaseGate(r.gate);
+        }
+    // did the game write an instance again after we pointed it at our BLAS? (its records are ours then: a mix)
+    for (const AsCheck& c : g_m3_check) {
+        uint64_t as = 0;
+        if (GuardedPrivateRead(c.res, c.va, reinterpret_cast<uint8_t*>(&as), 8) == 8 && as != c.as) {
+            if (g_m3_overwritten++ < 8) g_log.Line(true, "RTM3 WARNING: an instance we pointed at our BLAS was rewritten by the game before present (now %llx)",
+                (unsigned long long)as);
+        }
+    }
+    g_m3_check.clear();
+}
+
 void RtPresentTick()
 {
+    if (Mode() == 2) M3PresentTick();
     static bool     s_held = false;
     static bool     s_started = false;
     static uint32_t s_last_summary = 0;
