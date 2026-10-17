@@ -310,7 +310,10 @@ void Summary()
         (unsigned long long)g_sig_rings.load(), (unsigned long long)g_rt_draws.load(), (unsigned long long)g_c.skin_records.load(),
         (unsigned long long)g_c.claims_drawn.load(), (unsigned long long)g_c.sections.load(), (unsigned long long)g_c.section_misses.load(),
         (unsigned long long)g_c.m2_drawn.load(), (unsigned long long)g_c.m2_not_drawn.load(), m2.c_str(), g_ring_count.load(), rings.c_str());
-    if (Mode() == 2) M3Summary(); // its own lines (RTSUM is cut at 1024 characters)
+    if (Mode() == 2) {
+        for (const std::string& line : rtskin::PoseLines()) g_log.Line(true, "%s", line.c_str());
+        M3Summary(); // its own lines (RTSUM is cut at 1024 characters)
+    }
 }
 
 uint64_t BufferVa(resource res, uint64_t offset) // ReShade DX12: a null resource carries the VA in `offset`

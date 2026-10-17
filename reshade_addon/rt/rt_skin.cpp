@@ -57,6 +57,7 @@ struct Sec {
     uint64_t        tan_ring = 0;
     ID3D12Resource* pal_res = nullptr; // the palette's buffer and offset in it (merged skeletons copy from it)
     uint64_t        pal_off = 0;
+    uint32_t        frame = 0;         // the frame the skin cache posed it with this palette
 };
 // A ring's sections by their start vertex in it ($Globals SkinCacheStart): section k = the k-th start. Dispatch order
 // is not section order (two shader variants pose different sections, and a pass can straddle a frame id).
@@ -186,6 +187,15 @@ bool                         g_pipeline_tried = false;
 std::string                  g_pipeline_why;
 CbRing                       g_cb;
 uint64_t                     g_draws = 0, g_skips = 0, g_dispatches = 0, g_cached = 0;
+// Per mod: how fresh the poses the raster draws are (a pose of an earlier frame shows as a jump in motion). g_m.
+struct PoseStats {
+    uint64_t draws = 0;      // posed this draw
+    uint64_t age1 = 0;       // ...with last frame's palette (this frame's skin cache dispatch not recorded yet)
+    uint64_t merged_old = 0; // merged skeleton: some section kept an earlier frame's palette
+    uint64_t no_prev = 0;    // no pose of the frame before (no skinning motion vectors)
+    uint64_t cached = 0, cached_age = 0, cached_max = 0; // drawn with an earlier pose of ours (how many frames old)
+};
+std::map<int, PoseStats> g_pose_stats;
 std::string                  g_last_skip;
 std::set<std::string>        g_logged; // one line per distinct message
 
@@ -580,7 +590,7 @@ void NoteSection(uint64_t ring_va, uint64_t ring_bytes, uint32_t start, uint64_t
     const bool fresh = !r.by_start.count(start);
     if (fresh && r.by_start.size() >= 32) return;
     SecRec& rec = r.by_start[start];
-    rec.s = { palette_va, bones, tangent_ring_va, palette_res, palette_off };
+    rec.s = { palette_va, bones, tangent_ring_va, palette_res, palette_off, frame };
     rec.frame = frame;
     if (fresh) { // the layout as it grows (one line per distinct layout)
         std::string lay;
@@ -806,6 +816,12 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
             }
             palette_va = sl.merged->GetGPUVirtualAddress();
             palette_bones = m.merged_bones;
+            bool old = false;
+            for (const Mesh::MergedComp& mc : m.merged) {
+                Sec x;
+                old = old || !LookupSection(ctx.ring, mc.index, frame, &x, mod) || x.frame != frame;
+            }
+            if (old) ++g_pose_stats[mod].merged_old;
         }
         // last frame's pose of this component (the VS's previous positions, for motion vectors)
         Slot* prev = nullptr;
@@ -906,6 +922,14 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
             vbv = { sl.pos->GetGPUVirtualAddress(), m.verts * 12, 12 };
             vbv_prev = vbv;
             ++g_cached;
+            {
+                PoseStats& ps = g_pose_stats[mod];
+                const auto pit = m.poses.find(comp);
+                const uint64_t age = pit != m.poses.end() ? uint64_t(frame - pit->second.first.frame) : 0;
+                ++ps.cached;
+                ps.cached_age += age;
+                ps.cached_max = (std::max)(ps.cached_max, age);
+            }
             char key[48];
             snprintf(key, sizeof key, "cached %d %d", mod, comp);
             char line[160];
@@ -941,6 +965,12 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         vbv = { sl.pos->GetGPUVirtualAddress(), m.verts * 12, 12 };
         vbv_prev = prev ? D3D12_VERTEX_BUFFER_VIEW{ prev->pos->GetGPUVirtualAddress(), m.verts * 12, 12 } : vbv;
         ++g_dispatches;
+        {
+            PoseStats& ps = g_pose_stats[mod];
+            ++ps.draws;
+            if (m.merged.empty() && sec.frame != frame) ++ps.age1;
+            if (!prev) ++ps.no_prev;
+        }
         char first[200];
         snprintf(first, sizeof first, "RTM2 first draw mod=%d comp=%d: %u indices from %u, %u bones, %zu fetch slot(s) replaced, LocalVF %s %08x %08x %08x %08x%s",
             mod, comp, c, s2, palette_bones, slots.size(), have_vf ? "read" : "NOT read", vf_words[0], vf_words[1], vf_words[2], vf_words[3],
@@ -1020,6 +1050,21 @@ std::string Status()
         (unsigned long long)g_draws, (unsigned long long)g_dispatches, (unsigned long long)g_cached, (unsigned long long)g_skips,
         g_last_skip.empty() ? "-" : g_last_skip.c_str(), g_rings.size(), g_heap_next);
     return b;
+}
+
+std::vector<std::string> PoseLines()
+{
+    std::lock_guard          l(g_m);
+    std::vector<std::string> out;
+    for (const auto& [mod, ps] : g_pose_stats) {
+        char b[320];
+        snprintf(b, sizeof b,
+            "RTM2POSE mod=%d posed=%llu last_frame_palette=%llu merged_with_old_sections=%llu no_previous_pose=%llu cached=%llu (avg %llu, max %llu frame(s) old)",
+            mod, (unsigned long long)ps.draws, (unsigned long long)ps.age1, (unsigned long long)ps.merged_old, (unsigned long long)ps.no_prev,
+            (unsigned long long)ps.cached, (unsigned long long)(ps.cached ? ps.cached_age / ps.cached : 0), (unsigned long long)ps.cached_max);
+        out.push_back(b);
+    }
+    return out;
 }
 
 } // namespace rtskin

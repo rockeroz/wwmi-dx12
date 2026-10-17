@@ -61,6 +61,7 @@ struct GeomPose {
 bool PoseFor(uint64_t ring, int comp, uint32_t frame, GeomPose* out);
 
 std::string Status(); // one line for RTSUM / the overlay
+std::vector<std::string> PoseLines(); // RTM2POSE: per mod, how fresh the raster's poses are
 std::string Explain(uint64_t va, int comp, int mod); // why a section of this ring is (not) usable: for the held lines
 
 } // namespace rtskin
