@@ -793,6 +793,7 @@ struct ModBlas {
     std::vector<std::vector<std::pair<uint32_t, uint32_t>>> sig;     // the topology built: ranges per geometry
     std::vector<ID3D12Resource*>                            sig_idx; // ...of which mod index buffer
     uint32_t                                                built = 0, updates = 0, builds = 0;
+    uint32_t                                                topo_frame = 0; // when the topology (index buffer) last changed
     bool                                                    ok = false;
     // where the TLAS instance naming it was last found / written
     std::vector<uint32_t> hints;             // instance indices naming it last time
@@ -873,6 +874,12 @@ bool GuardedCopy(void* dst, const void* src, size_t n)
     memcpy(dst, src, n);
     return true;
 #endif
+}
+
+// A DRED breadcrumb context on the game's list (a device removal names what of ours ran last).
+void M3Marker(ID3D12GraphicsCommandList* cl, const wchar_t* what)
+{
+    cl->SetMarker(0, what, UINT((wcslen(what) + 1) * sizeof(wchar_t)));
 }
 
 // The game builds / updates a character BLAS from a ring the module poses a mod for: build ours next to it, from the
@@ -956,8 +963,12 @@ void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const ac
             cnt[g] = c ? c : 3;
             total += cnt[g];
         }
-        ComPtr<ID3D12Resource> ib; // zero-filled (committed): the degenerate triangles are indices 0, 0, 0
-        if (total > (64u << 20) || FAILED(CreateD3D12Buffer(g_d3d12_device, D3D12_HEAP_TYPE_DEFAULT, (total * 4 + 255) & ~uint64_t(255),
+        // zero-filled (committed): the degenerate triangles are indices 0, 0, 0; and as many zero indices again as the
+        // game's geometry has past our last one, so a read with the game's primitive indices stays in the buffer
+        uint64_t game_bytes = 0;
+        for (uint32_t g = 0; g < n; ++g) game_bytes += uint64_t(inputs[g].triangles.index_count) * (iw ? iw : 4) * 2;
+        ComPtr<ID3D12Resource> ib;
+        if (total > (64u << 20) || FAILED(CreateD3D12Buffer(g_d3d12_device, D3D12_HEAP_TYPE_DEFAULT, (total * 4 + game_bytes + 255) & ~uint64_t(255),
                                        D3D12_RESOURCE_STATE_COPY_DEST, &ib))) {
             M3Refuse("could not create the index buffer");
             return;
@@ -982,6 +993,7 @@ void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const ac
         mb.ib_cnt = cnt;
         mb.sig = sig;
         mb.sig_idx = sig_idx;
+        mb.topo_frame = frame;
     }
     mb.geoms = n;
     mb.game_ib = gib[0];
@@ -1055,6 +1067,7 @@ void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const ac
     uav[0].Type = uav[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     uav[0].UAV.pResource = mb.blas.Get();
     uav[1].UAV.pResource = mb.scratch.Get();
+    M3Marker(cl.Get(), L"wwmi rt-m3: our character BLAS build");
     cl->ResourceBarrier(2, uav); // a build of an earlier list still writing either
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC bd{};
     bd.Inputs = in;
@@ -1311,6 +1324,7 @@ bool M3RebuildTlas(command_list* cmd_list, const TlasRec& t, const std::vector<s
         }
     }
     // the instances: the game's, as its own build read them, then our BLAS addresses over theirs
+    M3Marker(cl.Get(), L"wwmi rt-m3: TLAS rebuild (instance copy, build)");
     D3D12_RESOURCE_BARRIER br{};
     br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     br.Transition.pResource = g_m3_inst.Get();
@@ -1342,6 +1356,8 @@ bool M3RebuildTlas(command_list* cmd_list, const TlasRec& t, const std::vector<s
     bd.ScratchAccelerationStructureData = g_m3_tscratch->GetGPUVirtualAddress();
     cl->BuildRaytracingAccelerationStructure(&bd, 0, nullptr);
     cl->ResourceBarrier(1, &uav); // complete before the rays read it
+    M3Marker(cl.Get(), patches.empty() ? L"wwmi rt-m3: game's TLAS rebuilt back; the game's rays follow"
+                                       : L"wwmi rt-m3: TLAS with our BLAS; the game's rays follow");
     RemovalPin::Ours(reinterpret_cast<const void*>(cmd_list->get_native()), "rt-m3 tlas");
     return true;
 }
@@ -1377,7 +1393,9 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
     bool             lost = false; // a rebuilt instance whose records cannot be ours here
     for (auto& [game, mb] : g_m3) {
         if (!mb.blas || !mb.ib) continue;
-        const bool     live = mb.ok && int32_t(frame - mb.built) <= int32_t(kM3Window);
+        // (not within 3 frames of a topology change: a rays list recorded meanwhile could pair the new records with the
+        // old BLAS)
+        const bool     live = mb.ok && int32_t(frame - mb.built) <= int32_t(kM3Window) && int32_t(frame - mb.topo_frame) >= 3;
         const uint64_t ours = mb.blas->GetGPUVirtualAddress();
         if (!live && !(rebuilt && mb.redirected == frame)) continue;
         for (uint32_t idx : FindInstances(t->res, t->va, t->count, game, ours, mb, frame)) {
