@@ -827,14 +827,22 @@ std::atomic<bool>                                    g_m3_any{ false };
 std::atomic<int>                                     g_m3_on{ -1 };
 ComPtr<ID3D12Device5>                                g_dev5;
 
-bool M3On()
+// rt_m3: 0 off, 1 full (our BLAS in a rebuilt TLAS, records patched), 2 our BLAS built only (nothing redirected),
+// 3 the TLAS rebuilt in place from the game's own instances, unchanged (no BLAS of ours in it, no record touched).
+// 2 and 3 isolate a hang: our BLAS work alone, the in-place rebuild alone.
+int M3Mode()
 {
     int v = g_m3_on.load(std::memory_order_relaxed);
-    if (v >= 0) return v != 0;
-    if (g_addon_ini_path.empty()) return false; // not read yet: nothing until it is
-    v = GetPrivateProfileIntW(L"wwmi-dx12", L"rt_m3", 1, g_addon_ini_path.c_str()) != 0 ? 1 : 0;
+    if (v >= 0) return v;
+    if (g_addon_ini_path.empty()) return 0; // not read yet: nothing until it is
+    v = int(GetPrivateProfileIntW(L"wwmi-dx12", L"rt_m3", 1, g_addon_ini_path.c_str()));
+    if (v < 0 || v > 3) v = 0;
     g_m3_on.store(v, std::memory_order_relaxed);
-    return v != 0;
+    return v;
+}
+bool M3On()
+{
+    return M3Mode() != 0;
 }
 
 void M3Refuse(const char* why) // g_m3_m held
@@ -1495,6 +1503,7 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
     bool            any = false;
     for (const auto& [game, mb] : g_m3) any = any || (mb.ok && int32_t(frame - mb.built) <= int32_t(kM3Window));
     if (!any && !g_m3_rebuilt_seq) return;
+    if (M3Mode() == 2) return; // diagnostic: our BLAS built, nothing redirected
     // the TLAS these rays trace: the one their bindings name when that can be told, else the newest built
     std::string    bind;
     const TlasRec* bound = M3BoundTlas(cmd_list, &bind);
@@ -1515,6 +1524,17 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
     CopyRec         copy{};
     const bool      src = M3HitSource(cmd_list, hit_res, hit_off, hit_size, frame, &rd, &rd_va, &why, &copy);
     const bool      rebuilt = g_m3_rebuilt_seq == t->seq;
+    if (M3Mode() == 3) {
+        // diagnostic: the TLAS rebuilt in place from the game's instances as they are, once per TLAS build
+        if (rebuilt) return;
+        const char* w = nullptr;
+        if (M3RebuildTlas(cmd_list, *t, {}, &w)) {
+            g_m3_rebuilt_seq = t->seq;
+            ++g_m3_rebuilds;
+        } else
+            M3Refuse(w);
+        return;
+    }
     std::vector<std::pair<uint32_t, uint64_t>> patches;
     std::vector<ModBlas*>                      owners;
     std::vector<RecTx>                         txs;
@@ -1606,6 +1626,11 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
 std::string M3Status()
 {
     if (!M3On()) return " | m3 off (rt_m3=0)";
+    if (M3Mode() == 2) return " | m3 DIAGNOSTIC rt_m3=2 (our BLAS only)" + std::string();
+    if (M3Mode() == 3) {
+        std::lock_guard l(g_m3_m);
+        return " | m3 DIAGNOSTIC rt_m3=3 (game TLAS rebuilt in place, unchanged): rebuilds=" + std::to_string(g_m3_rebuilds);
+    }
     std::lock_guard l(g_m3_m);
     char b[256];
     size_t ok = 0;
@@ -1654,6 +1679,24 @@ void RtNoteCopy(command_list* cmd_list, resource src, uint64_t src_off, resource
     r.frame = g_frame_id;
     std::lock_guard l(g_copy_m);
     g_copies[g_copy_next++ & 511] = r;
+}
+
+void RtOnDeviceRemoved()
+{
+    // the observe log is written at present, which no longer comes: the essentials straight into ReShade.log
+    std::string m3;
+    {
+        std::unique_lock l(g_m3_m, std::try_to_lock);
+        if (l.owns_lock()) {
+            char b[256];
+            snprintf(b, sizeof b, "rt_m3=%d builds=%llu updates=%llu redirected_frames=%llu tlas_rebuilds=%llu restores=%llu last_rebuilt_tlas_seq=%u",
+                M3Mode(), (unsigned long long)g_m3_builds, (unsigned long long)g_m3_updates, (unsigned long long)g_m3_redirects,
+                (unsigned long long)g_m3_rebuilds, (unsigned long long)g_m3_restores, g_m3_rebuilt_seq);
+            m3 = b;
+        } else
+            m3 = "(M3 lock held)";
+    }
+    ReshadeLog(reshade::log::level::error, "wwmi-dx12 RT module at device removal, frame %u: %s", g_frame_id, m3.c_str());
 }
 
 void RtNoteExecute(command_list* cmd_list)

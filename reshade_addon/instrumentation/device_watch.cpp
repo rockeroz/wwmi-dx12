@@ -4,6 +4,7 @@
 #include "removal_pin.h"
 #include "../addon_core.h"
 #include "device_watch.h"
+#include "../rt/rt_hooks.h" // RtOnDeviceRemoved
 #include <thread>
 
 using namespace reshade::api;
@@ -16,6 +17,10 @@ static void DumpDeviceRemoval(ID3D12Device* d3d, HRESULT rr)
         : (rr == DXGI_ERROR_DRIVER_INTERNAL_ERROR)    ? "DRIVER_INTERNAL_ERROR"
         : (rr == DXGI_ERROR_INVALID_CALL)             ? "INVALID_CALL (our command stream)"
                                                       : "unknown";
+    // a removal is always written (without debug=1 the log is otherwise off), and the gist into ReShade.log too
+    if (logger::g_level < 1) logger::set_level(1);
+    reshade::log::message(reshade::log::level::error, "wwmi-dx12: device removed -- DRED details in wwmi_dx12_addon.log");
+    RtOnDeviceRemoved();
     logger::report("*** DEVICE REMOVED: hr=%08x %s  frame=%llu", (unsigned)rr, what, (unsigned long long)g_frame_id);
     IbHash::LogInflight("device removed");
     DrainDebugLayer("at removal");

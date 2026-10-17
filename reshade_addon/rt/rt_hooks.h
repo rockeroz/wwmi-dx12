@@ -101,6 +101,8 @@ void RtObserveDraw(reshade::api::command_list* cmd_list, uint32_t index_count, u
 // Every buffer copy (resource_tracker.cpp): the RT module notes where DEFAULT regions -- shader tables -- come from.
 void RtNoteCopy(reshade::api::command_list* cmd_list, reshade::api::resource src, uint64_t src_off, reshade::api::resource dst,
     uint64_t dst_off, uint64_t size);
+// The device was removed (device_watch.cpp): the module's state into ReShade.log.
+void RtOnDeviceRemoved();
 // A list submitted (ExecuteCommandLists): from now on what it reads from UPLOAD memory may already be on the GPU.
 void RtNoteExecute(reshade::api::command_list* cmd_list);
 void RtNoteRays(reshade::api::command_list* cmd_list, reshade::api::resource rg_res, uint64_t rg_off, uint64_t rg_size,
