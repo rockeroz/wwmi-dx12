@@ -32,6 +32,7 @@ struct RootParam {
     reshade::api::descriptor_table ctable = {};
     ComputeBindNote                ctable_note;
     uint64_t                       va = 0;
+    uint64_t                       view_va = 0;   // a root SRV/UAV's view handle as pushed (an acceleration structure's: its address)
     ID3D12Resource*                res = nullptr; // owning resource of a root SRV/UAV (morph matcher: offset-proof identity)
     uint8_t                        desc_type = 0;
 

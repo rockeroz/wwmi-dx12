@@ -278,7 +278,12 @@ void on_push_descriptors(command_list* cmd_list, shader_stage stages, pipeline_l
         CmdCmpLayout(cmd_list) = layout.handle;
     }
 
+    if (update.type == descriptor_type::acceleration_structure) { // RT M3: a TLAS bound as a root SRV (the view is its address)
+        CmdGfx(cmd_list).root[layout_param].view_va = static_cast<const resource_view*>(update.descriptors)[0].handle;
+        CmdGfx(cmd_list).root[layout_param].desc_type = 2;
+    }
     if (update.type == descriptor_type::shader_resource_view || update.type == descriptor_type::unordered_access_view) {
+        CmdGfx(cmd_list).root[layout_param].view_va = static_cast<const resource_view*>(update.descriptors)[0].handle; // RT M3
         resource res = cmd_list->get_device()->get_resource_from_view(static_cast<const resource_view*>(update.descriptors)[0]);
         if (res.handle != 0) {
             auto*      d3d12_res = reinterpret_cast<ID3D12Resource*>(res.handle);

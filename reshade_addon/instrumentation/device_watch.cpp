@@ -37,7 +37,7 @@ static void DumpDeviceRemoval(ID3D12Device* d3d, HRESULT rr)
                     node->pCommandQueueDebugNameW ? node->pCommandQueueDebugNameW : L"(unnamed)",
                     (void*)node->pCommandQueue, done, node->BreadcrumbCount, node->BreadcrumbContextsCount, ours);
                 if (node->pCommandHistory && done < node->BreadcrumbCount) {
-                    logger::report("      faulting op index %u = D3D12_AUTO_BREADCRUMB_OP %d", done, (int)node->pCommandHistory[done]);
+                    logger::report("      first unfinished op %u = D3D12_AUTO_BREADCRUMB_OP %d (where the GPU stopped, not proof of the culprit)", done, (int)node->pCommandHistory[done]);
                     const D3D12_DRED_BREADCRUMB_CONTEXT* c = node->pBreadcrumbContexts;
                     const UINT                           cn = c ? node->BreadcrumbContextsCount : 0;
                     UINT                                 first_after = cn;
@@ -72,7 +72,7 @@ static void DumpDeviceRemoval(ID3D12Device* d3d, HRESULT rr)
                     (void*)node->pCommandQueue, done, node->BreadcrumbCount, ours);
                 // The op still running when the GPU died is the one after the last completed.
                 if (node->pCommandHistory && done < node->BreadcrumbCount)
-                    logger::report("      faulting op index %u = D3D12_AUTO_BREADCRUMB_OP %d",
+                    logger::report("      first unfinished op %u = D3D12_AUTO_BREADCRUMB_OP %d (where the GPU stopped, not proof of the culprit)",
                         done, (int)node->pCommandHistory[done]);
             }
             if (!n) logger::report("  DRED: no breadcrumb nodes");
