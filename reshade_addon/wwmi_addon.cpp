@@ -260,6 +260,7 @@ static bool X23Begin(command_list* cmd_list, uint32_t index_count, uint32_t inst
 static bool on_draw_indexed(command_list* cmd_list, uint32_t index_count, uint32_t instance_count,
     uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
 {
+    if (!g_game_drew.load(std::memory_order_relaxed)) g_game_drew.store(true, std::memory_order_relaxed);
     if (!MorphDump::Armed() || !g_merged_loaded || g_addon_disabled)
         return on_draw_indexed_guarded(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance);
     MorphDump::GameDrawRecord r{};

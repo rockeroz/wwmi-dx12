@@ -15,8 +15,40 @@
 #include "../hud/uid_hide.h"
 #include "../rt/rt_hooks.h" // RtPresentTick
 
+// A present with no draw of the game's since the last one: frame generation's in-between frame (two presents per frame
+// the game renders). Everything per frame -- the frame counter, [Present] lists, per-frame resets -- runs once per
+// rendered frame; before, every age in frames was doubled and the per-frame state was reset in the middle (mods posed
+// with a stale pose, animations stuck). Never two skipped in a row (a present without indexed draws, e.g. a loading
+// screen, still advances). wwmi_dx12.ini [wwmi-dx12] framegen_skip = 0 turns it off.
+static bool SkipGeneratedPresent()
+{
+    static int      s_on = -1;
+    static bool     s_skipped_last = false;
+    static uint32_t s_skipped = 0, s_presents = 0;
+    static bool     s_told = false;
+    if (s_on < 0 && !g_addon_ini_path.empty()) s_on = GetPrivateProfileIntW(L"wwmi-dx12", L"framegen_skip", 1, g_addon_ini_path.c_str()) ? 1 : 0;
+    const bool drew = g_game_drew.exchange(false, std::memory_order_relaxed);
+    ++s_presents;
+    if (s_on != 1 || drew || s_skipped_last) {
+        s_skipped_last = false;
+        return false;
+    }
+    s_skipped_last = true;
+    if (++s_skipped == 120 && !s_told) {
+        s_told = true;
+        char line[200];
+        snprintf(line, sizeof line,
+            "[wwmi-dx12] frame generation: %u of %u presents had no draw of the game's -- counted once per rendered frame (framegen_skip=0 turns this off)",
+            s_skipped, s_presents);
+        reshade::log::message(reshade::log::level::info, line);
+        logger::write("FRAMEGEN: %u of %u presents had no game draw -- not counted as frames", s_skipped, s_presents);
+    }
+    return true;
+}
+
 void on_present_body(command_queue* queue, swapchain* sc)
 {
+    if (SkipGeneratedPresent()) return;
     HotPath::FrameEnd();
     g_perf.FrameEnd();
     PROF(PROF_Present);

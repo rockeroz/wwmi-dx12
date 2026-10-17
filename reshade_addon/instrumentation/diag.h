@@ -21,6 +21,9 @@
 
 // The present counter: bumped once per frame by on_present, compared wherever an age in frames matters.
 inline uint32_t              g_frame_id = 1;
+// Frame generation (DLSS-G and the like) presents twice per frame the game renders: the in-between present carries no
+// draw of the game's. A present with no game draw since the last one (never two in a row) is not a frame.
+inline std::atomic<bool>     g_game_drew{ false };
 inline std::atomic<uint32_t> g_sections_this_frame{ 0 };
 
 inline bool g_debug = false;     // diagnostics + logging master (overlay A2)
