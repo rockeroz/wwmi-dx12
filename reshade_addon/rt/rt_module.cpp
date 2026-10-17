@@ -799,8 +799,7 @@ struct ModBlas {
     std::vector<uint32_t>                                   built_verts, built_flags, built_cnt; // what the BLAS was built from
     bool                                                    ok = false;
     // where the TLAS instance naming it was last found / written
-    std::vector<uint32_t> hints;             // instance indices naming it last time
-    uint32_t              last_scan = 0, redirected = 0;
+    uint32_t              redirected = 0;
     uint32_t contrib = UINT32_MAX;          // its instance's hit group contribution (last TLAS that named it)
     uint32_t patched = 0;                   // frame a TLAS build last got our BLAS in its instance
     std::vector<uint32_t> redirected_idx; // the instances our last TLAS rebuild put it in
@@ -1129,46 +1128,59 @@ void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const ac
         ++g_m3_updates;
 }
 
-// Every instance (up to 4) naming one of two BLAS addresses: at the known indices, around them, or (now and then, or
-// when the TLAS is small) anywhere. A character's BLAS can be named by more than one instance (a proxy with other
-// hit groups, mask ad / flags 07, was seen): each is judged on its own.
-std::vector<uint32_t> FindInstances(ID3D12Resource* res, uint64_t va, uint32_t count, uint64_t a, uint64_t b, ModBlas& mb, uint32_t frame)
+// Every instance naming a character's BLAS (the game's or ours), from one full scan of each TLAS's instances shared by
+// all characters (the 3f348bb/11c9692 tests: the instance order changes from one TLAS to the next, so the hints of the
+// last one missed ~85 % of the time). g_m3_m held.
+uint32_t                                          g_scan_seq = 0;   // the TLAS (sequence) scanned
+std::unordered_map<uint64_t, std::vector<uint32_t>> g_scan_hits;    // BLAS address -> instance indices naming it
+uint64_t                                          g_scan_n = 0, g_scan_us = 0, g_scan_max_us = 0;
+
+void M3ScanTlas(ID3D12Resource* res, uint64_t va, uint32_t count, uint32_t seq)
 {
-    std::vector<uint32_t> out;
-    auto at = [&](uint32_t i) -> uint64_t {
-        uint64_t as = 0;
-        return GuardedPrivateRead(res, va + uint64_t(i) * 64 + 56, reinterpret_cast<uint8_t*>(&as), 8) == 8 ? as : 0;
-    };
-    auto add = [&](uint32_t i) {
-        if (out.size() < 4 && std::find(out.begin(), out.end(), i) == out.end()) out.push_back(i);
-    };
-    auto scan = [&](uint32_t from, uint32_t to) {
-        std::vector<uint8_t> buf(1024 * 64);
-        for (uint32_t i = from; i < to && out.size() < 4; i += 1024) {
-            const uint32_t k = (std::min)(1024u, to - i);
-            const uint32_t got = GuardedPrivateRead(res, va + uint64_t(i) * 64, buf.data(), k * 64);
-            for (uint32_t j = 0; j < got / 64; ++j) {
-                uint64_t as;
-                memcpy(&as, buf.data() + size_t(j) * 64 + 56, 8);
-                if (as == a || as == b) add(i + j);
+    g_scan_seq = seq;
+    g_scan_hits.clear();
+    std::vector<uint64_t> keys;
+    for (const auto& [game, mb] : g_m3)
+        if (mb.blas) {
+            keys.push_back(game);
+            keys.push_back(mb.blas->GetGPUVirtualAddress());
+        }
+    if (keys.empty()) return;
+    std::sort(keys.begin(), keys.end());
+    LARGE_INTEGER f, t0, t1;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    std::vector<uint8_t> buf(1024 * 64);
+    for (uint32_t i = 0; i < count; i += 1024) {
+        const uint32_t k = (std::min)(1024u, count - i);
+        const uint32_t got = GuardedPrivateRead(res, va + uint64_t(i) * 64, buf.data(), k * 64);
+        for (uint32_t j = 0; j < got / 64; ++j) {
+            uint64_t as;
+            memcpy(&as, buf.data() + size_t(j) * 64 + 56, 8);
+            if (std::binary_search(keys.begin(), keys.end(), as)) {
+                auto& v = g_scan_hits[as];
+                if (v.size() < 4) v.push_back(i + j);
             }
         }
-    };
-    for (uint32_t h : mb.hints)
-        if (h < count) {
-            const uint64_t as = at(h);
-            if (as && (as == a || as == b)) add(h);
-        }
-    const bool full_due = count <= 2048 || frame - mb.last_scan >= 30;
-    if (out.empty() && !full_due)
-        for (uint32_t h : mb.hints)
-            if (h < count) scan(h > 128 ? h - 128 : 0, (std::min)(count, h + 129));
-    if (full_due && (out.empty() || frame - mb.last_scan >= 30)) {
-        mb.last_scan = frame;
-        out.clear();
-        scan(0, count);
+        if (got < k * 64) break;
     }
-    if (!out.empty()) mb.hints = out;
+    QueryPerformanceCounter(&t1);
+    const uint64_t us = uint64_t((t1.QuadPart - t0.QuadPart) * 1000000 / (f.QuadPart ? f.QuadPart : 1));
+    ++g_scan_n;
+    g_scan_us += us;
+    g_scan_max_us = (std::max)(g_scan_max_us, us);
+}
+
+std::vector<uint32_t> FindInstances(const TlasRec& t, uint64_t a, uint64_t b)
+{
+    if (g_scan_seq != t.seq) M3ScanTlas(t.res, t.va, t.count, t.seq);
+    std::vector<uint32_t> out;
+    for (uint64_t k : { a, b }) {
+        const auto it = g_scan_hits.find(k);
+        if (it == g_scan_hits.end()) continue;
+        for (uint32_t i : it->second)
+            if (out.size() < 4 && std::find(out.begin(), out.end(), i) == out.end()) out.push_back(i);
+    }
     return out;
 }
 
@@ -1551,7 +1563,7 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
         // old BLAS)
         const bool     live = mb.ok && int32_t(frame - mb.built) <= int32_t(kM3Window) && int32_t(frame - mb.topo_frame) >= 3;
         const uint64_t ours = mb.blas->GetGPUVirtualAddress();
-        const auto     found = FindInstances(t.res, t.va, t.count, game, ours, mb, frame);
+        const auto     found = FindInstances(t, game, ours);
         Cover&         cv = cover[&mb];
         cv.live = live;
         cv.found = uint32_t(found.size());
@@ -1706,11 +1718,12 @@ void M3Summary()
     }
     g_log.Line(true,
         "RTM3SUM chars=%zu/%zu builds=%llu updates=%llu rays=%llu coverage=%llu/%llu (instance found %llu) redirects=%llu tlas_redirected=%llu "
-        "(before submit %llu) restores=%llu gates=%llu (opened without rays %llu) overwritten=%llu grave=%zu",
+        "(before submit %llu) restores=%llu gates=%llu (opened without rays %llu) overwritten=%llu grave=%zu scans=%llu (avg %llu us, max %llu us)",
         ok, g_m3.size(), (unsigned long long)g_m3_builds, (unsigned long long)g_m3_updates, (unsigned long long)g_m3_rays,
         (unsigned long long)covered, (unsigned long long)live, (unsigned long long)found, (unsigned long long)g_m3_redirects,
         (unsigned long long)g_m3_rebuilds, (unsigned long long)g_m3_unsubmitted, (unsigned long long)g_m3_restores,
-        (unsigned long long)g_gate_count, (unsigned long long)g_gate_early, (unsigned long long)g_m3_overwritten, g_m3_grave.size());
+        (unsigned long long)g_gate_count, (unsigned long long)g_gate_early, (unsigned long long)g_m3_overwritten, g_m3_grave.size(),
+        (unsigned long long)g_scan_n, (unsigned long long)(g_scan_n ? g_scan_us / g_scan_n : 0), (unsigned long long)g_scan_max_us);
     for (const auto& [g, mb] : g_m3)
         if (mb.ok || mb.rays_live)
             g_log.Line(true, "RTM3CHAR game=%llx ok=%d contrib=%d geometries=%u coverage=%llu/%llu found=%llu last_redirect=%d frame(s) ago builds=%u",
