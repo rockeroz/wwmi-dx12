@@ -40,6 +40,7 @@
 #include <share.h>
 #include <tuple>
 #include <wrl/client.h>
+#include <intrin.h>
 
 using namespace reshade::api;
 using Microsoft::WRL::ComPtr;
@@ -950,6 +951,7 @@ void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const ac
     ModBlas& mb = g_m3[game];
     mb.ok = false;
     // any return before the build below leaves the BLAS as it was; the next build is then a full one
+    const bool need_full = mb.need_full;
     mb.need_full = true;
     if (!g_dev5 && (!g_d3d12_device || FAILED(g_d3d12_device->QueryInterface(IID_PPV_ARGS(&g_dev5))))) {
         M3Refuse("no ID3D12Device5");
@@ -1055,7 +1057,9 @@ void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const ac
         cur_verts[g] = mb.verts[g];
         cur_flags[g] = mb.gflags[g];
     }
-    const bool full = topo || mb.need_full || !mb.built || mode == acceleration_structure_build_mode::build || mb.updates >= 300 ||
+    // rt_m3_update = 0: every build a full one (before this, every build was, by a bug: need_full was set before it was read)
+    static const bool s_updates = g_addon_ini_path.empty() || GetPrivateProfileIntW(L"wwmi-dx12", L"rt_m3_update", 1, g_addon_ini_path.c_str()) != 0;
+    const bool full = !s_updates || topo || need_full || !mb.built || mode == acceleration_structure_build_mode::build || mb.updates >= 300 ||
                       cur_cnt != mb.built_cnt || cur_verts != mb.built_verts || cur_flags != mb.built_flags;
     if (full) {
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pi{};
@@ -1136,7 +1140,49 @@ void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const ac
 // last one missed ~85 % of the time). g_m3_m held.
 uint32_t                                          g_scan_seq = 0;   // the TLAS (sequence) scanned
 std::unordered_map<uint64_t, std::vector<uint32_t>> g_scan_hits;    // BLAS address -> instance indices naming it
-uint64_t                                          g_scan_n = 0, g_scan_us = 0, g_scan_max_us = 0;
+uint64_t                                          g_scan_n = 0, g_scan_us = 0, g_scan_max_us = 0, g_scan_slow = 0;
+
+// The instances' BLAS addresses (+56 of each 64-byte descriptor) in the game's UPLOAD memory (write-combined: a plain
+// read is one uncached transaction per load). One 16-byte streaming load per instance (+48..+63) fetches its line in a
+// single transaction. No C++ objects here (SEH). Returns the hits written, or UINT32_MAX on a fault.
+uint32_t ScanAsStream(const uint8_t* p, uint32_t count, const uint64_t* keys, uint32_t nkeys, uint32_t* hit_idx, uint64_t* hit_as, uint32_t cap)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < count && n < cap; ++i) {
+        const uint8_t* q = p + size_t(i) * 64 + 48;
+        uint64_t       as;
+#if defined(_MSC_VER) && !defined(__clang__)
+        const __m128i v = _mm_stream_load_si128(reinterpret_cast<const __m128i*>(q));
+        as = uint64_t(_mm_cvtsi128_si64(_mm_unpackhi_epi64(v, v)));
+#else
+        memcpy(&as, q + 8, 8);
+#endif
+        uint32_t lo = 0, hi = nkeys;
+        while (lo < hi) {
+            const uint32_t mid = (lo + hi) / 2;
+            if (keys[mid] < as) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo < nkeys && keys[lo] == as) {
+            hit_idx[n] = i;
+            hit_as[n] = as;
+            ++n;
+        }
+    }
+    return n;
+}
+uint32_t GuardedScanAs(const uint8_t* p, uint32_t count, const uint64_t* keys, uint32_t nkeys, uint32_t* hit_idx, uint64_t* hit_as, uint32_t cap)
+{
+#ifdef _MSC_VER
+    __try {
+        return ScanAsStream(p, count, keys, nkeys, hit_idx, hit_as, cap);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return UINT32_MAX;
+    }
+#else
+    return ScanAsStream(p, count, keys, nkeys, hit_idx, hit_as, cap);
+#endif
+}
 
 void M3ScanTlas(ID3D12Resource* res, uint64_t va, uint32_t count, uint32_t seq)
 {
@@ -1153,19 +1199,38 @@ void M3ScanTlas(ID3D12Resource* res, uint64_t va, uint32_t count, uint32_t seq)
     LARGE_INTEGER f, t0, t1;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&t0);
-    std::vector<uint8_t> buf(1024 * 64);
-    for (uint32_t i = 0; i < count; i += 1024) {
-        const uint32_t k = (std::min)(1024u, count - i);
-        const uint32_t got = GuardedPrivateRead(res, va + uint64_t(i) * 64, buf.data(), k * 64);
-        for (uint32_t j = 0; j < got / 64; ++j) {
-            uint64_t as;
-            memcpy(&as, buf.data() + size_t(j) * 64 + 56, 8);
-            if (std::binary_search(keys.begin(), keys.end(), as)) {
-                auto& v = g_scan_hits[as];
-                if (v.size() < 4) v.push_back(i + j);
+    constexpr uint32_t    kCap = 256;
+    uint32_t              hit_idx[kCap];
+    uint64_t              hit_as[kCap];
+    uint32_t              got = UINT32_MAX;
+    const uint8_t*        p = MapUpload(res, va, uint64_t(count) * 64);
+    if (p) {
+        if ((reinterpret_cast<uintptr_t>(p) & 15) == 0) got = GuardedScanAs(p, count, keys.data(), uint32_t(keys.size()), hit_idx, hit_as, kCap);
+        UnmapUpload(res);
+    }
+    if (got == UINT32_MAX) {
+        // not mappable / unaligned / faulted: plain chunked reads
+        got = 0;
+        std::vector<uint8_t> buf(1024 * 64);
+        for (uint32_t i = 0; i < count && got < kCap; i += 1024) {
+            const uint32_t k = (std::min)(1024u, count - i);
+            const uint32_t r = GuardedPrivateRead(res, va + uint64_t(i) * 64, buf.data(), k * 64);
+            for (uint32_t j = 0; j < r / 64 && got < kCap; ++j) {
+                uint64_t as;
+                memcpy(&as, buf.data() + size_t(j) * 64 + 56, 8);
+                if (std::binary_search(keys.begin(), keys.end(), as)) {
+                    hit_idx[got] = i + j;
+                    hit_as[got] = as;
+                    ++got;
+                }
             }
+            if (r < k * 64) break;
         }
-        if (got < k * 64) break;
+        ++g_scan_slow;
+    }
+    for (uint32_t h = 0; h < got; ++h) {
+        auto& v = g_scan_hits[hit_as[h]];
+        if (v.size() < 4) v.push_back(hit_idx[h]);
     }
     QueryPerformanceCounter(&t1);
     const uint64_t us = uint64_t((t1.QuadPart - t0.QuadPart) * 1000000 / (f.QuadPart ? f.QuadPart : 1));
@@ -1721,12 +1786,13 @@ void M3Summary()
     }
     g_log.Line(true,
         "RTM3SUM chars=%zu/%zu builds=%llu updates=%llu rays=%llu coverage=%llu/%llu (instance found %llu) redirects=%llu tlas_redirected=%llu "
-        "(before submit %llu) restores=%llu gates=%llu (opened without rays %llu) overwritten=%llu grave=%zu scans=%llu (avg %llu us, max %llu us)",
+        "(before submit %llu) restores=%llu gates=%llu (opened without rays %llu) overwritten=%llu grave=%zu scans=%llu (avg %llu us, max %llu us, slow path %llu)",
         ok, g_m3.size(), (unsigned long long)g_m3_builds, (unsigned long long)g_m3_updates, (unsigned long long)g_m3_rays,
         (unsigned long long)covered, (unsigned long long)live, (unsigned long long)found, (unsigned long long)g_m3_redirects,
         (unsigned long long)g_m3_rebuilds, (unsigned long long)g_m3_unsubmitted, (unsigned long long)g_m3_restores,
         (unsigned long long)g_gate_count, (unsigned long long)g_gate_early, (unsigned long long)g_m3_overwritten, g_m3_grave.size(),
-        (unsigned long long)g_scan_n, (unsigned long long)(g_scan_n ? g_scan_us / g_scan_n : 0), (unsigned long long)g_scan_max_us);
+        (unsigned long long)g_scan_n, (unsigned long long)(g_scan_n ? g_scan_us / g_scan_n : 0), (unsigned long long)g_scan_max_us,
+        (unsigned long long)g_scan_slow);
     for (const auto& [g, mb] : g_m3)
         if (mb.ok || mb.rays_live)
             g_log.Line(true, "RTM3CHAR game=%llx ok=%d contrib=%d geometries=%u coverage=%llu/%llu found=%llu last_redirect=%d frame(s) ago builds=%u",
