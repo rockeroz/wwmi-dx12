@@ -358,7 +358,13 @@ bool LoadMesh(Mesh& m) // g_m NOT held (file and GPU work); the caller publishes
         vg.bytes.clear();
         m.vg_stride = 0;
     }
-    if (!m.verts || !m.indices || (m.blend_stride != 8 && m.blend_stride != 16 && m.blend_stride != 32) || blend.bytes.size() < size_t(m.verts) * m.blend_stride ||
+    // Blend stride 32 is not 16 byte influences: seen as 8 R16_UINT bone ids + 8 R16_UNORM weights addressing a skeleton the
+    // mod builds itself (its own compute shader and bone maps, e.g. Hsin "Moonover Fox"): our palettes cannot pose it
+    if (m.blend_stride == 32) {
+        m.why = "custom blend format (stride 32: 16-bit bone ids into a skeleton the mod builds itself) not supported";
+        return false;
+    }
+    if (!m.verts || !m.indices || (m.blend_stride != 8 && m.blend_stride != 16) || blend.bytes.size() < size_t(m.verts) * m.blend_stride ||
         vec.stride != 8 || vec.bytes.size() < size_t(m.verts) * 8 || !m.uv_stride || (m.uv_stride & 3) ||
         uv.bytes.size() < size_t(m.verts) * m.uv_stride) {
         m.why = "unexpected mesh layout";
