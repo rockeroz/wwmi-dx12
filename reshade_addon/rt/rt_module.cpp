@@ -1795,75 +1795,84 @@ void M4Apply(device* dev, const ModBlas& mb, const RecTx& tx, uint64_t stride, u
             if (!g_heap_to_res.find({ ts.heap, ts.base + k }, ri) || !ri.view_handle) break;
             const resource_view_desc vd = dev->get_resource_view_desc(resource_view{ ri.view_handle });
             if (vd.type == resource_view_type::buffer || vd.type == resource_view_type::unknown) break;
-            ID3D12Resource* res = ri.swapped ? ri.swapped : ri.res;
-            if (!res) continue;
-            bool is_mod;
-            {
-                std::shared_lock l(g_tex_mutex);
-                is_mod = g_modtex_res.count(reinterpret_cast<uint64_t>(res)) != 0;
-            }
-            if (detail.size() < 1400) {
-                char b[64];
-                snprintf(b, sizeof b, " [%u %p h%08x ", k, (void*)res, TexHashOf(reinterpret_cast<uint64_t>(res)));
-                detail += b;
-                detail += TexDesc(res);
-                detail += is_mod ? " MOD]" : "";
-            }
-            if (is_mod) {
+            // a slot the core already gave a mod texture (placement swap in this table): as it is
+            if (ri.swapped && ri.swapped != ri.res) {
                 ++tex_mod;
+                if (detail.size() < 1400) {
+                    char b[64];
+                    snprintf(b, sizeof b, " [%u %p ALREADY-SWAPPED]", k, (void*)ri.swapped);
+                    detail += b;
+                }
                 continue;
             }
-            // the raster's own resolution (draw_texswap.cpp): the texture's hash selected in the mod's namespace, else the
-            // target it is a lower mip of (a streamed-out texture: the RT tables often hold the 64x64 mip tail)
+            ID3D12Resource* res = ri.res; // the game's texture
+            if (!res) continue;
+            bool target; // a texture some mod replaces (g_modtex_res: GAME resources the mods target, not mod textures)
+            {
+                std::shared_lock l(g_tex_mutex);
+                target = g_modtex_res.count(reinterpret_cast<uint64_t>(res)) != 0;
+            }
             const uint32_t hash = TexHashOf(reinterpret_cast<uint64_t>(res));
+            if (detail.size() < 1400) {
+                char b[64];
+                snprintf(b, sizeof b, " [%u %p h%08x ", k, (void*)res, hash);
+                detail += b;
+                detail += TexDesc(res);
+                detail += target ? " target" : "";
+            }
+            const auto put = [&](D3D12_CPU_DESCRIPTOR_HANDLE src, uint32_t& counter, const char* how) {
+                g_d3d12_device->CopyDescriptorsSimple(1, { cpu0 + SIZE_T(ts.base + k) * inc }, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                ++counter;
+                if (detail.size() < 1400) detail += how;
+            };
+            // 1. what the raster's draw of this section binds over this game texture at draw time (section ps-tN stamps,
+            //    RabbitFX maps): it wins over placement in the raster too
+            {
+                D3D12_CPU_DESCRIPTOR_HANDLE st{};
+                if (SlotTexFor(mb.pose_mod[g], int(g), res, &st)) {
+                    put(st, tex_slot, " SLOT]");
+                    continue;
+                }
+            }
+            // 2. the raster's placement resolution (texture_module.cpp GlobalTexSwap / draw_texswap.cpp): the hash selected
+            //    in the mod's namespace, the global selection, or the target it is a lower mip of
             if (hash) {
                 const int      dm = mb.pose_mod[g];
                 const wchar_t* own_ns = dm >= 0 && size_t(dm) < g_geomods.size() && !g_geomods[size_t(dm)].wcl_ns.empty()
                     ? g_geomods[size_t(dm)].wcl_ns.c_str() : nullptr;
                 ModLoader::TexEntry e;
-                const char*         how = nullptr;
-                if (ModLoader::TexEntryAt(TexSelectIdxNs(hash, own_ns), &e) && e.srv.ptr) how = " RULE]";
-                else if (const uint32_t tgt = TexLodTargetOf(hash); tgt && ModLoader::TexEntryAt(TexSelectIdxNs(tgt, own_ns), &e) && e.srv.ptr)
-                    how = " RULE-LOWER-MIP]";
-                if (how) {
-                    g_d3d12_device->CopyDescriptorsSimple(1, { cpu0 + SIZE_T(ts.base + k) * inc }, e.srv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-                    ++tex_sw;
-                    if (how[5] == '-') ++tex_lod;
-                    if (detail.size() < 1400) detail += how;
+                if (ModLoader::TexEntryAt(TexSelectIdxNs(hash, own_ns), &e) && e.srv.ptr) {
+                    put(e.srv, tex_sw, " RULE]");
+                    continue;
+                }
+                if (const uint32_t rule = TexRuleHashFor(hash)) {
+                    const D3D12_CPU_DESCRIPTOR_HANDLE src = TexReplacement(rule);
+                    if (src.ptr) {
+                        put(src, tex_sw, " RULE-GLOBAL]");
+                        continue;
+                    }
+                }
+                if (const uint32_t tgt = TexLodTargetOf(hash); tgt && ModLoader::TexEntryAt(TexSelectIdxNs(tgt, own_ns), &e) && e.srv.ptr) {
+                    ++tex_lod;
+                    put(e.srv, tex_sw, " RULE-LOWER-MIP]");
                     continue;
                 }
             }
+            // 3. the mod texture the core placed in the raster's slot of the same game texture
             {
                 D3D12_CPU_DESCRIPTOR_HANDLE rs{};
                 if (RasterSwapFor(mb.pose_mod[g], res, &rs)) {
-                    g_d3d12_device->CopyDescriptorsSimple(1, { cpu0 + SIZE_T(ts.base + k) * inc }, rs, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-                    ++tex_rsw;
-                    if (detail.size() < 1400) detail += " RASTER-SWAP]";
+                    put(rs, tex_rsw, " RASTER-SWAP]");
                     continue;
                 }
             }
-            const uint32_t rule = TexRuleHashFor(hash);
-            if (!rule) {
-                D3D12_CPU_DESCRIPTOR_HANDLE st{};
-                if (SlotTexFor(mb.pose_mod[g], int(g), res, &st)) {
-                    g_d3d12_device->CopyDescriptorsSimple(1, { cpu0 + SIZE_T(ts.base + k) * inc }, st, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-                    ++tex_slot;
-                    if (detail.size() < 1400) detail += " SLOT]";
-                    continue;
-                }
-                ++tex_none;
-                if (detail.size() < 1400) detail += RasterKept(mb.pose_mod[g], res) ? " kept-by-raster]" : " NOT-IN-RASTER]";
-                continue;
-            }
-            const D3D12_CPU_DESCRIPTOR_HANDLE src = TexReplacement(rule);
-            if (!src.ptr) {
+            if (target) {
                 ++tex_nosrv;
-                if (detail.size() < 1400) detail += " rule-without-texture]";
+                if (detail.size() < 1400) detail += " target-unresolved]";
                 continue;
             }
-            g_d3d12_device->CopyDescriptorsSimple(1, { cpu0 + SIZE_T(ts.base + k) * inc }, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            ++tex_sw;
-            if (detail.size() < 1400) detail += " RULE]";
+            ++tex_none;
+            if (detail.size() < 1400) detail += RasterKept(mb.pose_mod[g], res) ? " kept-by-raster]" : " NOT-IN-RASTER]";
         }
         g_m4_tex_mod += tex_mod;
         g_m4_tex_swapped += tex_sw;
@@ -1874,7 +1883,7 @@ void M4Apply(device* dev, const ModBlas& mb, const RecTx& tx, uint64_t stride, u
         g_m4_tex_rsw += tex_rsw;
         if (!what.empty()) {
             char t[128];
-            snprintf(t, sizeof t, " | textures: %u mod already, %u swapped, %u from slot stamps, %u no rule, %u rule without texture", tex_mod, tex_sw,
+            snprintf(t, sizeof t, " | textures: %u already swapped, %u by rule, %u from slot stamps, %u game's, %u target unresolved", tex_mod, tex_sw,
                 tex_slot, tex_none, tex_nosrv);
             what += t;
             ++g_m4_tables;
@@ -2139,8 +2148,8 @@ void M3Summary()
         slot_maps = g_slot_tex.size();
         slot_notes = g_slot_tex_notes;
     }
-    g_log.Line(true, "RTM4SUM rt_m4=%d tables rewritten=%llu slots=%llu textures: mod already %llu, swapped %llu (lower mip %llu), as the raster's slots %llu, from slot stamps %llu, no rule %llu, "
-        "rule without texture %llu | slot stamps noted %llu (%zu game->mod pairs)",
+    g_log.Line(true, "RTM4SUM rt_m4=%d tables rewritten=%llu slots=%llu textures: already swapped %llu, by rule %llu (lower mip %llu), as the raster's slots %llu, from slot stamps %llu, game's %llu, "
+        "target unresolved %llu | slot stamps noted %llu (%zu game->mod pairs)",
         M4Mode(), (unsigned long long)g_m4_tables, (unsigned long long)g_m4_slots, (unsigned long long)g_m4_tex_mod, (unsigned long long)g_m4_tex_swapped,
         (unsigned long long)g_m4_tex_lod, (unsigned long long)g_m4_tex_rsw, (unsigned long long)g_m4_tex_slot, (unsigned long long)g_m4_tex_norule, (unsigned long long)g_m4_tex_nosrv, (unsigned long long)slot_notes, slot_maps);
     std::string fw;
