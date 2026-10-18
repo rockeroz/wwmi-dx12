@@ -1602,6 +1602,57 @@ void M3GateSubmit(command_queue* queue, TlasRec& t)
     ++g_gate_count;
 }
 
+// M4 (observe): what a character's material records point at -- the local SRV table (+64: the vertex factory's buffers,
+// then the material's textures, in t-register order) and the local CBVs (+80 on: cb0.., one is LocalVF) -- once per
+// character, geometry and ray type. g_m3_m held.
+void M4Observe(device* dev, uint64_t game, const ModBlas& mb, const RecTx& tx, uint64_t stride)
+{
+    static std::set<std::tuple<uint64_t, uint32_t, uint32_t>> s_seen;
+    if (!dev || s_seen.size() >= 96) return;
+    for (uint32_t i = 0; i < mb.geoms * 3 && (i + 1) * stride <= tx.orig.size(); ++i) {
+        const uint8_t* r = tx.orig.data() + size_t(i) * stride;
+        uint64_t       tab = 0, smp = 0;
+        memcpy(&tab, r + 64, 8);
+        memcpy(&smp, r + 72, 8);
+        if (!tab || !s_seen.insert({ game, i / 3, i % 3 }).second) continue;
+        const TableStart ts = TableStartOf(dev, descriptor_table{ tab });
+        std::string      slots;
+        for (uint32_t k = 0; ts && k < 16 && slots.size() < 700; ++k) {
+            ResInfo ri{};
+            if (!g_heap_to_res.find({ ts.heap, ts.base + k }, ri) || !ri.view_handle) {
+                slots += " [" + std::to_string(k) + ": ?]";
+                continue;
+            }
+            const resource_view_desc vd = dev->get_resource_view_desc(resource_view{ ri.view_handle });
+            char b[128];
+            snprintf(b, sizeof b, " [%u: %s fmt %u va %llx n %llu%s]", k, vd.type == resource_view_type::buffer ? "buf" : "tex", uint32_t(vd.format),
+                (unsigned long long)ri.cached_va, (unsigned long long)(vd.type == resource_view_type::buffer ? vd.buffer.size : 0),
+                rtskin::RingKey(ri.cached_va) ? " RING" : "");
+            slots += b;
+        }
+        std::string cbs;
+        for (uint64_t o = 80; o + 8 <= stride && o < 128; o += 8) {
+            uint64_t va = 0;
+            memcpy(&va, r + o, 8);
+            if (!va) break;
+            ID3D12Resource* res = nullptr;
+            uint64_t        rva = 0;
+            uint32_t        w[6] = {};
+            const bool      rd = ResOfVa(resource{ 0 }, va, &res, &rva) && GuardedPrivateRead(res, va, reinterpret_cast<uint8_t*>(w), 24) == 24;
+            char            b[160];
+            if (rd)
+                snprintf(b, sizeof b, " cb%u=%llx {%x %x %x %x %x %x}", uint32_t((o - 80) / 8), (unsigned long long)va, w[0], w[1], w[2], w[3], w[4], w[5]);
+            else
+                snprintf(b, sizeof b, " cb%u=%llx", uint32_t((o - 80) / 8), (unsigned long long)va);
+            cbs += b;
+        }
+        g_log.Line(true, "RTM4 table game=%llx geometry %u ray type %u: heap=%llx base=%u%s", (unsigned long long)game, i / 3, i % 3,
+            (unsigned long long)ts.heap, ts.base, slots.c_str());
+        g_log.Line(true, "RTM4 cbv   game=%llx geometry %u ray type %u: sampler table %llx%s", (unsigned long long)game, i / 3, i % 3,
+            (unsigned long long)smp, cbs.c_str());
+    }
+}
+
 // DispatchRays (rt_m3=1). The TLAS these rays trace (the newest built) is still gated: every instance naming a
 // character's BLAS whose records are the character's (and of a kind whose records were) is pointed at our BLAS in the
 // game's own instance memory, its records at our buffers -- all or none -- and the gate opens. A TLAS whose gate is
@@ -1677,6 +1728,7 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
             mb.contrib = contrib;
             RecTx      tx;
             const bool valid = src && M3Records(mb, rd, rd_va, hit_size, hit_stride, contrib, &tx);
+            if (valid && as != ours) M4Observe(cmd_list->get_device(), game, mb, tx, hit_stride);
             if (as == ours) {
                 // already ours (this frame's first dispatch, or left from an earlier frame): its records must follow
                 if (valid) {
