@@ -113,6 +113,8 @@ void RtNoteRays(reshade::api::command_list* cmd_list, reshade::api::resource rg_
 // A raster draw of mod component (mod, comp) stamped its texture over the game's texture `game` (section_ps_stamp.cpp):
 // M4 puts the same texture in that section's ray tracing material table.
 void RtNoteSlotTexture(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRIPTOR_HANDLE src, ID3D12Resource* mod_res);
+// ...and a game texture it reads unstamped (diagnostic: RTM4 tex tells these from textures the raster never reads).
+void RtNoteKeptTexture(int mod, int comp, ID3D12Resource* game);
 // Once per frame from the present path, while the add-on is enabled: the module's hold transitions
 // (entering the hold gives every stamped texture slot back to the game) and its periodic work.
 void RtPresentTick();

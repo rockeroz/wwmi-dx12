@@ -189,7 +189,11 @@ SectionPsStamps PlanSectionPsSlots(command_list* cmd_list, uint32_t gen0, const 
         const RegBind& b = t_ps[r];
         if (b.param == 0xFF || b.param >= 64 || !b.is_table) continue;
         const TableStart ts = TableStartOf(dev, gs.root[b.param].table);
-        if (ts) read_as_bound.push_back(HeapKey{ ts.heap, ts.base + b.offset });
+        if (ts) {
+            read_as_bound.push_back(HeapKey{ ts.heap, ts.base + b.offset });
+            ResInfo kri{};
+            if (g_heap_to_res.find({ ts.heap, ts.base + b.offset }, kri) && kri.res) RtNoteKeptTexture(dm, comp, kri.res);
+        }
     }
     {
         std::lock_guard l(g_stamped_mtx);
