@@ -105,7 +105,8 @@ struct Mesh {
     int                                             mod = -1;
     bool                                            ready = false, failed = false;
     std::string                                     why;
-    ComPtr<ID3D12Resource>                          idx, pos, blend, vec, uv, color;
+    ComPtr<ID3D12Resource>                          idx, pos, blend, vec, uv, color, vg; // vg: 16-bit bone ids (blend remap)
+    uint32_t                                        vg_stride = 0;
     uint32_t                                        verts = 0, indices = 0, influences = 0, blend_stride = 0, uv_stride = 0;
     bool                                            has_color = false;
     std::vector<Slot>                               slots;
@@ -276,6 +277,15 @@ D3D12_CPU_DESCRIPTOR_HANDLE MakeView(ID3D12Resource* res, DXGI_FORMAT fmt, uint6
 }
 
 // ---- mesh loading (present thread) --------------------------------------------------------------------------
+std::string Narrow(const std::wstring& w)
+{
+    if (w.empty()) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), int(w.size()), nullptr, 0, nullptr, nullptr);
+    std::string s(size_t(n > 0 ? n : 0), '\0');
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), int(w.size()), s.data(), n, nullptr, nullptr);
+    return s;
+}
+
 bool LoadMesh(Mesh& m) // g_m NOT held (file and GPU work); the caller publishes
 {
     if (m.mod < 0 || size_t(m.mod) >= g_geomods.size()) {
@@ -298,12 +308,13 @@ bool LoadMesh(Mesh& m) // g_m NOT held (file and GPU work); the caller publishes
         { L"ResourceIndexBuffer", &m.idx, true, {} },       { L"ResourcePositionBuffer", &m.pos, true, {} },
         { L"ResourceBlendBuffer", &m.blend, true, {} },     { L"ResourceVectorBuffer", &m.vec, true, {} },
         { L"ResourceTexcoordBuffer", &m.uv, true, {} },     { L"ResourceColorBuffer", &m.color, false, {} },
+        { L"ResourceBlendRemapVertexVGBuffer", &m.vg, false, {} },
     };
     for (Src& s : src) {
         const WwmiMod::Resource* r = WwmiMod::Find(mod, s.name);
         if (!r || r->filename.empty()) {
             if (s.required) {
-                m.why = "no file for a required buffer";
+                m.why = "no file for " + Narrow(s.name);
                 return false;
             }
             continue;
@@ -311,20 +322,29 @@ bool LoadMesh(Mesh& m) // g_m NOT held (file and GPU work); the caller publishes
         s.bytes = WwmiReadFile(r->filename.c_str());
         s.stride = r->stride;
         if (s.bytes.empty() && s.required) {
-            m.why = "could not read a mesh file";
+            m.why = "could not read " + Narrow(r->filename);
             return false;
         }
     }
-    Src &idx = src[0], &pos = src[1], &blend = src[2], &vec = src[3], &uv = src[4], &col = src[5];
+    Src &idx = src[0], &pos = src[1], &blend = src[2], &vec = src[3], &uv = src[4], &col = src[5], &vg = src[6];
     m.verts = uint32_t(pos.bytes.size() / 12);
     m.indices = uint32_t(idx.bytes.size() / 4);
     m.blend_stride = blend.stride;
     m.influences = blend.stride / 2;
     m.uv_stride = uv.stride;
     m.ncomps = uint32_t(mod.comps.size());
+    // WWMI blend remap: Blend.buf's byte ids cannot reach merged-skeleton bones past 255; BlendRemapVertexVG.buf has
+    // every influence's 16-bit id in the merged skeleton, which our palette is (no per-component remapped skeleton)
+    m.vg_stride = blend.stride ? blend.stride : 0;
+    if (vg.bytes.empty() || !m.blend_stride || vg.bytes.size() < size_t(m.verts) * m.blend_stride) {
+        vg.bytes.clear();
+        m.vg_stride = 0;
+    }
+    bool any_remap = false;
     for (const WwmiMod::Component& wc : mod.comps) {
-        if (wc.remapped) {
-            m.why = "remapped skeleton (BlendRemap) not supported yet";
+        any_remap = any_remap || wc.remapped;
+        if (wc.remapped && !m.vg_stride) {
+            m.why = "remapped skeleton (BlendRemap) without a usable BlendRemapVertexVG buffer";
             return false;
         }
         if (wc.vg_count) {
@@ -334,7 +354,11 @@ bool LoadMesh(Mesh& m) // g_m NOT held (file and GPU work); the caller publishes
     }
     m.has_color = !col.bytes.empty() && col.stride == 4 && col.bytes.size() >= size_t(m.verts) * 4;
     if (!m.has_color) col.bytes.clear();
-    if (!m.verts || !m.indices || (m.blend_stride != 8 && m.blend_stride != 16) || blend.bytes.size() < size_t(m.verts) * m.blend_stride ||
+    if (!any_remap) { // ids < 256: Blend.buf's bytes as always
+        vg.bytes.clear();
+        m.vg_stride = 0;
+    }
+    if (!m.verts || !m.indices || (m.blend_stride != 8 && m.blend_stride != 16 && m.blend_stride != 32) || blend.bytes.size() < size_t(m.verts) * m.blend_stride ||
         vec.stride != 8 || vec.bytes.size() < size_t(m.verts) * 8 || !m.uv_stride || (m.uv_stride & 3) ||
         uv.bytes.size() < size_t(m.verts) * m.uv_stride) {
         m.why = "unexpected mesh layout";
@@ -975,7 +999,7 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         // pose: COMMON | read -> UAV, dispatch, -> read
         const D3D12_RESOURCE_STATES from = bind->state == 2 ? kRead : D3D12_RESOURCE_STATE_COMMON;
         if (bind->state != 1) Transition(cl, sl.pos.Get(), sl.tan.Get(), from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        const uint32_t consts[12] = { s2, c, m.verts, palette_bones, m.influences, m.blend_stride, 0u, 0u, 0u, 0u, 0u, 0u };
+        const uint32_t consts[12] = { s2, c, m.verts, palette_bones, m.influences, m.blend_stride, 0u, 0u, 0u, m.vg ? m.vg_stride : 0u, 0u, 0u };
         cl->SetComputeRootSignature(g_rs.Get());
         cl->SetPipelineState(g_pso.Get());
         cl->SetComputeRoot32BitConstants(0, 12, consts, 0);
@@ -984,8 +1008,9 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         cl->SetComputeRootShaderResourceView(3, m.blend->GetGPUVirtualAddress());
         cl->SetComputeRootShaderResourceView(4, m.vec->GetGPUVirtualAddress());
         cl->SetComputeRootShaderResourceView(5, palette_va);
-        cl->SetComputeRootUnorderedAccessView(6, sl.pos->GetGPUVirtualAddress());
-        cl->SetComputeRootUnorderedAccessView(7, sl.tan->GetGPUVirtualAddress());
+        cl->SetComputeRootShaderResourceView(6, (m.vg ? m.vg : m.blend)->GetGPUVirtualAddress());
+        cl->SetComputeRootUnorderedAccessView(7, sl.pos->GetGPUVirtualAddress());
+        cl->SetComputeRootUnorderedAccessView(8, sl.tan->GetGPUVirtualAddress());
         cl->Dispatch((c + 63) / 64, 1, 1);
         RemovalPin::Ours(cl, "rt-m2 skin");
         Transition(cl, sl.pos.Get(), sl.tan.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
@@ -1069,7 +1094,35 @@ bool PoseFor(uint64_t ring, int comp, uint32_t frame, GeomPose* out)
     out->indices = m.indices;
     out->ranges = best->ranges;
     out->frame = g.frame;
+    out->slot = best->slot;
     return true;
+}
+
+bool MakeVfViews(int mod, int slot, uint32_t uv_fmt, VfViews* out)
+{
+    std::lock_guard l(g_m);
+    auto            mi = g_meshes.find(mod);
+    if (mi == g_meshes.end() || !mi->second.ready || !out) return false;
+    Mesh& m = mi->second;
+    *out = VfViews{};
+    const uint32_t fb = uv_fmt == uint32_t(DXGI_FORMAT_R16G16_FLOAT) ? 4u : uv_fmt == uint32_t(DXGI_FORMAT_R32G32_FLOAT) ? 8u : 0u;
+    if (fb && m.uv && m.uv_stride % fb == 0) {
+        auto& v = m.uv_views[uv_fmt];
+        if (!v.ptr) v = MakeView(m.uv.Get(), DXGI_FORMAT(uv_fmt), 0, m.verts * (m.uv_stride / fb));
+        out->uv = v;
+        out->uv_channels = m.uv_stride / fb;
+    }
+    if (slot >= 0 && size_t(slot) < m.slots.size() && m.slots[size_t(slot)].tan) {
+        Slot& sl = m.slots[size_t(slot)];
+        if (!sl.tan_view.ptr) sl.tan_view = MakeView(sl.tan.Get(), DXGI_FORMAT_R16G16B16A16_SNORM, 0, m.verts * 2);
+        out->tan = sl.tan_view;
+    }
+    if (m.has_color && m.color) {
+        auto& v = m.color_views[uint32_t(format::r8g8b8a8_unorm)];
+        if (!v.ptr) v = MakeView(m.color.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 0, m.verts);
+        out->col = v;
+    }
+    return out->uv.ptr || out->tan.ptr || out->col.ptr;
 }
 
 std::string Status()

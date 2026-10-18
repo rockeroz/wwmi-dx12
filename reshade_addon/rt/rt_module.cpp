@@ -795,6 +795,7 @@ struct ModBlas {
     uint64_t                                                blas_cap = 0, scratch_cap = 0;
     std::vector<uint64_t>                                   vb;
     std::vector<uint32_t>                                   verts, ib_off, ib_cnt, gflags;
+    std::vector<int>                                        pose_mod, pose_slot; // M4: whose pose each geometry is (-1 none)
     std::vector<std::vector<std::pair<uint32_t, uint32_t>>> sig;     // the topology built: ranges per geometry
     std::vector<ID3D12Resource*>                            sig_idx; // ...of which mod index buffer
     uint32_t                                                built = 0, updates = 0, builds = 0;
@@ -1026,6 +1027,13 @@ void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const ac
     mb.gflags = gflags;
     mb.vb.resize(n);
     mb.verts.resize(n);
+    mb.pose_mod.assign(n, -1);
+    mb.pose_slot.assign(n, -1);
+    for (uint32_t g = 0; g < n; ++g)
+        if (poses[g].mod >= 0) {
+            mb.pose_mod[g] = poses[g].mod;
+            mb.pose_slot[g] = poses[g].slot;
+        }
     for (uint32_t g = 0; g < n; ++g) {
         mb.vb[g] = poses[g].mod >= 0 ? poses[g].pos_va : any_vb;
         mb.verts[g] = poses[g].mod >= 0 ? poses[g].verts : any_verts;
@@ -1653,6 +1661,77 @@ void M4Observe(device* dev, uint64_t game, const ModBlas& mb, const RecTx& tx, u
     }
 }
 
+// M4: the vertex factory slots of a character's material records -- the leading buffer views of each record's local
+// SRV table (UVs R16G16_FLOAT / R32G32_FLOAT, tangents R16G16B16A16_SNORM, colors R8G8B8A8) -- rewritten in place, in the
+// game's (this frame's) descriptor heap, to the mod's UVs / posed tangents / colors, so a hit on our BLAS reads the
+// mod's attributes at the mod's vertex indices. Only once the records and instances are ours. rt_m4 = 0: off. g_m3_m.
+uint64_t g_m4_tables = 0, g_m4_slots = 0;
+int      M4Mode()
+{
+    static int s = -1;
+    if (s < 0 && !g_addon_ini_path.empty()) s = GetPrivateProfileIntW(L"wwmi-dx12", L"rt_m4", 1, g_addon_ini_path.c_str()) != 0 ? 1 : 0;
+    return s < 0 ? 1 : s;
+}
+void M4Apply(device* dev, const ModBlas& mb, const RecTx& tx, uint64_t stride, uint64_t game)
+{
+    if (!dev || !M4Mode() || !g_d3d12_device) return;
+    static uint32_t                                s_frame = 0;
+    static std::set<std::pair<uint64_t, uint32_t>> s_done; // tables rewritten this frame (shared by ray types)
+    if (s_frame != g_frame_id) {
+        s_frame = g_frame_id;
+        s_done.clear();
+    }
+    const UINT inc = g_d3d12_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    for (uint32_t i = 0; i < mb.geoms * 3 && (i + 1) * stride <= tx.mine.size(); ++i) {
+        const uint32_t g = i / 3;
+        if (g >= mb.pose_mod.size() || mb.pose_mod[g] < 0) continue; // a section the mod does not draw
+        uint64_t tab = 0;
+        memcpy(&tab, tx.mine.data() + size_t(i) * stride + 64, 8);
+        if (!tab) continue;
+        const TableStart ts = TableStartOf(dev, descriptor_table{ tab });
+        if (!ts || !s_done.insert({ ts.heap, ts.base }).second) continue;
+        auto*          heap = ts.Heap();
+        const SIZE_T   cpu0 = heap->GetCPUDescriptorHandleForHeapStart().ptr;
+        rtskin::VfViews v{};
+        uint32_t        vfmt = 0;
+        std::string     what;
+        for (uint32_t k = 0; k < 8; ++k) { // the vertex factory's buffers lead the table; the first texture ends them
+            ResInfo ri{};
+            if (!g_heap_to_res.find({ ts.heap, ts.base + k }, ri) || !ri.view_handle) break;
+            const resource_view_desc vd = dev->get_resource_view_desc(resource_view{ ri.view_handle });
+            if (vd.type != resource_view_type::buffer) break;
+            const uint32_t fmt = uint32_t(vd.format);
+            const bool     uv = fmt == uint32_t(DXGI_FORMAT_R16G16_FLOAT) || fmt == uint32_t(DXGI_FORMAT_R32G32_FLOAT);
+            if (uv && vfmt != fmt) {
+                rtskin::MakeVfViews(mb.pose_mod[g], mb.pose_slot[g], fmt, &v);
+                vfmt = fmt;
+            } else if (!vfmt) {
+                rtskin::MakeVfViews(mb.pose_mod[g], mb.pose_slot[g], 0, &v);
+                vfmt = 1;
+            }
+            D3D12_CPU_DESCRIPTOR_HANDLE src{};
+            const char*                 tag = nullptr;
+            if (uv) src = v.uv, tag = "uv";
+            else if (fmt == uint32_t(DXGI_FORMAT_R16G16B16A16_SNORM)) src = v.tan, tag = "tan";
+            else if (fmt == uint32_t(DXGI_FORMAT_R8G8B8A8_UNORM) || fmt == uint32_t(DXGI_FORMAT_B8G8R8A8_UNORM)) src = v.col, tag = "col";
+            if (!src.ptr) continue;
+            g_d3d12_device->CopyDescriptorsSimple(1, { cpu0 + SIZE_T(ts.base + k) * inc }, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            ++g_m4_slots;
+            what += " ";
+            what += std::to_string(k);
+            what += "=";
+            what += tag;
+        }
+        if (!what.empty()) {
+            ++g_m4_tables;
+            static std::atomic<uint32_t> s_log{ 0 };
+            if (s_log.fetch_add(1) < 24)
+                g_log.Line(true, "RTM4 vf game=%llx geometry %u ray type %u: table %llx+%u ->%s (mod %d slot %d, %u uv channel(s))", (unsigned long long)game, g,
+                    i % 3, (unsigned long long)ts.heap, ts.base, what.c_str(), mb.pose_mod[g], mb.pose_slot[g], v.uv_channels);
+        }
+    }
+}
+
 // DispatchRays (rt_m3=1). The TLAS these rays trace (the newest built) is still gated: every instance naming a
 // character's BLAS whose records are the character's (and of a kind whose records were) is pointed at our BLAS in the
 // game's own instance memory, its records at our buffers -- all or none -- and the gate opens. A TLAS whose gate is
@@ -1701,6 +1780,7 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
     };
     std::vector<Cand>  cands;    // to point at our BLAS (gate closed)
     std::vector<RecTx> txs;      // records to make ours: the candidates', then those of instances naming ours already
+    std::vector<std::pair<ModBlas*, uint64_t>> tx_owner; // each RecTx's character (M4)
     std::vector<Cand>  stale;    // instances naming ours whose records cannot follow
     std::vector<Cand>  mine;     // instances naming ours whose records can (their RecTx are in txs too)
     for (auto& [game, mb] : g_m3) {
@@ -1733,6 +1813,7 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
                 // already ours (this frame's first dispatch, or left from an earlier frame): its records must follow
                 if (valid) {
                     txs.push_back(std::move(tx));
+                    tx_owner.push_back({ &mb, game });
                     mine.push_back({ &mb, idx, game, sig });
                 } else
                     stale.push_back({ &mb, idx, game, sig });
@@ -1749,6 +1830,7 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
             }
             cands.push_back({ &mb, idx, game, sig });
             txs.push_back(std::move(tx));
+            tx_owner.push_back({ &mb, game });
         }
     }
     auto write_as = [&](const Cand& c, uint64_t as) -> bool {
@@ -1764,6 +1846,7 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
         for (const Cand& c : mine) write_as(c, c.game);
         cands.clear();
         txs.clear();
+        tx_owner.clear();
         mine.clear();
         ++g_m3_restores;
     };
@@ -1822,6 +1905,16 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
             g_log.Line(true, "RTM3 redirect f=%u: TLAS %llx (%u instances, gate %llu) reads our BLAS for %zu instance(s); records patched", frame,
                 (unsigned long long)t.dest, t.count, (unsigned long long)t.gate, cands.size());
     }
+    // M4: the committed records' vertex factory slots (txs: one RecTx per candidate / instance already ours, each now
+    // ours; tx_owner: its character)
+    if (!backed && committed) {
+        size_t ti = 0;
+        for (const RecTx& tx : txs) {
+            const ModBlas* owner = ti < tx_owner.size() ? tx_owner[ti].first : nullptr;
+            if (owner) M4Apply(cmd_list->get_device(), *owner, tx, hit_stride, tx_owner[ti].second);
+            ++ti;
+        }
+    }
     // coverage: which characters' instances all trace our BLAS with our records after this
     if (!backed && committed) {
         for (const Cand& c : mine) ++cover[c.mb].good;
@@ -1879,6 +1972,7 @@ void M3Summary()
                 (unsigned long long)mb.rays_covered, (unsigned long long)mb.rays_live, (unsigned long long)mb.rays_found,
                 mb.redirected ? int(g_frame_id - mb.redirected) : -1, mb.builds);
     for (const auto& [why, n] : g_m3_why) g_log.Line(true, "RTM3WHY %llu: %s", (unsigned long long)n, why.c_str());
+    g_log.Line(true, "RTM4SUM rt_m4=%d tables rewritten=%llu slots=%llu", M4Mode(), (unsigned long long)g_m4_tables, (unsigned long long)g_m4_slots);
     std::string fw;
     for (const auto& [why, n] : g_m3_full_why) fw += " | " + std::to_string(n) + " " + why;
     if (!fw.empty()) g_log.Line(true, "RTM3FULL full BLAS builds by reason:%s", fw.c_str());

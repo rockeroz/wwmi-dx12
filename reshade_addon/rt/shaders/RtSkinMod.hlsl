@@ -14,11 +14,13 @@
 //                (VectorFlags bit 0 swaps the two)
 //   t4 Palette   the native section's bone matrices: 3 float4 rows per bone, translation in w (a typed view in the
 //                frame's upload buffer; the root SRV points at the view's first element)
+//   t5 VgIds     optional (VgStride != 0): the mod's 16-bit bone ids per influence (BlendRemapVertexVG.buf, WWMI's
+//                blend remap: merged skeletons over 256 bones, whose Blend.buf byte ids cannot address them)
 //   u0 OutPositions FLOAT3 per vertex
 //   u1 OutTangents  two R16G16B16A16_SNORM per vertex (TangentX, TangentZ.w = sign), the skin cache's own format
 #define RtSkinModRS \
     "RootConstants(num32BitConstants=12, b0)," \
-    "SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4)," \
+    "SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), SRV(t5)," \
     "UAV(u0), UAV(u1)"
 
 cbuffer Parameters : register(b0)
@@ -27,12 +29,12 @@ cbuffer Parameters : register(b0)
     uint IndexCount;     // indices to process
     uint VertexCount;    // vertices in the mod buffers (bounds)
     uint BoneCount;      // bones in the palette view
-    uint InfluenceCount; // 4 or 8
+    uint InfluenceCount; // 4, 8 or 16
     uint BlendStride;    // InfluenceCount * 2
     uint VectorFlags;    // bit 0: normal first
     uint OutPosOffset;   // byte offset of this list's region in u0
     uint OutTanOffset;   // byte offset of this list's region in u1
-    uint Pad0;
+    uint VgStride;       // bytes per vertex in VgIds (InfluenceCount * 2), 0 = the bone ids are Blend.buf's bytes
     uint Pad1;
     uint Pad2;
 };
@@ -42,6 +44,7 @@ ByteAddressBuffer   Positions    : register(t1);
 ByteAddressBuffer   Blends       : register(t2);
 ByteAddressBuffer   Vectors      : register(t3);
 ByteAddressBuffer   Palette      : register(t4);
+ByteAddressBuffer   VgIds        : register(t5);
 RWByteAddressBuffer OutPositions : register(u0);
 RWByteAddressBuffer OutTangents  : register(u1);
 
@@ -73,12 +76,17 @@ void main(uint3 tid : SV_DispatchThreadID)
     // the blended bone matrix: sum of weight * rows
     float4 r0 = 0, r1 = 0, r2 = 0;
     uint   sum = 0;
-    [unroll(8)]
-    for (uint i = 0; i < 8u; ++i) {
+    [loop]
+    for (uint i = 0; i < 16u; ++i) {
         if (i >= InfluenceCount) break;
         const uint w = BlendByte(v * BlendStride + InfluenceCount + i);
         if (!w) continue;
-        const uint b = BlendByte(v * BlendStride + i);
+        uint b;
+        if (VgStride) {
+            const uint o = v * VgStride + i * 2u;
+            b = (VgIds.Load(o & ~3u) >> ((o & 2u) * 8u)) & 0xffffu;
+        } else
+            b = BlendByte(v * BlendStride + i);
         if (b >= BoneCount) continue; // a bone the palette does not have: skipped, not read out of bounds
         const float f = float(w) / 255.0;
         r0 += asfloat(Palette.Load4(b * 48u)) * f;

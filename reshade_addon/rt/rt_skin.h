@@ -58,8 +58,18 @@ struct GeomPose {
     uint32_t                                   indices = 0; // the mod's index buffer size (in indices)
     std::vector<std::pair<uint32_t, uint32_t>> ranges;      // (first index, count), sorted
     uint32_t                                   frame = 0;   // when it was posed
+    int                                        slot = -1;   // the output slot posed into (its tangents: VfViews)
 };
 bool PoseFor(uint64_t ring, int comp, uint32_t frame, GeomPose* out);
+
+// M4: CPU descriptors (the module's heap) a hit group's vertex factory slots take for a mod geometry: the mod's UVs as
+// `uv_fmt` (R16G16_FLOAT / R32G32_FLOAT, as the game's), the slot's posed tangents, the mod's colors. A null handle =
+// not available. uv_channels = UV channels per vertex the view holds.
+struct VfViews {
+    D3D12_CPU_DESCRIPTOR_HANDLE uv{}, tan{}, col{};
+    uint32_t                    uv_channels = 0;
+};
+bool MakeVfViews(int mod, int slot, uint32_t uv_fmt, VfViews* out);
 
 std::string Status(); // one line for RTSUM / the overlay
 std::vector<std::string> PoseLines(); // RTM2POSE: per mod, how fresh the raster's poses are
