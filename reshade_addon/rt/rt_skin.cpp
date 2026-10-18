@@ -354,7 +354,10 @@ bool LoadMesh(Mesh& m) // g_m NOT held (file and GPU work); the caller publishes
     }
     m.has_color = !col.bytes.empty() && col.stride == 4 && col.bytes.size() >= size_t(m.verts) * 4;
     if (!m.has_color) col.bytes.clear();
-    if (!any_remap) { // ids < 256: Blend.buf's bytes as always
+    // merged skeleton with the 16-bit ids shipped: use them even without a remap section (older WWMI-Tools exports, e.g.
+    // Cartethyia "A Knight's Sweet Dream": 296 bones, Blend.buf bytes, BlendRemapVertexVG.buf present but unused by
+    // its ini); a non-merged mod keeps Blend.buf's bytes
+    if (!any_remap && m.merged.empty()) {
         vg.bytes.clear();
         m.vg_stride = 0;
     }
