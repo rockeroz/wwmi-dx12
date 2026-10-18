@@ -90,4 +90,6 @@ bool on_dispatch_rays(reshade::api::command_list* cmd_list, reshade::api::resour
     uint64_t hit_group_size, uint64_t hit_group_stride, reshade::api::resource callable,
     uint64_t callable_offset, uint64_t callable_size, uint64_t callable_stride,
     uint32_t width, uint32_t height, uint32_t depth);
+bool on_draw_or_dispatch_indirect(reshade::api::command_list* cmd_list, reshade::api::indirect_command type, reshade::api::resource buffer,
+    uint64_t offset, uint32_t draw_count, uint32_t stride);
 #endif

@@ -325,3 +325,13 @@ bool on_dispatch_rays(reshade::api::command_list* cmd_list, reshade::api::resour
     if (cmd_list) RemovalPin::Ours(reinterpret_cast<const void*>(cmd_list->get_native()), "game-dispatch-rays");
     return false;
 }
+// ExecuteIndirect (ReShade: draw_or_dispatch_indirect, type unknown, the argument buffer and MaxCommandCount). With a ray
+// tracing state object bound it is an indirect DispatchRays: the RT module (M5) checks its hit group table.
+bool on_draw_or_dispatch_indirect(reshade::api::command_list* cmd_list, reshade::api::indirect_command, reshade::api::resource buffer,
+    uint64_t offset, uint32_t draw_count, uint32_t)
+{
+    if (!cmd_list || !CmdRtPipelineBound(cmd_list)) return false;
+    if (RtNoteIndirectRays(cmd_list, buffer, offset, draw_count)) return true;
+    RemovalPin::Ours(reinterpret_cast<const void*>(cmd_list->get_native()), "game-indirect-rays");
+    return false;
+}

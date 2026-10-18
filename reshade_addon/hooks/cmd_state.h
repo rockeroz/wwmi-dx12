@@ -142,6 +142,7 @@ struct CmdBlock {
     uint64_t             gen = 1;
     uint64_t             drew_gen = 0; // the recording (gen) a game draw was recorded in
     uint64_t             frame_end_gen = 0; // the recording a back-buffer-sized texture went to COMMON in: the game's frame end
+    uint64_t             rt_pso_gen = 0;    // the recording whose bound pipeline is a ray tracing state object (SetPipelineState1)
     std::vector<UavNote> uav_recent; // most recent last; written by on_barrier, read at dispatch, both on the recording thread
 #ifdef WWMI_DEBUG
     std::vector<BbNote> bb_notes; // B23: back-buffer-sized textures moved to or from COMMON in recording bb_notes_gen (BBCOMMON)
@@ -273,6 +274,20 @@ inline bool CmdDrewThisRecording(const void* cmd_list)
 {
     const CmdBlock* b = g_cmd_blocks.get(reinterpret_cast<uintptr_t>(cmd_list));
     return b && b->drew_gen == b->gen;
+}
+// The list's bound pipeline (SetPipelineState1: a ray tracing state object; SetPipelineState: a PSO), this recording: an
+// ExecuteIndirect with a ray tracing state object bound is an indirect DispatchRays (RT M5).
+inline void CmdNoteRtPipeline(const void* cmd_list, bool rt)
+{
+    if (CmdBlock* b = g_cmd_blocks.get(reinterpret_cast<uintptr_t>(cmd_list))) {
+        if (rt) b->rt_pso_gen = b->gen;
+        else if (b->rt_pso_gen) b->rt_pso_gen = 0;
+    }
+}
+inline bool CmdRtPipelineBound(const void* cmd_list)
+{
+    const CmdBlock* b = g_cmd_blocks.get(reinterpret_cast<uintptr_t>(cmd_list));
+    return b && b->rt_pso_gen && b->rt_pso_gen == b->gen;
 }
 inline bool CmdEndsGameFrame(const void* cmd_list)
 {

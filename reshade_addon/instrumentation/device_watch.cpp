@@ -43,6 +43,14 @@ static void DumpDeviceRemoval(ID3D12Device* d3d, HRESULT rr)
                     (void*)node->pCommandQueue, done, node->BreadcrumbCount, node->BreadcrumbContextsCount, ours);
                 if (node->pCommandHistory && done < node->BreadcrumbCount) {
                     logger::report("      first unfinished op %u = D3D12_AUTO_BREADCRUMB_OP %d (where the GPU stopped, not proof of the culprit)", done, (int)node->pCommandHistory[done]);
+                    if (done) { // the ops around it (5 EXECUTEINDIRECT, 6 DISPATCH, 7 COPYBUFFERREGION, 15 BARRIER, 31 AS BUILD, 34 DISPATCHRAYS)
+                        char       ops[200] = "";
+                        size_t     o = 0;
+                        const UINT from = done > 16 ? done - 16 : 0, to = (std::min)(node->BreadcrumbCount, done + 4);
+                        for (UINT k = from; k < to && o + 8 < sizeof ops; ++k)
+                            o += snprintf(ops + o, sizeof ops - o, k == done ? " [%d]" : " %d", (int)node->pCommandHistory[k]);
+                        logger::report("      ops %u..%u:%s", from, to ? to - 1 : 0, ops);
+                    }
                     const D3D12_DRED_BREADCRUMB_CONTEXT* c = node->pBreadcrumbContexts;
                     const UINT                           cn = c ? node->BreadcrumbContextsCount : 0;
                     UINT                                 first_after = cn;

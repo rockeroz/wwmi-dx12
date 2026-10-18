@@ -112,6 +112,9 @@ bool RtNoteRays(reshade::api::command_list* cmd_list, reshade::api::resource rg_
     reshade::api::resource miss_res, uint64_t miss_off, uint64_t miss_size, uint64_t miss_stride, reshade::api::resource hit_res,
     uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, reshade::api::resource call_res, uint64_t call_off, uint64_t call_size,
     uint64_t call_stride, uint32_t w, uint32_t h, uint32_t d);
+// An ExecuteIndirect recorded with a ray tracing pipeline bound (removal_pin.cpp): an indirect DispatchRays, its desc in
+// the argument buffer. true = skip it (M5: instances point past the game's table and its desc could not be pointed at ours).
+bool RtNoteIndirectRays(reshade::api::command_list* cmd_list, reshade::api::resource args, uint64_t args_off, uint32_t max_count);
 // A raster draw of mod component (mod, comp) stamped its texture over the game's texture `game` (section_ps_stamp.cpp):
 // M4 puts the same texture in that section's ray tracing material table.
 void RtNoteSlotTexture(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRIPTOR_HANDLE src, ID3D12Resource* mod_res);

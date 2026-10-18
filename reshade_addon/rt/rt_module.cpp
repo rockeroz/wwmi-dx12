@@ -597,6 +597,8 @@ std::atomic<uint32_t> g_rec_seq{ 0 };
 std::mutex g_copy_m;
 CopyRec    g_copies[512];
 uint32_t   g_copy_next = 0;
+CopyRec    g_small_copies[256]; // 64..255 bytes (M5: a dispatch rays desc uploaded for an ExecuteIndirect)
+uint32_t   g_small_next = 0;
 
 // The buffer holding a GPU address (resource handle when ReShade gave one, else the core's address map).
 bool ResOfVa(resource r, uint64_t off, ID3D12Resource** res, uint64_t* va)
@@ -1792,11 +1794,15 @@ std::string TexDesc(ID3D12Resource* r)
 }
 // rt_m5: 1 (default) a component's sub-draws binding different texture sets get a geometry, records and a material
 // table each in the ray traced scene; 0 one texture set per section (the largest sub-draw's).
+// M5 off for the rest of the session: the game traced rays indirectly with a desc we could not point at our extended table
+std::atomic<bool> g_m5_off{ false };
+// the last frame an indirect ray dispatch was recorded without our extended table: no instance goes into our block that frame
+std::atomic<uint32_t> g_m5_ind_unext_frame{ UINT32_MAX };
 int M5Mode()
 {
     static int s = -1;
     if (s < 0 && !g_addon_ini_path.empty()) s = GetPrivateProfileIntW(L"wwmi-dx12", L"rt_m5", 1, g_addon_ini_path.c_str()) != 0 ? 1 : 0;
-    return s < 0 ? 0 : s;
+    return s < 0 || g_m5_off.load(std::memory_order_relaxed) ? 0 : s;
 }
 
 // A section's pose ranges grouped by the texture set their sub-draws bound (sub-draws seen binding in the last 60
@@ -2052,6 +2058,8 @@ std::map<std::string, uint64_t> g_m5_why; // skipped dispatches / failed blocks 
 constexpr uint32_t kM5Region = 4096, kM5TableSlots = 40; // per frame in flight: ~100 tables of 40
 constexpr uint32_t kM5SlotRecs = 192, kM5MaxGeoms = 64, kM5Slots = 8; // a character's slot: 64 geometries x 3 ray types
 uint32_t           g_m5_r0 = 0;                                       // our block's first record (fixed once set)
+uint64_t           g_m5_stride = 0;                                   // ...and the record stride it was set for
+uint64_t           g_m5_copies = 0;                                   // extended copies of a game table made
 std::map<uint64_t, uint32_t> g_m5_slot;                               // character (game BLAS) -> its slot
 std::map<uint64_t, std::pair<uint64_t, std::vector<uint8_t>>> g_m5_last; // character -> (table source, its last records)
 struct M5HeapCur {
@@ -2297,7 +2305,7 @@ M5Ext* M5TakeExt(uint64_t need, uint64_t up_need) // g_m3_m held
         }
         return &e;
     }
-    if (g_m5_ring.size() >= 16) return nullptr;
+    if (g_m5_ring.size() >= 24) return nullptr;
     g_m5_ring.emplace_back();
     g_m5_ring_next = uint32_t(g_m5_ring.size() - 1);
     return M5TakeExt(need, up_need);
@@ -2311,6 +2319,131 @@ uint64_t M5Va(resource r, uint64_t off)
     return BufferVa(r, off);
 }
 
+// The newest TLAS of the last 2 frames with instances in our block, or null. g_m3_m held.
+const TlasRec* M5OnTlas()
+{
+    const TlasRec* t = nullptr;
+    for (const TlasRec& r : g_m3_tlas)
+        if (r.res && r.m5_on && int32_t(g_frame_id - r.frame) <= 2 && (!t || r.seq > t->seq)) t = &r;
+    return t;
+}
+
+// Armed: an instance may point at our block this frame (a character has extra geometries, R0 is set). g_m3_m held.
+bool M5Armed()
+{
+    if (!M5Mode() || !g_m5_r0) return false;
+    for (const auto& [game, mb] : g_m3)
+        if (!mb.m5.empty() && mb.blas) return true;
+    return false;
+}
+
+// The block an extended copy of the game's table made from source rd_va gets: t's newest (made from that same table)
+// if it is, else each slot's last records made from it, else zeros -- a null hit group: no shader runs. g_m3_m held.
+void M5BlockFor(const TlasRec* t, uint64_t rd_va, uint64_t stride, std::vector<uint8_t>* out, bool* null_block)
+{
+    *null_block = false;
+    if (t && t->m5_src == rd_va && t->m5_stride == stride && !t->m5_block.empty()) {
+        *out = t->m5_block;
+        return;
+    }
+    uint32_t top = t ? (t->m5_recs + kM5SlotRecs - 1) / kM5SlotRecs : 0;
+    for (const auto& [gk, sk] : g_m5_slot) top = (std::max)(top, sk + 1);
+    if (!top) top = 1;
+    out->assign(size_t(top) * kM5SlotRecs * stride, 0);
+    bool any = false;
+    for (const auto& [game, k] : g_m5_slot) {
+        const auto lt = g_m5_last.find(game);
+        if (k >= top || lt == g_m5_last.end() || lt->second.first != rd_va || lt->second.second.empty()) continue;
+        memcpy(out->data() + size_t(k) * kM5SlotRecs * stride, lt->second.second.data(),
+            (std::min)(lt->second.second.size(), size_t(kM5SlotRecs) * stride));
+        any = true;
+    }
+    *null_block = !any;
+}
+
+// Extended copies made this frame, shared by the later dispatches of a recording reading the same table with the same block.
+struct M5ExtUse {
+    const void* cl = nullptr;
+    uint64_t    gen = 0, rd_va = 0, size = 0, block_hash = 0, va = 0, ext_size = 0;
+};
+std::vector<M5ExtUse> g_m5_uses;
+uint32_t              g_m5_uses_frame = UINT32_MAX;
+
+// An extended copy of the game's hit group table at hit_va (its UPLOAD source found as M3 finds it): the game's records,
+// then our block at R0. Recorded on cl now, before the caller's dispatch. Its GPU address (*ext_size bytes), or 0 with
+// *skip set. g_m3_m held.
+uint64_t M5Extend(command_list* cmd_list, ID3D12GraphicsCommandList4* cl, const TlasRec* t, uint64_t hit_va, uint64_t hit_size, uint64_t hit_stride,
+    uint64_t* ext_size, const char** skip, bool* null_block)
+{
+    ID3D12Resource* rd = nullptr;
+    uint64_t        rd_va = 0;
+    const char*     why = nullptr;
+    if (!M3HitSource(cmd_list, resource{ 0 }, hit_va, hit_size, g_frame_id, &rd, &rd_va, &why, nullptr)) {
+        *skip = "the hit group table's source is unknown";
+        return 0;
+    }
+    if (!g_m5_r0 || !g_m5_stride) {
+        *skip = "no block position yet";
+        return 0;
+    }
+    if (hit_stride != g_m5_stride) {
+        *skip = "another record stride";
+        return 0;
+    }
+    const uint64_t r0b = uint64_t(g_m5_r0) * hit_stride;
+    if (hit_size > r0b) {
+        *skip = "the game's table reaches our block";
+        return 0;
+    }
+    std::vector<uint8_t> blk;
+    M5BlockFor(t, rd_va, hit_stride, &blk, null_block);
+    uint64_t h = 1469598103934665603ull;
+    for (uint8_t b : blk) h = (h ^ b) * 1099511628211ull;
+    if (g_m5_uses_frame != g_frame_id) {
+        g_m5_uses.clear();
+        g_m5_uses_frame = g_frame_id;
+    }
+    const uint64_t gen = CmdGen(cmd_list);
+    for (const M5ExtUse& u : g_m5_uses)
+        if (u.cl == cmd_list && u.gen == gen && u.rd_va == rd_va && u.size == hit_size && u.block_hash == h) {
+            *ext_size = u.ext_size;
+            return u.va;
+        }
+    M5Ext* e = M5TakeExt(r0b + blk.size(), blk.size());
+    if (!e) {
+        *skip = "no extended table buffer";
+        return 0;
+    }
+    memcpy(e->up_ptr, blk.data(), blk.size());
+    D3D12_RESOURCE_BARRIER br{};
+    br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    br.Transition.pResource = e->res.Get();
+    br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    br.Transition.StateBefore = e->read_state ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COMMON;
+    br.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    M3Marker(cl, L"wwmi rt-m5: extended hit group table");
+    cl->ResourceBarrier(1, &br);
+    cl->CopyBufferRegion(e->res.Get(), 0, rd, rd_va - rd->GetGPUVirtualAddress(), hit_size);
+    cl->CopyBufferRegion(e->res.Get(), r0b, e->up.Get(), 0, blk.size());
+    br.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    br.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    cl->ResourceBarrier(1, &br);
+    e->read_state = true;
+    e->stamp = GpuStamp();
+    M5ExtUse u;
+    u.cl = cmd_list;
+    u.gen = gen;
+    u.rd_va = rd_va;
+    u.size = hit_size;
+    u.block_hash = h;
+    u.va = e->res->GetGPUVirtualAddress();
+    u.ext_size = r0b + blk.size();
+    g_m5_uses.push_back(u);
+    ++g_m5_copies;
+    *ext_size = u.ext_size;
+    return u.va;
+}
+
 // After M3: a TLAS of the last frames has instances pointing at our block -- this dispatch traces with the game's table
 // extended by our block (issued here; the game's call is skipped), or is skipped. true = skip the game's call.
 bool M5AfterRays(command_list* cmd_list, resource rg_res, uint64_t rg_off, uint64_t rg_size, resource miss_res, uint64_t miss_off,
@@ -2319,59 +2452,28 @@ bool M5AfterRays(command_list* cmd_list, resource rg_res, uint64_t rg_off, uint6
 {
     if (!cmd_list) return false;
     std::lock_guard l(g_m3_m);
-    const TlasRec* t = nullptr;
-    for (const TlasRec& r : g_m3_tlas)
-        if (r.res && r.m5_on && int32_t(g_frame_id - r.frame) <= 2 && (!t || r.seq > t->seq)) t = &r;
+    const TlasRec* t = M5OnTlas();
     if (!t) return false;
-    ID3D12Resource* rd = nullptr;
-    uint64_t        rd_va = 0;
-    const char*     why = nullptr;
-    const bool      src = M3HitSource(cmd_list, hit_res, hit_off, hit_size, g_frame_id, &rd, &rd_va, &why, nullptr);
-    const uint64_t  r0b = uint64_t(t->m5_r0) * hit_stride;
-    const uint64_t  rg_va = M5Va(rg_res, rg_off), miss_va = M5Va(miss_res, miss_off), call_va = M5Va(call_res, call_off);
-    const char*     skip = !rg_va || !rg_size                ? "dispatch skipped: no ray generation record"
-                           : (miss_size && !miss_va) || (call_size && !call_va) ? "dispatch skipped: a miss / callable table without an address"
-                           : !src                       ? "dispatch skipped: the hit group table's source is unknown"
-                           : t->m5_block.empty()        ? "dispatch skipped: no block of records"
-                           : hit_stride != t->m5_stride ? "dispatch skipped: another record stride"
-                           : hit_size > r0b             ? "dispatch skipped: the game's table reaches our block"
-                                                        : nullptr;
+    const uint64_t rg_va = M5Va(rg_res, rg_off), miss_va = M5Va(miss_res, miss_off), call_va = M5Va(call_res, call_off);
+    const char*    skip = !rg_va || !rg_size                                       ? "no ray generation record"
+                          : (miss_size && !miss_va) || (call_size && !call_va) ? "a miss / callable table without an address"
+                                                                               : nullptr;
     ComPtr<ID3D12GraphicsCommandList4> cl;
     if (!skip && (FAILED(reinterpret_cast<IUnknown*>(cmd_list->get_native())->QueryInterface(IID_PPV_ARGS(&cl))) || !cl))
-        skip = "dispatch skipped: the list is not an ID3D12GraphicsCommandList4";
-    M5Ext* e = skip ? nullptr : M5TakeExt(r0b + t->m5_block.size(), t->m5_block.size());
-    if (!skip && !e) skip = "dispatch skipped: no extended table buffer";
-    if (skip) {
+        skip = "the list is not an ID3D12GraphicsCommandList4";
+    uint64_t ext = 0, ext_size = 0;
+    bool     null_block = false;
+    if (!skip) ext = M5Extend(cmd_list, cl.Get(), t, M5Va(hit_res, hit_off), hit_size, hit_stride, &ext_size, &skip, &null_block);
+    if (!ext) {
         ++g_m5_skip;
-        M5Why(skip);
+        M5Why((std::string("dispatch skipped: ") + (skip ? skip : "?")).c_str());
         return true;
     }
-    // a block made from another table holds another pipeline's shader identifiers: zeros instead (null hit groups -- our
-    // characters miss this dispatch's rays, nothing reads a wrong record)
-    if (t->m5_src == rd_va) memcpy(e->up_ptr, t->m5_block.data(), t->m5_block.size());
-    else {
-        memset(e->up_ptr, 0, t->m5_block.size());
-        M5Why("dispatch traced with a null block (its block was made from another table)");
-    }
-    D3D12_RESOURCE_BARRIER br{};
-    br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    br.Transition.pResource = e->res.Get();
-    br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    br.Transition.StateBefore = e->read_state ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COMMON;
-    br.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    M3Marker(cl.Get(), L"wwmi rt-m5: extended hit group table");
-    cl->ResourceBarrier(1, &br);
-    cl->CopyBufferRegion(e->res.Get(), 0, rd, rd_va - rd->GetGPUVirtualAddress(), hit_size);
-    cl->CopyBufferRegion(e->res.Get(), r0b, e->up.Get(), 0, t->m5_block.size());
-    br.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    br.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    cl->ResourceBarrier(1, &br);
-    e->read_state = true;
-    e->stamp = GpuStamp();
+    if (null_block) M5Why("dispatch traced with a null block (no records made from its table)");
     D3D12_DISPATCH_RAYS_DESC dr{};
     dr.RayGenerationShaderRecord = { rg_va, rg_size };
     dr.MissShaderTable = { miss_va, miss_size, miss_stride };
-    dr.HitGroupTable = { e->res->GetGPUVirtualAddress(), r0b + t->m5_block.size(), hit_stride };
+    dr.HitGroupTable = { ext, ext_size, hit_stride };
     dr.CallableShaderTable = { call_va, call_size, call_stride };
     dr.Width = w;
     dr.Height = h;
@@ -2380,13 +2482,143 @@ bool M5AfterRays(command_list* cmd_list, resource rg_res, uint64_t rg_off, uint6
     RemovalPin::Ours(reinterpret_cast<const void*>(cmd_list->get_native()), "rt-m5 dispatch rays");
     if (g_m5_ext++ < 6)
         g_log.Line(true,
-            "RTM5 dispatch f=%u %ux%u: traced with our extended table (%llu game records, block of %u at %u%s) raygen=%llx/%llu miss=%llx/%llu/%llu "
+            "RTM5 dispatch f=%u %ux%u: traced with our extended table (%llu game records, block at %u%s) raygen=%llx/%llu miss=%llx/%llu/%llu "
             "hit=%llx/%llu/%llu (game's %llx) callable=%llx/%llu",
-            g_frame_id, w, h, (unsigned long long)(hit_size / hit_stride), t->m5_recs, t->m5_r0, t->m5_src == rd_va ? "" : ", null block",
-            (unsigned long long)rg_va, (unsigned long long)rg_size, (unsigned long long)miss_va, (unsigned long long)miss_size,
-            (unsigned long long)miss_stride, (unsigned long long)dr.HitGroupTable.StartAddress, (unsigned long long)dr.HitGroupTable.SizeInBytes,
-            (unsigned long long)hit_stride, (unsigned long long)M5Va(hit_res, hit_off), (unsigned long long)call_va, (unsigned long long)call_size);
+            g_frame_id, w, h, (unsigned long long)(hit_size / hit_stride), g_m5_r0, null_block ? ", null block" : "", (unsigned long long)rg_va,
+            (unsigned long long)rg_size, (unsigned long long)miss_va, (unsigned long long)miss_size, (unsigned long long)miss_stride,
+            (unsigned long long)ext, (unsigned long long)ext_size, (unsigned long long)hit_stride, (unsigned long long)M5Va(hit_res, hit_off),
+            (unsigned long long)call_va, (unsigned long long)call_size);
     return true;
+}
+
+// Indirect ray dispatches (ExecuteIndirect with a ray tracing state object bound). Their D3D12_DISPATCH_RAYS_DESC -- with
+// the hit group table's address -- is in a GPU argument buffer, out of on_dispatch_rays' reach: with instances pointing
+// past the game's table (M5) such a dispatch reads past its table's end (the GPU hung in one, f4354). A desc the CPU
+// wrote (the arguments in UPLOAD memory, or copied into them from UPLOAD memory earlier in this recording) is pointed at
+// an extended copy of its table whenever M5 is armed; one that cannot be keeps M5 off for the session and, while instances
+// point at our block, is skipped.
+struct M5IndNote {
+    const void* list = nullptr; // native
+    uint32_t    frame = 0;
+    uint64_t    args = 0;
+    const char* what = "";
+};
+M5IndNote g_m5_ind_ring[32];
+uint32_t  g_m5_ind_next = 0;
+uint64_t  g_m5_ind_seen = 0, g_m5_ind_patched = 0, g_m5_ind_skipped = 0, g_m5_ind_plain = 0;
+
+bool M5Indirect(command_list* cmd_list, resource args, uint64_t args_off, uint32_t max_count)
+{
+    const uint32_t  frame = g_frame_id;
+    const uint64_t  args_va = BufferVa(args, args_off);
+    ID3D12Resource* ares = nullptr;
+    uint64_t        ava = 0;
+    ResOfVa(args, args_off, &ares, &ava);
+    const bool copies_noted = g_have_char_inst.load(std::memory_order_relaxed) || g_m3_any.load(std::memory_order_relaxed);
+    // the desc's CPU-written source: the arguments themselves in UPLOAD memory, or the newest copy into them from UPLOAD
+    // memory in this recording, not yet submitted
+    ID3D12Resource* src = nullptr;
+    uint64_t        src_va = 0;
+    const char*     from = "nowhere we saw";
+    if (ares && HeapTypeOf(ares) == int(D3D12_HEAP_TYPE_UPLOAD)) {
+        src = ares;
+        src_va = args_va;
+        from = "the arguments (UPLOAD)";
+    } else if (copies_noted) {
+        std::lock_guard l(g_copy_m);
+        const uint64_t  gen = CmdGen(cmd_list);
+        const CopyRec*  c = nullptr;
+        auto            scan = [&](const CopyRec* ring, size_t n) {
+            for (size_t i = 0; i < n; ++i) {
+                const CopyRec& r = ring[i];
+                if (r.src && r.cl == cmd_list && r.gen == gen && !r.executed && args_va >= r.dst_va && args_va + 64 <= r.dst_va + r.size &&
+                    int32_t(frame - r.frame) <= 1 && (!c || r.seq > c->seq))
+                    c = &r;
+            }
+        };
+        scan(g_copies, 512);
+        scan(g_small_copies, 256);
+        if (c && HeapTypeOf(c->src) == int(D3D12_HEAP_TYPE_UPLOAD)) {
+            src = c->src;
+            src_va = c->src_va + (args_va - c->dst_va);
+            from = "a copy from UPLOAD in this recording";
+        } else if (c)
+            from = "a copy from non-UPLOAD memory";
+    }
+    D3D12_DISPATCH_RAYS_DESC desc{};
+    const bool have = src && GuardedPrivateRead(src, src_va, reinterpret_cast<uint8_t*>(&desc), uint32_t(sizeof desc)) == sizeof desc;
+    const auto& hg = desc.HitGroupTable;
+    const bool  looks = have && desc.RayGenerationShaderRecord.StartAddress && desc.RayGenerationShaderRecord.SizeInBytes &&
+                       desc.RayGenerationShaderRecord.SizeInBytes <= 4096 && hg.StartAddress && !(hg.StartAddress & 63) && hg.StrideInBytes >= 32 &&
+                       hg.StrideInBytes <= 4096 && !(hg.StrideInBytes & 31) && hg.SizeInBytes && hg.SizeInBytes % hg.StrideInBytes == 0 &&
+                       desc.MissShaderTable.StrideInBytes <= 4096;
+    static std::atomic<uint32_t> s_log{ 0 };
+    if (s_log.fetch_add(1) < 8)
+        g_log.Line(true,
+            "RTM5 indirect f=%u: ExecuteIndirect with a ray tracing pipeline bound (args %llx, heap %d, max %u command(s)), desc from %s%s: "
+            "raygen=%llx/%llu miss=%llx/%llu/%llu hit=%llx/%llu/%llu callable=%llx/%llu dims %ux%ux%u",
+            frame, (unsigned long long)args_va, HeapTypeOf(ares), max_count, from, have ? (looks ? "" : " (does not read as a dispatch rays desc)") : "",
+            (unsigned long long)desc.RayGenerationShaderRecord.StartAddress, (unsigned long long)desc.RayGenerationShaderRecord.SizeInBytes,
+            (unsigned long long)desc.MissShaderTable.StartAddress, (unsigned long long)desc.MissShaderTable.SizeInBytes,
+            (unsigned long long)desc.MissShaderTable.StrideInBytes, (unsigned long long)hg.StartAddress, (unsigned long long)hg.SizeInBytes,
+            (unsigned long long)hg.StrideInBytes, (unsigned long long)desc.CallableShaderTable.StartAddress,
+            (unsigned long long)desc.CallableShaderTable.SizeInBytes, desc.Width, desc.Height, desc.Depth);
+    std::lock_guard l(g_m3_m);
+    ++g_m5_ind_seen;
+    M5IndNote& note = g_m5_ind_ring[g_m5_ind_next++ & 31];
+    note = { reinterpret_cast<const void*>(cmd_list->get_native()), frame, args_va, "game's table" };
+    const TlasRec* t = M5OnTlas();
+    // a desc M5 cannot point at its table: M5 off for the session (checked armed or not: it must never turn on then), and
+    // the dispatch skipped while instances point at our block (with the game's table it would read past its end)
+    auto refuse = [&](const char* why) -> bool {
+        M5Why((std::string("indirect: ") + why).c_str());
+        g_m5_ind_unext_frame.store(frame, std::memory_order_relaxed);
+        if (!g_m5_off.exchange(true))
+            g_log.Line(true, "RTM5 off f=%u: %s -- M5 stays off this session (one texture set per mod part, as before M5)", frame, why);
+        if (t) {
+            ++g_m5_ind_skipped;
+            note.what = "skipped";
+            return true;
+        }
+        ++g_m5_ind_plain;
+        return false;
+    };
+    if (copies_noted) {
+        const char* cannot = !have         ? "an indirect ray dispatch's desc is not CPU-written memory we can reach"
+                             : !looks      ? "an indirect ray dispatch's arguments do not read as a dispatch rays desc"
+                             : max_count != 1 ? "an indirect ray dispatch with more than one command"
+                                              : nullptr;
+        if (cannot) return refuse(cannot);
+    }
+    if (!t && !M5Armed()) { // nothing points at our block: the game's table serves (and no instance enters the block this frame)
+        ++g_m5_ind_plain;
+        g_m5_ind_unext_frame.store(frame, std::memory_order_relaxed);
+        return false;
+    }
+    if (!have || !looks) return refuse("an indirect ray dispatch's desc was not checked"); // (armed implies copies noted)
+    ComPtr<ID3D12GraphicsCommandList4> cl;
+    if (FAILED(reinterpret_cast<IUnknown*>(cmd_list->get_native())->QueryInterface(IID_PPV_ARGS(&cl))) || !cl)
+        return refuse("an indirect ray dispatch's list is not an ID3D12GraphicsCommandList4");
+    uint64_t    ext = 0, ext_size = 0;
+    bool        null_block = false;
+    const char* why = nullptr;
+    ext = M5Extend(cmd_list, cl.Get(), t, hg.StartAddress, hg.SizeInBytes, hg.StrideInBytes, &ext_size, &why, &null_block);
+    if (!ext) return refuse((std::string("an indirect ray dispatch's table could not be extended: ") + (why ? why : "?")).c_str());
+    {
+        // HitGroupTable.StartAddress and .SizeInBytes (offsets 40 and 48 of D3D12_DISPATCH_RAYS_DESC) in the CPU-written
+        // desc, which the GPU reads (copies) when this list runs
+        uint8_t*   p = MapUpload(src, src_va + 40, 16);
+        const bool ok = p && GuardedCopy(p, &ext, 8) && GuardedCopy(p + 8, &ext_size, 8);
+        if (p) UnmapUpload(src);
+        if (!ok) return refuse("an indirect ray dispatch's desc could not be written");
+    }
+    ++g_m5_ind_patched;
+    note.what = "our extended table";
+    static std::atomic<uint32_t> s_patch{ 0 };
+    if (s_patch.fetch_add(1) < 4)
+        g_log.Line(true, "RTM5 indirect f=%u: desc pointed at our extended table %llx/%llu (game's %llx/%llu)%s", frame, (unsigned long long)ext,
+            (unsigned long long)ext_size, (unsigned long long)hg.StartAddress, (unsigned long long)hg.SizeInBytes, null_block ? ", null block" : "");
+    return false;
 }
 
 // DispatchRays (rt_m3=1). The TLAS these rays trace (the newest built) is still gated: every instance naming a
@@ -2438,9 +2670,13 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
     };
     // M5: characters with extra geometries need their records in our block (R0..), and every dispatch our extended table.
     // R0 is fixed for the session at the first such dispatch (twice the game's table, at least 16384 records)
-    if (M5Mode() && src && hit_stride >= 72 && !g_m5_r0)
+    if (M5Mode() && src && hit_stride >= 72 && !g_m5_r0) {
         g_m5_r0 = uint32_t(((std::max)(uint64_t(16384), 2 * (hit_size / hit_stride)) + 1023) & ~uint64_t(1023));
-    const bool m5_ok = M5Mode() && src && hit_stride >= 72 && g_m5_r0 && hit_size <= uint64_t(g_m5_r0) * hit_stride;
+        g_m5_stride = hit_stride;
+    }
+    // (not in a frame an indirect ray dispatch was recorded with the game's own table: it would read past its end)
+    const bool m5_ok = M5Mode() && src && hit_stride >= 72 && g_m5_r0 && hit_stride == g_m5_stride && hit_size <= uint64_t(g_m5_r0) * hit_stride &&
+                       g_m5_ind_unext_frame.load(std::memory_order_relaxed) != frame;
     std::vector<Cand>  cands;    // to point at our BLAS (gate closed)
     std::vector<RecTx> txs;      // records to make ours: the candidates', then those of instances naming ours already
     std::vector<std::pair<ModBlas*, uint64_t>> tx_owner; // each RecTx's character (M4)
@@ -2496,7 +2732,9 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
                 continue;
             }
             if (!mb.m5.empty() && !m5_ok) {
-                M3Refuse("M5: extra geometries, but no hit group table to extend (it keeps the game's BLAS)");
+                M3Refuse(g_m5_ind_unext_frame.load(std::memory_order_relaxed) == frame
+                        ? "M5: extra geometries, but an indirect ray dispatch of this frame used the game's table (it keeps the game's BLAS)"
+                        : "M5: extra geometries, but no hit group table to extend (it keeps the game's BLAS)");
                 continue;
             }
             cands.push_back({ &mb, idx, game, sig, contrib });
@@ -2854,9 +3092,13 @@ void M3Summary()
     {
         std::string why;
         for (const auto& [wy, n] : g_m5_why) why += " | " + std::to_string(n) + " " + wy;
-        g_log.Line(true, "RTM5SUM rt_m5=%d dispatches extended=%llu skipped=%llu blocks=%llu (failed %llu) tables=%llu (failed %llu) game tables reach %u%s",
-            M5Mode(), (unsigned long long)g_m5_ext, (unsigned long long)g_m5_skip, (unsigned long long)g_m5_blocks, (unsigned long long)g_m5_block_fail,
-            (unsigned long long)g_m5_tables, (unsigned long long)g_m5_table_fail, g_m5_game_hi, why.c_str());
+        g_log.Line(true,
+            "RTM5SUM rt_m5=%d%s dispatches extended=%llu skipped=%llu table copies=%llu | indirect ray dispatches=%llu (our table %llu, skipped %llu, "
+            "game's table %llu) | blocks=%llu (failed %llu) tables=%llu (failed %llu) game tables reach %u%s",
+            M5Mode(), g_m5_off.load() ? " (off: indirect rays)" : "", (unsigned long long)g_m5_ext, (unsigned long long)g_m5_skip,
+            (unsigned long long)g_m5_copies, (unsigned long long)g_m5_ind_seen, (unsigned long long)g_m5_ind_patched,
+            (unsigned long long)g_m5_ind_skipped, (unsigned long long)g_m5_ind_plain, (unsigned long long)g_m5_blocks,
+            (unsigned long long)g_m5_block_fail, (unsigned long long)g_m5_tables, (unsigned long long)g_m5_table_fail, g_m5_game_hi, why.c_str());
     }
     std::string fw;
     for (const auto& [why, n] : g_m3_full_why) fw += " | " + std::to_string(n) + " " + why;
@@ -2878,9 +3120,10 @@ bool RtHoldVanilla()
 
 void RtNoteCopy(command_list* cmd_list, resource src, uint64_t src_off, resource dst, uint64_t dst_off, uint64_t size)
 {
-    if (Mode() != 2 || !(g_have_char_inst.load(std::memory_order_relaxed) || g_m3_any.load(std::memory_order_relaxed)) || size < 256 ||
+    if (Mode() != 2 || !(g_have_char_inst.load(std::memory_order_relaxed) || g_m3_any.load(std::memory_order_relaxed)) || size < 64 ||
         size > (8ull << 20) || !src.handle)
         return;
+    const bool small = size < 256;
     CopyRec r;
     r.cl = cmd_list;
     r.gen = CmdGen(cmd_list);
@@ -2891,7 +3134,14 @@ void RtNoteCopy(command_list* cmd_list, resource src, uint64_t src_off, resource
     r.src_va = BufferVa(src, src_off);
     r.frame = g_frame_id;
     std::lock_guard l(g_copy_m);
-    g_copies[g_copy_next++ & 511] = r;
+    if (small) g_small_copies[g_small_next++ & 255] = r;
+    else g_copies[g_copy_next++ & 511] = r;
+}
+
+bool RtNoteIndirectRays(command_list* cmd_list, resource args, uint64_t args_off, uint32_t max_count)
+{
+    if (Mode() != 2 || !cmd_list) return false;
+    return M5Indirect(cmd_list, args, args_off, max_count);
 }
 
 void RtOnDeviceRemoved()
@@ -2911,6 +3161,19 @@ void RtOnDeviceRemoved()
     }
     ReshadeLog(reshade::log::level::error, "wwmi-dx12 RT module at device removal, frame %u: %s", g_frame_id, m3.c_str());
     {
+        // M5: the last indirect ray dispatches (native list as DRED names it) and what they traced with
+        std::unique_lock l(g_m3_m, std::try_to_lock);
+        if (l.owns_lock() && g_m5_ind_seen) {
+            ReshadeLog(reshade::log::level::error, "wwmi-dx12 RT M5 at removal: rt_m5=%d%s, indirect ray dispatches %llu (our table %llu, skipped %llu, game's table %llu); newest:",
+                M5Mode(), g_m5_off.load() ? " (off)" : "", (unsigned long long)g_m5_ind_seen, (unsigned long long)g_m5_ind_patched,
+                (unsigned long long)g_m5_ind_skipped, (unsigned long long)g_m5_ind_plain);
+            for (uint32_t i = 0; i < 8 && i < g_m5_ind_next; ++i) {
+                const M5IndNote& n = g_m5_ind_ring[(g_m5_ind_next - 1 - i) & 31];
+                ReshadeLog(reshade::log::level::error, "  indirect rays f=%u list %p args %llx: %s", n.frame, n.list, (unsigned long long)n.args, n.what);
+            }
+        }
+    }
+    {
         std::lock_guard l(g_m3_m);
         M3ReleaseGate(g_gate_next);
     }
@@ -2929,6 +3192,8 @@ void RtNoteExecute(command_queue* queue, command_list* cmd_list)
         }
     std::lock_guard l2(g_copy_m);
     for (CopyRec& r : g_copies)
+        if (r.cl == cmd_list && r.gen == gen) r.executed = true;
+    for (CopyRec& r : g_small_copies)
         if (r.cl == cmd_list && r.gen == gen) r.executed = true;
 }
 

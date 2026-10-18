@@ -11,6 +11,7 @@
 void on_bind_pipeline(command_list* cmd_list, pipeline_stage type, pipeline pipeline)
 {
     PROF(PROF_BindPipeline);
+    CmdNoteRtPipeline(cmd_list, type == pipeline_stage::all_ray_tracing); // ReShade: SetPipelineState1 binds all_ray_tracing
     uint64_t vc = 0;
     uint64_t ps = 0;
     uint64_t gs = 0;

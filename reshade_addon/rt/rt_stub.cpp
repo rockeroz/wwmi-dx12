@@ -58,6 +58,10 @@ bool RtNoteRays(reshade::api::command_list*, reshade::api::resource, uint64_t, u
 {
     return false;
 }
+bool RtNoteIndirectRays(reshade::api::command_list*, reshade::api::resource, uint64_t, uint32_t)
+{
+    return false;
+}
 void RtObserveDraw(reshade::api::command_list*, uint32_t, uint32_t, int32_t, uint64_t) {}
 void RtPresentTick() {}
 void RtNoteSlotTexture(int, int, ID3D12Resource*, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*) {}
