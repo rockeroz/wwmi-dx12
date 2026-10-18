@@ -2065,13 +2065,15 @@ struct M5Ext {
     ComPtr<ID3D12Resource> res, up;
     uint64_t               cap = 0, up_cap = 0, stamp = 0;
     uint8_t*               up_ptr = nullptr;
+    bool                   read_state = false; // res left in NON_PIXEL_SHADER_RESOURCE by its last use (else COMMON: new)
 };
 std::vector<M5Ext> g_m5_ring;
 uint32_t           g_m5_ring_next = 0;
 
 void M5Why(const char* why)
 {
-    ++g_m5_why[why];
+    // the first time each reason comes up, in the log right away (a removal can come before the next RTM5SUM)
+    if (g_m5_why[why]++ == 0) g_log.Line(true, "RTM5 first f=%u: %s", g_frame_id, why);
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE M5NullSrv()
@@ -2278,6 +2280,7 @@ M5Ext* M5TakeExt(uint64_t need, uint64_t up_need) // g_m3_m held
             M3Retire(e.res);
             e.res = r;
             e.cap = cap;
+            e.read_state = false;
         }
         if (e.up_cap < up_need) {
             ComPtr<ID3D12Resource> u;
@@ -2300,9 +2303,12 @@ M5Ext* M5TakeExt(uint64_t need, uint64_t up_need) // g_m3_m held
     return M5TakeExt(need, up_need);
 }
 
+// ReShade's DX12 dispatch_rays event passes every shader table as a null resource with its GPU address in `offset`
+// (BufferVa): a null resource is not a null table. (M5's first build read it as 0: raygen and miss at address 0 -- the
+// GPU hung in its first extended dispatch.)
 uint64_t M5Va(resource r, uint64_t off)
 {
-    return r.handle ? reinterpret_cast<ID3D12Resource*>(r.handle)->GetGPUVirtualAddress() + off : 0;
+    return BufferVa(r, off);
 }
 
 // After M3: a TLAS of the last frames has instances pointing at our block -- this dispatch traces with the game's table
@@ -2322,7 +2328,10 @@ bool M5AfterRays(command_list* cmd_list, resource rg_res, uint64_t rg_off, uint6
     const char*     why = nullptr;
     const bool      src = M3HitSource(cmd_list, hit_res, hit_off, hit_size, g_frame_id, &rd, &rd_va, &why, nullptr);
     const uint64_t  r0b = uint64_t(t->m5_r0) * hit_stride;
-    const char*     skip = !src                         ? "dispatch skipped: the hit group table's source is unknown"
+    const uint64_t  rg_va = M5Va(rg_res, rg_off), miss_va = M5Va(miss_res, miss_off), call_va = M5Va(call_res, call_off);
+    const char*     skip = !rg_va || !rg_size                ? "dispatch skipped: no ray generation record"
+                           : (miss_size && !miss_va) || (call_size && !call_va) ? "dispatch skipped: a miss / callable table without an address"
+                           : !src                       ? "dispatch skipped: the hit group table's source is unknown"
                            : t->m5_block.empty()        ? "dispatch skipped: no block of records"
                            : hit_stride != t->m5_stride ? "dispatch skipped: another record stride"
                            : hit_size > r0b             ? "dispatch skipped: the game's table reaches our block"
@@ -2348,7 +2357,7 @@ bool M5AfterRays(command_list* cmd_list, resource rg_res, uint64_t rg_off, uint6
     br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     br.Transition.pResource = e->res.Get();
     br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    br.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    br.Transition.StateBefore = e->read_state ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COMMON;
     br.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     M3Marker(cl.Get(), L"wwmi rt-m5: extended hit group table");
     cl->ResourceBarrier(1, &br);
@@ -2357,20 +2366,26 @@ bool M5AfterRays(command_list* cmd_list, resource rg_res, uint64_t rg_off, uint6
     br.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     br.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     cl->ResourceBarrier(1, &br);
+    e->read_state = true;
     e->stamp = GpuStamp();
     D3D12_DISPATCH_RAYS_DESC dr{};
-    dr.RayGenerationShaderRecord = { M5Va(rg_res, rg_off), rg_size };
-    dr.MissShaderTable = { M5Va(miss_res, miss_off), miss_size, miss_stride };
+    dr.RayGenerationShaderRecord = { rg_va, rg_size };
+    dr.MissShaderTable = { miss_va, miss_size, miss_stride };
     dr.HitGroupTable = { e->res->GetGPUVirtualAddress(), r0b + t->m5_block.size(), hit_stride };
-    dr.CallableShaderTable = { M5Va(call_res, call_off), call_size, call_stride };
+    dr.CallableShaderTable = { call_va, call_size, call_stride };
     dr.Width = w;
     dr.Height = h;
     dr.Depth = d;
     cl->DispatchRays(&dr);
     RemovalPin::Ours(reinterpret_cast<const void*>(cmd_list->get_native()), "rt-m5 dispatch rays");
-    if (g_m5_ext++ < 4)
-        g_log.Line(true, "RTM5 dispatch f=%u %ux%u: traced with our extended table (%llu game records, block of %u at %u)", g_frame_id, w, h,
-            (unsigned long long)(hit_size / hit_stride), t->m5_recs, t->m5_r0);
+    if (g_m5_ext++ < 6)
+        g_log.Line(true,
+            "RTM5 dispatch f=%u %ux%u: traced with our extended table (%llu game records, block of %u at %u%s) raygen=%llx/%llu miss=%llx/%llu/%llu "
+            "hit=%llx/%llu/%llu (game's %llx) callable=%llx/%llu",
+            g_frame_id, w, h, (unsigned long long)(hit_size / hit_stride), t->m5_recs, t->m5_r0, t->m5_src == rd_va ? "" : ", null block",
+            (unsigned long long)rg_va, (unsigned long long)rg_size, (unsigned long long)miss_va, (unsigned long long)miss_size,
+            (unsigned long long)miss_stride, (unsigned long long)dr.HitGroupTable.StartAddress, (unsigned long long)dr.HitGroupTable.SizeInBytes,
+            (unsigned long long)hit_stride, (unsigned long long)M5Va(hit_res, hit_off), (unsigned long long)call_va, (unsigned long long)call_size);
     return true;
 }
 
