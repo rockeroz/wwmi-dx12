@@ -2507,6 +2507,131 @@ M5IndNote g_m5_ind_ring[32];
 uint32_t  g_m5_ind_next = 0;
 uint64_t  g_m5_ind_seen = 0, g_m5_ind_patched = 0, g_m5_ind_skipped = 0, g_m5_ind_plain = 0;
 
+// M5 (observe): the current frame's direct dispatches (state object, tables), for the indirect ones to be compared with.
+struct M5Direct {
+    uint32_t frame = UINT32_MAX, count = 0;
+    uint64_t pso = 0, rg_va = 0, miss_va = 0, hit_va = 0, hit_size = 0;
+};
+M5Direct g_m5_dir;
+
+// A readback of an indirect dispatch's arguments as the GPU executes them (after the game's own writes into them).
+struct M5Readback {
+    ComPtr<ID3D12Resource> rb;
+    uint64_t               stamp = 0, args_va = 0, pso = 0, dir_hit = 0, dir_hit_size = 0;
+    uint32_t               frame = 0, n = 0;
+};
+std::vector<M5Readback> g_m5_rbs;
+uint32_t                g_m5_rb_total = 0;
+
+std::string M5Hex(const uint8_t* p, size_t n)
+{
+    std::string s;
+    char        b[4];
+    for (size_t i = 0; i < n; ++i) {
+        snprintf(b, sizeof b, i && i % 8 == 0 ? " %02x" : "%02x", p[i]);
+        s += b;
+    }
+    return s;
+}
+
+std::string M5DescText(const D3D12_DISPATCH_RAYS_DESC& d)
+{
+    char b[400];
+    snprintf(b, sizeof b, "raygen=%llx/%llu miss=%llx/%llu/%llu hit=%llx/%llu/%llu callable=%llx/%llu dims %ux%ux%u",
+        (unsigned long long)d.RayGenerationShaderRecord.StartAddress, (unsigned long long)d.RayGenerationShaderRecord.SizeInBytes,
+        (unsigned long long)d.MissShaderTable.StartAddress, (unsigned long long)d.MissShaderTable.SizeInBytes,
+        (unsigned long long)d.MissShaderTable.StrideInBytes, (unsigned long long)d.HitGroupTable.StartAddress,
+        (unsigned long long)d.HitGroupTable.SizeInBytes, (unsigned long long)d.HitGroupTable.StrideInBytes,
+        (unsigned long long)d.CallableShaderTable.StartAddress, (unsigned long long)d.CallableShaderTable.SizeInBytes, d.Width, d.Height, d.Depth);
+    return b;
+}
+
+// A direct dispatch (RtNoteRays): noted for the frame; and, a few times while a character is in the world, where these
+// rays' TLAS is bound -- root SRVs and the entries of the compute tables that are acceleration structure views.
+void M5NoteDirect(command_list* cmd_list, uint64_t rg_va, uint64_t miss_va, uint64_t hit_va, uint64_t hit_size)
+{
+    std::lock_guard l(g_m3_m);
+    if (g_m5_dir.frame != g_frame_id) {
+        g_m5_dir = {};
+        g_m5_dir.frame = g_frame_id;
+    }
+    ++g_m5_dir.count;
+    g_m5_dir.pso = CmdRtPipeline(cmd_list);
+    g_m5_dir.rg_va = rg_va;
+    g_m5_dir.miss_va = miss_va;
+    g_m5_dir.hit_va = hit_va;
+    g_m5_dir.hit_size = hit_size;
+    static uint32_t s_n = 0, s_last = 0;
+    if (s_n >= 3 || !g_m3_any.load(std::memory_order_relaxed) || g_frame_id - s_last < 600) return;
+    s_last = g_frame_id;
+    ++s_n;
+    device*         dev = cmd_list->get_device();
+    const CmdState& st = CmdGfx(cmd_list);
+    uint64_t        tlas = 0;
+    for (const TlasRec& r : g_m3_tlas)
+        if (r.res && r.dest && int32_t(g_frame_id - r.frame) <= 1) tlas = r.dest;
+    std::string out;
+    char        b[200];
+    for (uint32_t p = 0; p < 16; ++p) {
+        const RootParam& rp = st.root[p];
+        if (rp.view_va && rp.desc_type) {
+            snprintf(b, sizeof b, " | p%u root %s view %llx va %llx", p, rp.desc_type == 3 ? "UAV" : "SRV", (unsigned long long)rp.view_va,
+                (unsigned long long)rp.va);
+            out += b;
+        }
+        const descriptor_table tab = rp.compute_table();
+        if (!tab.handle) continue;
+        const TableStart ts = TableStartOf(dev, tab);
+        if (!ts) {
+            snprintf(b, sizeof b, " | p%u table %llx in no known heap", p, (unsigned long long)tab.handle);
+            out += b;
+            continue;
+        }
+        uint32_t    known = 0, as = 0;
+        std::string asl;
+        for (uint32_t i = 0; i < 128; ++i) {
+            ResInfo ri{};
+            if (!g_heap_to_res.find({ ts.heap, ts.base + i }, ri) || !ri.view_handle) continue;
+            ++known;
+            const resource_view_desc vd = dev->get_resource_view_desc(resource_view{ ri.view_handle });
+            if (vd.type != resource_view_type::acceleration_structure) continue;
+            ++as;
+            const resource r = dev->get_resource_from_view(resource_view{ ri.view_handle });
+            snprintf(b, sizeof b, " slot%u=view %llx res %llx+%llx", i, (unsigned long long)ri.view_handle, (unsigned long long)r.handle,
+                (unsigned long long)vd.buffer.offset);
+            asl += b;
+        }
+        snprintf(b, sizeof b, " | p%u heap %llx base %u: %u/128 known, %u AS view(s)", p, (unsigned long long)ts.heap, ts.base, known, as);
+        out += b + asl;
+    }
+    g_log.Line(true, "RTM5 tlas bind f=%u (state object %llx, newest TLAS %llx):%s", g_frame_id, (unsigned long long)g_m5_dir.pso,
+        (unsigned long long)tlas, out.c_str());
+}
+
+// Readbacks of indirect dispatches' arguments the GPU has passed: logged (RtPresentTick).
+void M5PollReadbacks()
+{
+    std::lock_guard l(g_m3_m);
+    for (auto it = g_m5_rbs.begin(); it != g_m5_rbs.end();) {
+        if (!GpuPassed(it->stamp)) {
+            ++it;
+            continue;
+        }
+        void*             p = nullptr;
+        const D3D12_RANGE rr{ 0, it->n };
+        if (SUCCEEDED(it->rb->Map(0, &rr, &p)) && p) {
+            D3D12_DISPATCH_RAYS_DESC d{};
+            memcpy(&d, p, (std::min)(size_t(it->n), sizeof d));
+            g_log.Line(true, "RTM5 indirect readback (f=%u args %llx, state object %llx; that frame's direct hit table %llx/%llu): %s | raw %s",
+                it->frame, (unsigned long long)it->args_va, (unsigned long long)it->pso, (unsigned long long)it->dir_hit,
+                (unsigned long long)it->dir_hit_size, M5DescText(d).c_str(), M5Hex(static_cast<const uint8_t*>(p), it->n).c_str());
+            const D3D12_RANGE none{ 0, 0 };
+            it->rb->Unmap(0, &none);
+        }
+        it = g_m5_rbs.erase(it);
+    }
+}
+
 bool M5Indirect(command_list* cmd_list, resource args, uint64_t args_off, uint32_t max_count)
 {
     const uint32_t  frame = g_frame_id;
@@ -2520,6 +2645,7 @@ bool M5Indirect(command_list* cmd_list, resource args, uint64_t args_off, uint32
     ID3D12Resource* src = nullptr;
     uint64_t        src_va = 0;
     const char*     from = "nowhere we saw";
+    CopyRec         found{}; // (observe) the copy it came from
     if (ares && HeapTypeOf(ares) == int(D3D12_HEAP_TYPE_UPLOAD)) {
         src = ares;
         src_va = args_va;
@@ -2538,6 +2664,7 @@ bool M5Indirect(command_list* cmd_list, resource args, uint64_t args_off, uint32
         };
         scan(g_copies, 512);
         scan(g_small_copies, 256);
+        if (c) found = *c;
         if (c && HeapTypeOf(c->src) == int(D3D12_HEAP_TYPE_UPLOAD)) {
             src = c->src;
             src_va = c->src_va + (args_va - c->dst_va);
@@ -2567,6 +2694,70 @@ bool M5Indirect(command_list* cmd_list, resource args, uint64_t args_off, uint32
     ++g_m5_ind_seen;
     M5IndNote& note = g_m5_ind_ring[g_m5_ind_next++ & 31];
     note = { reinterpret_cast<const void*>(cmd_list->get_native()), frame, args_va, "game's table" };
+    {
+        // (observe) the first ones that do not read as a desc, and a few of sampled frames, in full -- with a readback of the
+        // arguments as the GPU executes them (after the game's own writes into them)
+        static uint32_t s_sample = UINT32_MAX, s_samples = 0, s_last = 0, s_in = 0, s_bad = 0;
+        bool            detail = false;
+        if (copies_noted) {
+            if (frame != s_sample && s_samples < 6 && frame - s_last >= 900 && g_m3_any.load(std::memory_order_relaxed)) {
+                s_sample = s_last = frame;
+                ++s_samples;
+                s_in = 0;
+            }
+            detail = (frame == s_sample && s_in++ < 6) || ((!have || !looks) && s_bad++ < 6);
+        }
+        if (detail) {
+            const uint64_t pso = CmdRtPipeline(cmd_list);
+            const bool     same_frame = g_m5_dir.frame == frame;
+            char           cp[220] = "";
+            if (found.src)
+                snprintf(cp, sizeof cp, " [copy: src %llx heap %d, %llu bytes into %llx..%llx; the args at +%llx]", (unsigned long long)found.src_va,
+                    HeapTypeOf(found.src), (unsigned long long)found.size, (unsigned long long)found.dst_va,
+                    (unsigned long long)(found.dst_va + found.size), (unsigned long long)(args_va - found.dst_va));
+            uint8_t        raw[sizeof(D3D12_DISPATCH_RAYS_DESC)] = {};
+            if (have) memcpy(raw, &desc, sizeof raw);
+            g_log.Line(true,
+                "RTM5 indirect detail f=%u: state object %llx (direct dispatches this frame so far %u, state object %llx, hit %llx/%llu, raygen %llx); "
+                "args %llx (heap %d, width %llu) max %u; desc from %s%s%s: %s | raw %s",
+                frame, (unsigned long long)pso, same_frame ? g_m5_dir.count : 0, same_frame ? (unsigned long long)g_m5_dir.pso : 0ull,
+                (unsigned long long)g_m5_dir.hit_va, (unsigned long long)g_m5_dir.hit_size, (unsigned long long)g_m5_dir.rg_va,
+                (unsigned long long)args_va, HeapTypeOf(ares), ares ? (unsigned long long)ares->GetDesc().Width : 0ull, max_count, from, cp,
+                have ? (looks ? "" : " (does not read as a desc)") : "", have ? M5DescText(desc).c_str() : "-", have ? M5Hex(raw, sizeof raw).c_str() : "-");
+            ComPtr<ID3D12GraphicsCommandList> gcl;
+            if (ares && max_count == 1 && g_m5_rb_total < 8 && g_m5_rbs.size() < 8 &&
+                SUCCEEDED(reinterpret_cast<IUnknown*>(cmd_list->get_native())->QueryInterface(IID_PPV_ARGS(&gcl))) && gcl) {
+                const uint64_t off = args_va - ares->GetGPUVirtualAddress(), width = ares->GetDesc().Width;
+                const uint32_t n = uint32_t((std::min)(uint64_t(128), width > off ? width - off : 0));
+                M5Readback     r;
+                if (n >= sizeof(D3D12_DISPATCH_RAYS_DESC) &&
+                    SUCCEEDED(CreateD3D12Buffer(g_d3d12_device, D3D12_HEAP_TYPE_READBACK, 256, D3D12_RESOURCE_STATE_COPY_DEST, &r.rb))) {
+                    // the arguments are INDIRECT_ARGUMENT here (the ExecuteIndirect that follows requires it): a read-only
+                    // round trip through COPY_SOURCE
+                    D3D12_RESOURCE_BARRIER br{};
+                    br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    br.Transition.pResource = ares;
+                    br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    br.Transition.StateBefore = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+                    br.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    M3Marker(gcl.Get(), L"wwmi rt-m5: indirect arguments readback");
+                    gcl->ResourceBarrier(1, &br);
+                    gcl->CopyBufferRegion(r.rb.Get(), 0, ares, off, n);
+                    std::swap(br.Transition.StateBefore, br.Transition.StateAfter);
+                    gcl->ResourceBarrier(1, &br);
+                    r.stamp = GpuStamp();
+                    r.frame = frame;
+                    r.args_va = args_va;
+                    r.n = n;
+                    r.pso = pso;
+                    r.dir_hit = same_frame ? g_m5_dir.hit_va : 0;
+                    r.dir_hit_size = same_frame ? g_m5_dir.hit_size : 0;
+                    g_m5_rbs.push_back(std::move(r));
+                    ++g_m5_rb_total;
+                }
+            }
+        }
+    }
     const TlasRec* t = M5OnTlas();
     // a desc M5 cannot point at its table: M5 off for the session (checked armed or not: it must never turn on then), and
     // the dispatch skipped while instances point at our block (with the game's table it would read past its end)
@@ -3207,6 +3398,7 @@ bool RtNoteRays(command_list* cmd_list, resource rg_res, uint64_t rg_off, uint64
     ObserveRays(rg_res, rg_off, rg_size, miss_res, miss_off, miss_size, miss_stride, hit_res, hit_off, hit_size, hit_stride, w, h, d);
     if (Mode() != 2) return false;
     M5ObserveRays(cmd_list, hit_res, hit_off, hit_size, hit_stride, w, h);
+    if (cmd_list) M5NoteDirect(cmd_list, BufferVa(rg_res, rg_off), BufferVa(miss_res, miss_off), BufferVa(hit_res, hit_off), hit_size);
     M3Redirect(cmd_list, hit_res, hit_off, hit_size, hit_stride);
     // M5: instances pointing past the game's table: this dispatch is issued with our extended table (or skipped)
     return M3On() && M5AfterRays(cmd_list, rg_res, rg_off, rg_size, miss_res, miss_off, miss_size, miss_stride, hit_res, hit_off, hit_size,
@@ -3235,7 +3427,10 @@ void M3PresentTick()
 
 void RtPresentTick()
 {
-    if (Mode() == 2) M3PresentTick();
+    if (Mode() == 2) {
+        M3PresentTick();
+        M5PollReadbacks();
+    }
     static bool     s_held = false;
     static bool     s_started = false;
     static uint32_t s_last_summary = 0;
