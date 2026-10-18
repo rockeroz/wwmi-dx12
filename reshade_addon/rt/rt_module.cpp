@@ -1666,6 +1666,7 @@ void M4Observe(device* dev, uint64_t game, const ModBlas& mb, const RecTx& tx, u
 // game's (this frame's) descriptor heap, to the mod's UVs / posed tangents / colors, so a hit on our BLAS reads the
 // mod's attributes at the mod's vertex indices. Only once the records and instances are ours. rt_m4 = 0: off. g_m3_m.
 uint64_t g_m4_tables = 0, g_m4_slots = 0;
+uint64_t g_m4_tex_mod = 0, g_m4_tex_swapped = 0, g_m4_tex_norule = 0, g_m4_tex_nosrv = 0; // texture slots seen
 int      M4Mode()
 {
     static int s = -1;
@@ -1695,7 +1696,8 @@ void M4Apply(device* dev, const ModBlas& mb, const RecTx& tx, uint64_t stride, u
         rtskin::VfViews v{};
         uint32_t        vfmt = 0;
         std::string     what;
-        for (uint32_t k = 0; k < 8; ++k) { // the vertex factory's buffers lead the table; the first texture ends them
+        uint32_t k = 0;
+        for (; k < 8; ++k) { // the vertex factory's buffers lead the table; the first texture ends them
             ResInfo ri{};
             if (!g_heap_to_res.find({ ts.heap, ts.base + k }, ri) || !ri.view_handle) break;
             const resource_view_desc vd = dev->get_resource_view_desc(resource_view{ ri.view_handle });
@@ -1722,7 +1724,46 @@ void M4Apply(device* dev, const ModBlas& mb, const RecTx& tx, uint64_t stride, u
             what += "=";
             what += tag;
         }
+        // then the material's textures, up to the next table's first buffer: the game's, unless the core swapped the
+        // descriptor at placement; one a mod replaces (by hash rule) gets the mod's texture, as the raster draws it
+        uint32_t tex_mod = 0, tex_sw = 0, tex_none = 0, tex_nosrv = 0;
+        for (uint32_t end = k + 24; what.size() && k < end; ++k) {
+            ResInfo ri{};
+            if (!g_heap_to_res.find({ ts.heap, ts.base + k }, ri) || !ri.view_handle) break;
+            const resource_view_desc vd = dev->get_resource_view_desc(resource_view{ ri.view_handle });
+            if (vd.type == resource_view_type::buffer || vd.type == resource_view_type::unknown) break;
+            ID3D12Resource* res = ri.swapped ? ri.swapped : ri.res;
+            if (!res) continue;
+            bool is_mod;
+            {
+                std::shared_lock l(g_tex_mutex);
+                is_mod = g_modtex_res.count(reinterpret_cast<uint64_t>(res)) != 0;
+            }
+            if (is_mod) {
+                ++tex_mod;
+                continue;
+            }
+            const uint32_t rule = TexRuleHashFor(TexHashOf(reinterpret_cast<uint64_t>(res)));
+            if (!rule) {
+                ++tex_none;
+                continue;
+            }
+            const D3D12_CPU_DESCRIPTOR_HANDLE src = TexReplacement(rule);
+            if (!src.ptr) {
+                ++tex_nosrv;
+                continue;
+            }
+            g_d3d12_device->CopyDescriptorsSimple(1, { cpu0 + SIZE_T(ts.base + k) * inc }, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            ++tex_sw;
+        }
+        g_m4_tex_mod += tex_mod;
+        g_m4_tex_swapped += tex_sw;
+        g_m4_tex_norule += tex_none;
+        g_m4_tex_nosrv += tex_nosrv;
         if (!what.empty()) {
+            char t[96];
+            snprintf(t, sizeof t, " | textures: %u mod already, %u swapped, %u no rule, %u rule without texture", tex_mod, tex_sw, tex_none, tex_nosrv);
+            what += t;
             ++g_m4_tables;
             static std::atomic<uint32_t> s_log{ 0 };
             if (s_log.fetch_add(1) < 24)
@@ -1972,7 +2013,9 @@ void M3Summary()
                 (unsigned long long)mb.rays_covered, (unsigned long long)mb.rays_live, (unsigned long long)mb.rays_found,
                 mb.redirected ? int(g_frame_id - mb.redirected) : -1, mb.builds);
     for (const auto& [why, n] : g_m3_why) g_log.Line(true, "RTM3WHY %llu: %s", (unsigned long long)n, why.c_str());
-    g_log.Line(true, "RTM4SUM rt_m4=%d tables rewritten=%llu slots=%llu", M4Mode(), (unsigned long long)g_m4_tables, (unsigned long long)g_m4_slots);
+    g_log.Line(true, "RTM4SUM rt_m4=%d tables rewritten=%llu slots=%llu textures: mod already %llu, swapped %llu, no rule %llu, rule without texture %llu",
+        M4Mode(), (unsigned long long)g_m4_tables, (unsigned long long)g_m4_slots, (unsigned long long)g_m4_tex_mod, (unsigned long long)g_m4_tex_swapped,
+        (unsigned long long)g_m4_tex_norule, (unsigned long long)g_m4_tex_nosrv);
     std::string fw;
     for (const auto& [why, n] : g_m3_full_why) fw += " | " + std::to_string(n) + " " + why;
     if (!fw.empty()) g_log.Line(true, "RTM3FULL full BLAS builds by reason:%s", fw.c_str());
