@@ -16,6 +16,9 @@
 //                frame's upload buffer; the root SRV points at the view's first element)
 //   t5 VgIds     optional (VgStride != 0): the mod's 16-bit bone ids per influence (BlendRemapVertexVG.buf, WWMI's
 //                blend remap: merged skeletons over 256 bones, whose Blend.buf byte ids cannot address them)
+//   BlendMode 1: Blend.buf holds InfluenceCount R16_UINT bone ids then InfluenceCount R16_UNORM weights (stride 32,
+//                8 influences: mods that build their own instance skeleton, e.g. Hsin "Moonover Fox"; the palette is
+//                that skeleton, rebuilt by the module from the sections' palettes and the mod's bone maps)
 //   u0 OutPositions FLOAT3 per vertex
 //   u1 OutTangents  two R16G16B16A16_SNORM per vertex (TangentX, TangentZ.w = sign), the skin cache's own format
 #define RtSkinModRS \
@@ -35,7 +38,7 @@ cbuffer Parameters : register(b0)
     uint OutPosOffset;   // byte offset of this list's region in u0
     uint OutTanOffset;   // byte offset of this list's region in u1
     uint VgStride;       // bytes per vertex in VgIds (InfluenceCount * 2), 0 = the bone ids are Blend.buf's bytes
-    uint Pad1;
+    uint BlendMode;      // 0: byte ids + UNORM8 weights, 1: R16 ids + UNORM16 weights
     uint Pad2;
 };
 
@@ -51,6 +54,11 @@ RWByteAddressBuffer OutTangents  : register(u1);
 uint BlendByte(uint offset)
 {
     return (Blends.Load(offset & ~3u) >> ((offset & 3u) * 8u)) & 255u;
+}
+
+uint BlendShort(uint offset)
+{
+    return (Blends.Load(offset & ~3u) >> ((offset & 2u) * 8u)) & 0xffffu;
 }
 
 float4 Snorm8x4(uint packed)
@@ -75,31 +83,39 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     // the blended bone matrix: sum of weight * rows
     float4 r0 = 0, r1 = 0, r2 = 0;
-    uint   sum = 0;
+    float  sum = 0;
     [loop]
     for (uint i = 0; i < 16u; ++i) {
         if (i >= InfluenceCount) break;
-        const uint w = BlendByte(v * BlendStride + InfluenceCount + i);
-        if (!w) continue;
-        uint b;
-        if (VgStride) {
-            const uint o = v * VgStride + i * 2u;
-            b = (VgIds.Load(o & ~3u) >> ((o & 2u) * 8u)) & 0xffffu;
-        } else
-            b = BlendByte(v * BlendStride + i);
+        uint  b;
+        float f;
+        if (BlendMode == 1u) {
+            const uint w = BlendShort(v * BlendStride + InfluenceCount * 2u + i * 2u);
+            if (!w) continue;
+            b = BlendShort(v * BlendStride + i * 2u);
+            f = float(w) / 65535.0;
+        } else {
+            const uint w = BlendByte(v * BlendStride + InfluenceCount + i);
+            if (!w) continue;
+            if (VgStride) {
+                const uint o = v * VgStride + i * 2u;
+                b = (VgIds.Load(o & ~3u) >> ((o & 2u) * 8u)) & 0xffffu;
+            } else
+                b = BlendByte(v * BlendStride + i);
+            f = float(w) / 255.0;
+        }
         if (b >= BoneCount) continue; // a bone the palette does not have: skipped, not read out of bounds
-        const float f = float(w) / 255.0;
         r0 += asfloat(Palette.Load4(b * 48u)) * f;
         r1 += asfloat(Palette.Load4(b * 48u + 16u)) * f;
         r2 += asfloat(Palette.Load4(b * 48u + 32u)) * f;
-        sum += w;
+        sum += f;
     }
     const float3 p = asfloat(Positions.Load3(v * 12u));
     float3       q = p;
-    if (sum) {
+    if (sum > 0.0) {
         const float4 h = float4(p, 1.0);
         q = float3(dot(r0, h), dot(r1, h), dot(r2, h));
-        if (sum != 255u) q = lerp(p, q, 255.0 / float(sum)); // renormalise partial weights
+        if (abs(sum - 1.0) > 0.002) q /= sum; // renormalise partial weights (sum of weight * matrix * p)
     }
     if (!all(isfinite(q))) q = p;
     OutPositions.Store3(OutPosOffset + v * 12u, asuint(q));
@@ -108,7 +124,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 a = Snorm8x4((VectorFlags & 1u) ? vec.y : vec.x); // tangent
     const float4 n = Snorm8x4((VectorFlags & 1u) ? vec.x : vec.y); // normal, w = bitangent sign
     float3       t = a.xyz, z = n.xyz;
-    if (sum) {
+    if (sum > 0.0) {
         t = float3(dot(r0.xyz, a.xyz), dot(r1.xyz, a.xyz), dot(r2.xyz, a.xyz));
         z = float3(dot(r0.xyz, n.xyz), dot(r1.xyz, n.xyz), dot(r2.xyz, n.xyz));
     }

@@ -115,12 +115,20 @@ struct Mesh {
     std::map<int, std::pair<Pose, Pose>>            poses; // component -> (latest pose, the one before): velocity history
     // WWMI merged skeleton ($\WWMIv1\vg_offset / vg_count): the mod's bone indices address every section's palette
     // laid end to end, section k's first vg_count bones at vg_offset
+    // A run of bones copied from section `index`'s palette (bones src..src+count-1) to the merged palette at offset.
+    // WWMI merged skeletons: one run per section (src 0). Mods with their own instance skeleton (stride-32 blends,
+    // e.g. Hsin "Moonover Fox"): the canonical runs (section k's bones at its import offset) then the mod's per-
+    // component draw bone maps (local bone -> destination), as runs of consecutive pairs.
     struct MergedComp {
         int      index;
         uint32_t offset, count;
+        uint32_t src = 0;
     };
     std::vector<MergedComp> merged;
+    std::vector<int>        merged_idx; // the distinct sections the runs read
     uint32_t                merged_bones = 0;
+    bool                    blend16 = false; // Blend.buf: R16 ids + R16_UNORM weights (BlendMode 1)
+    uint32_t                custom_pairs = 0; // instance skeleton: draw bone map pairs read
     Pose                    merged_cur, merged_prev; // the last merged palettes built (velocity-free history)
     // M3: per component, the slots its sub-draws were posed into, this frame and the one before (the BLAS takes one)
     struct RtPose {
@@ -286,6 +294,141 @@ std::string Narrow(const std::wstring& w)
     return s;
 }
 
+// Mods that build their own instance skeleton (WWMI-Tools 1.7 "instance skeleton" exports, e.g. Hsin "Moonover Fox"):
+// Blend.buf has 8 R16_UINT ids + 8 R16_UNORM weights per vertex addressing a skeleton their compute shader
+// (InstanceSkeleton.hlsl) fills from each component's native bone CB:
+//   - canonical import, [CommandListImportInstance_TextureOverrideComponentN] x0 = bones, y0 = offset, w0 = 0:
+//     destination y0 + i <- local bone i (as a WWMI merged skeleton);
+//   - the draw bone map, ResourceDrawBoneMapComponentN (R32G32_UINT pairs, local bone -> destination): before the
+//     component's draw, its own bones overwrite the destinations they map to.
+// Under RT the draws carry no bone CB, so their shader cannot run: the same skeleton is built from the sections' skin
+// cache palettes (same local bone order as the bone CB). Every mapping of a destination names the same skeleton bone,
+// so one palette per frame serves every component.
+struct IniNums {
+    float x0 = -1, y0 = -1, w0 = -1;
+};
+void OnImportLine(const wchar_t* line, void* user)
+{
+    IniNums* n = static_cast<IniNums*>(user);
+    while (*line == L' ' || *line == L'\t') ++line;
+    float* dst = nullptr;
+    if (!_wcsnicmp(line, L"x0", 2)) dst = &n->x0;
+    else if (!_wcsnicmp(line, L"y0", 2)) dst = &n->y0;
+    else if (!_wcsnicmp(line, L"w0", 2)) dst = &n->w0;
+    if (!dst || *dst >= 0) return; // the first numeric assignment only (later ones restore saved values)
+    const wchar_t* p = line + 2;
+    while (*p == L' ' || *p == L'\t') ++p;
+    if (*p != L'=') return;
+    ++p;
+    while (*p == L' ' || *p == L'\t') ++p;
+    wchar_t* end = nullptr;
+    const double v = wcstod(p, &end);
+    if (end == p) return;
+    while (*end == L' ' || *end == L'\t' || *end == L'\r' || *end == L'\n') ++end;
+    if (*end) return; // an expression, not a number
+    *dst = float(v);
+}
+struct ImportCtx {
+    std::map<int, std::wstring> fq; // component -> its import section
+};
+void OnNsSection(const wchar_t* fq, void* user)
+{
+    static const wchar_t kTail[] = L"importinstance_textureoverridecomponent";
+    const wchar_t*       t = wcsrchr(fq, L'\\');
+    t = t ? t + 1 : fq;
+    const size_t n = wcslen(t), k = wcslen(kTail);
+    for (size_t i = 0; i + k <= n; ++i)
+        if (!_wcsnicmp(t + i, kTail, k)) {
+            const wchar_t* d = t + i + k;
+            if (*d < L'0' || *d > L'9') return;
+            wchar_t*   end = nullptr;
+            const long c = wcstol(d, &end, 10);
+            if (end && !*end && c >= 0 && c < 64) static_cast<ImportCtx*>(user)->fq[int(c)] = fq;
+            return;
+        }
+}
+
+bool LoadInstanceSkeleton(const WwmiMod::Mod& mod, Mesh& m) // g_m NOT held
+{
+    constexpr uint32_t kMaxBones = 4096; // InstanceSkeleton.hlsl's Skeleton is array/3 rows; 553 seen
+    // the namespace, from a resource of the mod
+    const WwmiMod::Resource* br = WwmiMod::Find(mod, L"ResourceBlendBuffer");
+    std::wstring             ns;
+    if (br && !br->fq.empty()) {
+        const size_t a = br->fq.find(L'\\'), b = br->fq.find_last_of(L'\\');
+        if (a != std::wstring::npos && b != std::wstring::npos && b > a) ns = br->fq.substr(a + 1, b - a - 1);
+    }
+    ImportCtx ic;
+    if (!ns.empty()) PortApi::ForEachSectionInNs(ns.c_str(), &OnNsSection, &ic);
+    struct Pair {
+        uint32_t src, dst;
+    };
+    std::map<int, std::vector<Pair>> maps;
+    uint32_t                         next = 0; // canonical offsets when the import sections cannot be read
+    std::vector<Mesh::MergedComp>    canon, over;
+    for (const WwmiMod::Component& wc : mod.comps) {
+        const int                idx = wc.index;
+        const std::wstring       name = L"ResourceDrawBoneMapComponent" + std::to_wstring(idx);
+        const WwmiMod::Resource* r = WwmiMod::Find(mod, name.c_str());
+        if (!r || r->fq.empty()) {
+            m.why = "instance skeleton (stride-32 blend): no " + Narrow(name);
+            return false;
+        }
+        std::vector<uint32_t> words(16384);
+        const size_t          got = PortApi::BufferInitialData(r->fq.c_str(), words.data(), words.size() * 4);
+        words.resize(got / 4);
+        if (words.size() < 2) {
+            m.why = "instance skeleton (stride-32 blend): " + Narrow(name) + " has no data";
+            return false;
+        }
+        std::vector<Pair>& pv = maps[idx];
+        for (size_t i = 0; i + 1 < words.size(); i += 2) pv.push_back({ words[i], words[i + 1] });
+        m.custom_pairs += uint32_t(pv.size());
+        // canonical import: x0 bones at y0 (mode 0); without the section, the bone map's count at the running offset
+        uint32_t count = uint32_t(pv.size()), offset = next;
+        const auto f = ic.fq.find(idx);
+        if (f != ic.fq.end()) {
+            IniNums nums;
+            PortApi::ForEachSectionLine(f->second.c_str(), &OnImportLine, &nums);
+            if (nums.w0 > 0.5f && (uint32_t(nums.w0) & 7) != 0) {
+                m.why = "instance skeleton: component " + std::to_string(idx) + " imports through a bone map (mode " +
+                        std::to_string(uint32_t(nums.w0) & 7) + "), not supported";
+                return false;
+            }
+            if (nums.x0 >= 1) count = uint32_t(nums.x0);
+            if (nums.y0 >= 0) offset = uint32_t(nums.y0);
+        }
+        next = offset + count;
+        if (offset + count > kMaxBones) {
+            m.why = "instance skeleton past " + std::to_string(kMaxBones) + " bones";
+            return false;
+        }
+        canon.push_back({ idx, offset, count, 0u });
+        m.merged_bones = (std::max)(m.merged_bones, offset + count);
+        // the draw bone map as runs, minus pairs the canonical import already does
+        for (size_t i = 0; i < pv.size();) {
+            const Pair p = pv[i];
+            size_t     j = i + 1;
+            while (j < pv.size() && pv[j].src == p.src + (j - i) && pv[j].dst == p.dst + (j - i)) ++j;
+            const uint32_t n = uint32_t(j - i);
+            i = j;
+            if (p.src >= 512 || p.dst + n > kMaxBones) continue; // their shader skips sources past 512
+            if (p.dst == offset + p.src && p.src + n <= count) continue;
+            over.push_back({ idx, p.dst, n, p.src });
+            m.merged_bones = (std::max)(m.merged_bones, p.dst + n);
+        }
+    }
+    if (canon.empty()) {
+        m.why = "instance skeleton: no components";
+        return false;
+    }
+    m.merged = std::move(canon);
+    m.merged.insert(m.merged.end(), over.begin(), over.end());
+    Log(true, "RTM2 instance skeleton mod=%d: %u bones, %zu components, %u bone map pairs -> %zu runs (%zu import sections read)",
+        m.mod, m.merged_bones, mod.comps.size(), m.custom_pairs, m.merged.size(), ic.fq.size());
+    return true;
+}
+
 bool LoadMesh(Mesh& m) // g_m NOT held (file and GPU work); the caller publishes
 {
     if (m.mod < 0 || size_t(m.mod) >= g_geomods.size()) {
@@ -364,10 +507,18 @@ bool LoadMesh(Mesh& m) // g_m NOT held (file and GPU work); the caller publishes
     // Blend stride 32 is not 16 byte influences: seen as 8 R16_UINT bone ids + 8 R16_UNORM weights addressing a skeleton the
     // mod builds itself (its own compute shader and bone maps, e.g. Hsin "Moonover Fox"): our palettes cannot pose it
     if (m.blend_stride == 32) {
-        m.why = "custom blend format (stride 32: 16-bit bone ids into a skeleton the mod builds itself) not supported";
-        return false;
+        if (!LoadInstanceSkeleton(mod, m)) return false;
+        vg.bytes.clear();
+        m.vg_stride = 0;
+        m.influences = 8;
+        m.blend16 = true;
     }
-    if (!m.verts || !m.indices || (m.blend_stride != 8 && m.blend_stride != 16) || blend.bytes.size() < size_t(m.verts) * m.blend_stride ||
+    {
+        std::set<int> seen;
+        for (const Mesh::MergedComp& mc : m.merged)
+            if (seen.insert(mc.index).second) m.merged_idx.push_back(mc.index);
+    }
+    if (!m.verts || !m.indices || (m.blend_stride != 8 && m.blend_stride != 16 && m.blend_stride != 32) || blend.bytes.size() < size_t(m.verts) * m.blend_stride ||
         vec.stride != 8 || vec.bytes.size() < size_t(m.verts) * 8 || !m.uv_stride || (m.uv_stride & 3) ||
         uv.bytes.size() < size_t(m.verts) * m.uv_stride) {
         m.why = "unexpected mesh layout";
@@ -560,13 +711,13 @@ bool BuildMerged(Mesh& m, Slot& sl, Bind& bind, int self_slot, uint64_t ring, ui
     const Pose& bp = m.merged_cur.frame < frame ? m.merged_cur : m.merged_prev;
     if (bp.slot >= 0 && bp.slot != self_slot && size_t(bp.slot) < m.slots.size() && bp.frame < frame && m.slots[size_t(bp.slot)].merged)
         base = &m.slots[size_t(bp.slot)];
-    std::vector<std::pair<const Mesh::MergedComp*, Sec>> fresh;
-    for (const Mesh::MergedComp& mc : m.merged) {
+    std::map<int, Sec> posed; // section -> this frame's palette
+    for (const int idx : m.merged_idx) {
         Sec x;
-        if (LookupSection(ring, mc.index, frame, &x, m.mod) && x.pal_res) fresh.push_back({ &mc, x });
+        if (LookupSection(ring, idx, frame, &x, m.mod) && x.pal_res) posed[idx] = x;
     }
-    if (!base && fresh.size() != m.merged.size()) return false;
-    if (fresh.empty() && !base) return false;
+    if (!base && posed.size() != m.merged_idx.size()) return false;
+    if (posed.empty() && !base) return false;
     D3D12_RESOURCE_BARRIER br{};
     br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     br.Transition.pResource = sl.merged.Get();
@@ -579,9 +730,13 @@ bool BuildMerged(Mesh& m, Slot& sl, Bind& bind, int self_slot, uint64_t ring, ui
         base->used = frame;
         base->stamp = GpuStamp();
     }
-    for (const auto& [mc, x] : fresh) {
-        const uint32_t n = (std::min)(mc->count, x.bones);
-        if (n && uint64_t(mc->offset + n) * 48 <= bytes) cl->CopyBufferRegion(sl.merged.Get(), uint64_t(mc->offset) * 48, x.pal_res, x.pal_off, uint64_t(n) * 48);
+    for (const Mesh::MergedComp& mc : m.merged) {
+        const auto px = posed.find(mc.index);
+        if (px == posed.end() || mc.src >= px->second.bones) continue;
+        const Sec&     x = px->second;
+        const uint32_t n = (std::min)(mc.count, x.bones - mc.src);
+        if (n && uint64_t(mc.offset + n) * 48 <= bytes)
+            cl->CopyBufferRegion(sl.merged.Get(), uint64_t(mc.offset) * 48, x.pal_res, x.pal_off + uint64_t(mc.src) * 48, uint64_t(n) * 48);
     }
     br.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     br.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -758,9 +913,10 @@ void LoaderThread()
         QueryPerformanceCounter(&t0);
         const bool ok = LoadMesh(m);
         QueryPerformanceCounter(&t1);
-        Log(true, "RTM2 mesh mod=%d %s in %.0f ms (background): verts=%u indices=%u influences=%u uv_stride=%u color=%d merged_skeleton=%u bones (%zu sections)%s%s",
+        Log(true, "RTM2 mesh mod=%d %s in %.0f ms (background): verts=%u indices=%u influences=%u%s uv_stride=%u color=%d merged_skeleton=%u bones (%zu sections, %zu runs)%s%s",
             mod, ok ? "loaded" : "FAILED", double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(f.QuadPart ? f.QuadPart : 1), m.verts, m.indices,
-            m.influences, m.uv_stride, m.has_color ? 1 : 0, m.merged_bones, m.merged.size(), ok ? "" : " -- ", ok ? "" : m.why.c_str());
+            m.influences, m.blend16 ? " (R16 ids, instance skeleton)" : "", m.uv_stride, m.has_color ? 1 : 0, m.merged_bones, m.merged_idx.size(),
+            m.merged.size(), ok ? "" : " -- ", ok ? "" : m.why.c_str());
         std::lock_guard l(g_m);
         m.ready = ok;
         m.failed = !ok;
@@ -858,9 +1014,9 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         bool fresh = LookupSection(ctx.ring, comp, frame, &sec, mod);
         if (!m.merged.empty()) { // merged skeleton: any section posed this frame, or last frame's palettes, will do
             bool any = false;
-            for (const Mesh::MergedComp& mc : m.merged) {
+            for (const int idx : m.merged_idx) {
                 Sec x;
-                any = any || LookupSection(ctx.ring, mc.index, frame, &x, mod);
+                any = any || LookupSection(ctx.ring, idx, frame, &x, mod);
             }
             fresh = any;
         }
@@ -886,9 +1042,9 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
             palette_va = sl.merged->GetGPUVirtualAddress();
             palette_bones = m.merged_bones;
             bool old = false;
-            for (const Mesh::MergedComp& mc : m.merged) {
+            for (const int idx : m.merged_idx) {
                 Sec x;
-                old = old || !LookupSection(ctx.ring, mc.index, frame, &x, mod) || x.frame != frame;
+                old = old || !LookupSection(ctx.ring, idx, frame, &x, mod) || x.frame != frame;
             }
             if (old) ++g_pose_stats[mod].merged_old;
         }
@@ -1008,7 +1164,8 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         // pose: COMMON | read -> UAV, dispatch, -> read
         const D3D12_RESOURCE_STATES from = bind->state == 2 ? kRead : D3D12_RESOURCE_STATE_COMMON;
         if (bind->state != 1) Transition(cl, sl.pos.Get(), sl.tan.Get(), from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        const uint32_t consts[12] = { s2, c, m.verts, palette_bones, m.influences, m.blend_stride, 0u, 0u, 0u, m.vg ? m.vg_stride : 0u, 0u, 0u };
+        const uint32_t consts[12] = { s2, c, m.verts, palette_bones, m.influences, m.blend_stride, 0u, 0u, 0u, m.vg ? m.vg_stride : 0u,
+            m.blend16 ? 1u : 0u, 0u };
         cl->SetComputeRootSignature(g_rs.Get());
         cl->SetPipelineState(g_pso.Get());
         cl->SetComputeRoot32BitConstants(0, 12, consts, 0);
