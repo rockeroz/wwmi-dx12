@@ -192,7 +192,7 @@ SectionPsStamps PlanSectionPsSlots(command_list* cmd_list, uint32_t gen0, const 
         if (ts) {
             read_as_bound.push_back(HeapKey{ ts.heap, ts.base + b.offset });
             ResInfo kri{};
-            if (g_heap_to_res.find({ ts.heap, ts.base + b.offset }, kri) && kri.res) RtNoteKeptTexture(dm, comp, kri.res);
+            if (g_heap_to_res.find({ ts.heap, ts.base + b.offset }, kri) && kri.res) RtNoteKeptTexture(dm, comp, kri.res, kri.swapped);
         }
     }
     {
