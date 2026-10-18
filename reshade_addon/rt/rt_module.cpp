@@ -595,7 +595,7 @@ struct CopyRec {
 };
 std::atomic<uint32_t> g_rec_seq{ 0 };
 std::mutex g_copy_m;
-CopyRec    g_copies[512];
+CopyRec    g_copies[2048]; // (512 lost a frame's shader table copy before its last indirect dispatch: M5 off, f5551)
 uint32_t   g_copy_next = 0;
 CopyRec    g_small_copies[256]; // 64..255 bytes (M5: a dispatch rays desc uploaded for an ExecuteIndirect)
 uint32_t   g_small_next = 0;
@@ -2060,6 +2060,7 @@ constexpr uint32_t kM5SlotRecs = 192, kM5MaxGeoms = 64, kM5Slots = 8; // a chara
 uint32_t           g_m5_r0 = 0;                                       // our block's first record (fixed once set)
 uint64_t           g_m5_stride = 0;                                   // ...and the record stride it was set for
 uint64_t           g_m5_copies = 0;                                   // extended copies of a game table made
+uint64_t           g_m5_src_cached = 0;                               // ...whose source came from the frame's earlier find
 std::map<uint64_t, uint32_t> g_m5_slot;                               // character (game BLAS) -> its slot
 std::map<uint64_t, std::pair<uint64_t, std::vector<uint8_t>>> g_m5_last; // character -> (table source, its last records)
 struct M5HeapCur {
@@ -2391,9 +2392,30 @@ uint64_t M5Extend(command_list* cmd_list, ID3D12GraphicsCommandList4* cl, const 
     ID3D12Resource* rd = nullptr;
     uint64_t        rd_va = 0;
     const char*     why = nullptr;
-    if (!M3HitSource(cmd_list, resource{ 0 }, hit_va, hit_size, g_frame_id, &rd, &rd_va, &why, nullptr)) {
-        *skip = "the hit group table's source is unknown";
-        return 0;
+    // a table's UPLOAD source stays as the game wrote it for the frame: found once (in the recording that filled the
+    // table), it serves the frame's later dispatches of that table in any recording
+    struct SrcSeen {
+        uint64_t        hit_va = 0, size = 0, rd_va = 0;
+        ID3D12Resource* rd = nullptr;
+    };
+    static std::vector<SrcSeen> s_src;
+    static uint32_t             s_src_frame = UINT32_MAX;
+    if (s_src_frame != g_frame_id) {
+        s_src.clear();
+        s_src_frame = g_frame_id;
+    }
+    if (M3HitSource(cmd_list, resource{ 0 }, hit_va, hit_size, g_frame_id, &rd, &rd_va, &why, nullptr)) {
+        if (std::none_of(s_src.begin(), s_src.end(), [&](const SrcSeen& e) { return e.hit_va == hit_va && e.size == hit_size; }) && s_src.size() < 64)
+            s_src.push_back({ hit_va, hit_size, rd_va, rd });
+    } else {
+        const auto it = std::find_if(s_src.begin(), s_src.end(), [&](const SrcSeen& e) { return e.hit_va == hit_va && e.size == hit_size; });
+        if (it == s_src.end()) {
+            *skip = "the hit group table's source is unknown";
+            return 0;
+        }
+        rd = it->rd;
+        rd_va = it->rd_va;
+        ++g_m5_src_cached;
     }
     if (!g_m5_r0 || !g_m5_stride) {
         *skip = "no block position yet";
@@ -2675,7 +2697,7 @@ bool M5Indirect(command_list* cmd_list, resource args, uint64_t args_off, uint32
                     c = &r;
             }
         };
-        scan(g_copies, 512);
+        scan(g_copies, 2048);
         scan(g_small_copies, 256);
         if (c) found = *c;
         if (c && HeapTypeOf(c->src) == int(D3D12_HEAP_TYPE_UPLOAD)) {
@@ -3276,10 +3298,10 @@ void M3Summary()
         std::string why;
         for (const auto& [wy, n] : g_m5_why) why += " | " + std::to_string(n) + " " + wy;
         g_log.Line(true,
-            "RTM5SUM rt_m5=%d%s dispatches extended=%llu skipped=%llu table copies=%llu | indirect ray dispatches=%llu (our table %llu, skipped %llu, "
+            "RTM5SUM rt_m5=%d%s dispatches extended=%llu skipped=%llu table copies=%llu (source from the frame's earlier find %llu) | indirect ray dispatches=%llu (our table %llu, skipped %llu, "
             "game's table %llu, no hit groups %llu) | blocks=%llu (failed %llu) tables=%llu (failed %llu) game tables reach %u%s",
             M5Mode(), g_m5_off.load() ? " (off: indirect rays)" : "", (unsigned long long)g_m5_ext, (unsigned long long)g_m5_skip,
-            (unsigned long long)g_m5_copies, (unsigned long long)g_m5_ind_seen, (unsigned long long)g_m5_ind_patched,
+            (unsigned long long)g_m5_copies, (unsigned long long)g_m5_src_cached, (unsigned long long)g_m5_ind_seen, (unsigned long long)g_m5_ind_patched,
             (unsigned long long)g_m5_ind_skipped, (unsigned long long)g_m5_ind_plain, (unsigned long long)g_m5_ind_nohit, (unsigned long long)g_m5_blocks,
             (unsigned long long)g_m5_block_fail, (unsigned long long)g_m5_tables, (unsigned long long)g_m5_table_fail, g_m5_game_hi, why.c_str());
     }
@@ -3318,7 +3340,7 @@ void RtNoteCopy(command_list* cmd_list, resource src, uint64_t src_off, resource
     r.frame = g_frame_id;
     std::lock_guard l(g_copy_m);
     if (short_copy) g_small_copies[g_small_next++ & 255] = r;
-    else g_copies[g_copy_next++ & 511] = r;
+    else g_copies[g_copy_next++ & 2047] = r;
 }
 
 bool RtNoteIndirectRays(command_list* cmd_list, resource args, uint64_t args_off, uint32_t max_count)

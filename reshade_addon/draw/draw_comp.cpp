@@ -1141,6 +1141,26 @@ bool DrawComponent(InjectFrame& fr, int dm, const WwmiMod::Component* wc)
                 g_wwmi_geom_count += did;
                 if (skip_orig || did > 0) return true;
                 ++g_port_fellback_count;
+                {
+                    // SECTION-NODRAW: an enabled mod's section ran and neither drew nor skipped -- the game's own draw goes
+                    // through (with an instance-skeleton mod: its original parts on screen). Per (mod, comp, VS): what this
+                    // pass binds, and what the mod's instance capture made of it.
+                    const float en = PortApi::GetVarNs(uns.c_str(), L"mod_enabled", -1.f);
+                    if (en != 0.f && logger::enabled(1) &&
+                        DiagOnce("SECTION-NODRAW", (int)(((uint64_t)(unsigned)dm << 24) ^ ((uint64_t)(unsigned)wc->index << 20) ^ (vs_hash & 0xfffff) ^ (vs_hash >> 40)))) {
+                        const auto&       gs = CmdGfx(cmd_list);
+                        const RootCbvBind obj = ObjectCbOf(cmd_list);
+                        logger::write("SECTION-NODRAW f=%u mod=%d comp=%d first=%u count=%u vs=%016llx pso=%llx rtv=%u dsv=%d vb0=%llx stride=%u inSkinBand=%d vb6=%llx | "
+                                      "bones cb4=%p/%llx root %d, cb3=%p/%llx root %d | object cb (vs-cb2) %p/%llx | instance_valid=%g instance_id=%g instance_slot=%g "
+                                      "object_detected=%g -- the game's draw goes through",
+                            g_frame_id, dm, wc->index, first_index, index_count, (unsigned long long)vs_hash, (unsigned long long)gs.gfx_pso,
+                            draw_rt.rtv_count, (int)draw_rt.has_dsv, (unsigned long long)gs.vb[0].va, gs.vb[0].stride, (int)InSkinBand(gs.vb[0].va),
+                            (unsigned long long)gs.vb[6].va, (void*)port_cb4_res, (unsigned long long)port_cb4_va, game_cb13_root, (void*)port_cb3_res,
+                            (unsigned long long)port_cb3_va, game_cb14_root, (void*)obj.res, (unsigned long long)obj.va,
+                            PortApi::GetVarNs(uns.c_str(), L"instance_valid", -1.f), PortApi::GetVarNs(uns.c_str(), L"instance_id", -1.f),
+                            PortApi::GetVarNs(uns.c_str(), L"instance_slot", -1.f), PortApi::GetVarNs(uns.c_str(), L"object_detected", -1.f));
+                    }
+                }
                 restore_state();
                 fr.mod_switched_off = PortApi::GetVarNs(uns.c_str(), L"mod_enabled", -1.f) == 0.f;
                 return false;
