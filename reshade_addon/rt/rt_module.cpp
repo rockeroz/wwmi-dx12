@@ -1681,7 +1681,14 @@ struct SlotTex {
     uint32_t                    hash = 0, hframe = 0; // the game texture's identity (target it stands for), refreshed
     uint32_t                    weight = 0, wframe = 0; // index count of the sub-draw that bound it, and when
 };
-thread_local uint32_t t_note_weight = 0;
+thread_local uint32_t t_note_weight = 0, t_note_first = UINT32_MAX;
+// M5 (observe): what each sub-draw of a mod component binds over which game texture, this frame -- how many distinct
+// texture sets a component's sub-draws use (a section's RT material holds one). (mod, comp, first index) -> binds.
+struct SubDrawBinds {
+    uint32_t                                                  count = 0, frame = 0;
+    std::vector<std::pair<uint64_t, uint64_t>>                binds; // (game resource, mod view)
+};
+std::map<std::tuple<int, int, uint32_t>, SubDrawBinds> g_m5_subdraws; // g_slot_tex_m
 std::mutex                                                g_slot_tex_m;
 std::map<std::tuple<int, int, uint64_t>, SlotTex>         g_slot_tex;
 uint64_t                                                  g_slot_tex_notes = 0;
@@ -2122,6 +2129,90 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
     }
 }
 
+// M5 (observe): a few dispatches of a sampled frame -- the hit group table's size and stride, and which descriptor
+// heap(s) its records' local tables (+64) live in, how big, and the range of table starts used: where a table of our
+// own could go, and how big an extended hit group table would be.
+void M5ObserveRays(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, uint32_t w, uint32_t h)
+{
+    static uint32_t s_sample = UINT32_MAX, s_last = 0, s_n = 0, s_samples = 0;
+    const uint32_t  frame = g_frame_id;
+    if (frame != s_sample) {
+        if (s_samples >= 4 || frame - s_last < 1800 || frame < 600) return;
+        s_sample = frame;
+        s_last = frame;
+        s_n = 0;
+        ++s_samples;
+    }
+    if (++s_n > 8 || !cmd_list) return;
+    ID3D12Resource* rd = nullptr;
+    uint64_t        rd_va = 0;
+    const char*     why = "";
+    const bool      src = M3HitSource(cmd_list, hit_res, hit_off, hit_size, frame, &rd, &rd_va, &why, nullptr);
+    std::string     heaps;
+    if (src && hit_stride >= 72 && hit_size <= (16ull << 20)) {
+        std::vector<uint8_t> buf(static_cast<size_t>(hit_size));
+        const uint32_t       got = GuardedPrivateRead(rd, rd_va, buf.data(), uint32_t(buf.size()));
+        struct HeapUse {
+            uint32_t n = 0, lo = UINT32_MAX, hi = 0, size = 0;
+        };
+        std::map<uint64_t, HeapUse> use;
+        uint32_t                    nontab = 0;
+        for (uint64_t o = 0; o + 72 <= got; o += hit_stride) {
+            uint64_t tab;
+            memcpy(&tab, buf.data() + o + 64, 8);
+            const TableStart ts = tab ? TableStartOf(cmd_list->get_device(), descriptor_table{ tab }) : TableStart{};
+            if (!ts) {
+                ++nontab;
+                continue;
+            }
+            HeapUse& u = use[ts.heap];
+            ++u.n;
+            u.lo = (std::min)(u.lo, ts.base);
+            u.hi = (std::max)(u.hi, ts.base);
+            if (!u.size) u.size = ts.Heap()->GetDesc().NumDescriptors;
+        }
+        char b[160];
+        for (const auto& [hp, u] : use) {
+            snprintf(b, sizeof b, " | heap %llx (%u descriptors): %u tables, starts %u..%u", (unsigned long long)hp, u.size, u.n, u.lo, u.hi);
+            heaps += b;
+        }
+        snprintf(b, sizeof b, " | %u record(s) without a table at +64 (of %llu read)", nontab, (unsigned long long)(got / hit_stride));
+        heaps += b;
+    }
+    g_log.Line(true, "RTM5 rays f=%u #%u %ux%u: hit table %llu bytes, stride %llu (%llu records), source %s%s", frame, s_n, w, h,
+        (unsigned long long)hit_size, (unsigned long long)hit_stride, (unsigned long long)(hit_stride ? hit_size / hit_stride : 0),
+        src ? (HeapTypeOf(rd) == int(D3D12_HEAP_TYPE_UPLOAD) ? "UPLOAD" : "?") : why, heaps.c_str());
+}
+
+// M5 (observe): per mod component, how many distinct texture sets its sub-draws bind (sub-draws seen in the last 60 frames).
+void M5SubDrawSummary()
+{
+    std::lock_guard l(g_slot_tex_m);
+    std::map<std::pair<int, int>, std::map<std::vector<std::pair<uint64_t, uint64_t>>, std::pair<uint32_t, uint64_t>>> per; // -> set -> (sub-draws, indices)
+    for (auto& [k, sb] : g_m5_subdraws) {
+        if (g_frame_id - sb.frame > 60) continue;
+        std::vector<std::pair<uint64_t, uint64_t>> set = sb.binds;
+        std::sort(set.begin(), set.end());
+        auto& v = per[{ std::get<0>(k), std::get<1>(k) }][set];
+        ++v.first;
+        v.second += sb.count;
+    }
+    for (const auto& [mc, sets] : per) {
+        std::string line;
+        char        b[96];
+        int         i = 0;
+        for (const auto& [set, v] : sets) {
+            if (i++ >= 12) {
+                line += " ...";
+                break;
+            }
+            snprintf(b, sizeof b, " [set %d: %zu bind(s), %u sub-draw(s), %llu indices]", i - 1, set.size(), v.first, (unsigned long long)v.second);
+            line += b;
+        }
+        g_log.Line(true, "RTM5SUB mod=%d comp=%d: %zu texture set(s) over its bound sub-draws:%s", mc.first, mc.second, sets.size(), line.c_str());
+    }
+}
+
 // RTM3SUM / RTM3CHAR / RTM3WHY lines (every summary).
 void M3Summary()
 {
@@ -2171,6 +2262,7 @@ void M3Summary()
         "target unresolved %llu | slot stamps noted %llu (%zu game->mod pairs)",
         M4Mode(), (unsigned long long)g_m4_tables, (unsigned long long)g_m4_slots, (unsigned long long)g_m4_tex_mod, (unsigned long long)g_m4_tex_swapped,
         (unsigned long long)g_m4_tex_lod, (unsigned long long)g_m4_tex_rsw, (unsigned long long)g_m4_tex_slot, (unsigned long long)g_m4_tex_norule, (unsigned long long)g_m4_tex_nosrv, (unsigned long long)slot_notes, slot_maps);
+    M5SubDrawSummary();
     std::string fw;
     for (const auto& [why, n] : g_m3_full_why) fw += " | " + std::to_string(n) + " " + why;
     if (!fw.empty()) g_log.Line(true, "RTM3FULL full BLAS builds by reason:%s", fw.c_str());
@@ -2253,6 +2345,7 @@ void RtNoteRays(command_list* cmd_list, resource rg_res, uint64_t rg_off, uint64
     NoteRtFrame();
     g_c.rays.fetch_add(1, std::memory_order_relaxed);
     ObserveRays(rg_res, rg_off, rg_size, miss_res, miss_off, miss_size, miss_stride, hit_res, hit_off, hit_size, hit_stride, w, h, d);
+    if (Mode() == 2) M5ObserveRays(cmd_list, hit_res, hit_off, hit_size, hit_stride, w, h);
     if (Mode() == 2) M3Redirect(cmd_list, hit_res, hit_off, hit_size, hit_stride);
 }
 
@@ -3257,6 +3350,16 @@ void RtNoteSlotTexture(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRI
     std::lock_guard l(g_slot_tex_m);
     ++g_slot_tex_notes;
     if (g_slot_tex.size() > 4096) g_slot_tex.clear();
+    if (t_note_first != UINT32_MAX && g_m5_subdraws.size() < 4096) {
+        SubDrawBinds& sb = g_m5_subdraws[{ mod, comp, t_note_first }];
+        if (sb.frame != g_frame_id) {
+            sb.frame = g_frame_id;
+            sb.binds.clear();
+        }
+        sb.count = t_note_weight;
+        const std::pair<uint64_t, uint64_t> b{ reinterpret_cast<uint64_t>(game), src.ptr };
+        if (std::find(sb.binds.begin(), sb.binds.end(), b) == sb.binds.end() && sb.binds.size() < 16) sb.binds.push_back(b);
+    }
     SlotTex& e = g_slot_tex[{ mod, comp, reinterpret_cast<uint64_t>(game) }];
     const uint32_t weight = t_note_weight;
     // sub-draws of one component binding different textures over the same game texture: one material table, so the
@@ -3318,7 +3421,8 @@ void RtNoteKeptTexture(int mod, int comp, ID3D12Resource* game, ID3D12Resource* 
     }
 }
 
-void RtSetNoteWeight(uint32_t index_count)
+void RtSetNoteDraw(uint32_t first_index, uint32_t index_count)
 {
     t_note_weight = index_count;
+    t_note_first = first_index;
 }

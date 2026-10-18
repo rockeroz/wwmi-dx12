@@ -58,7 +58,7 @@ void SectionDrawIndexed(SectionDraw& sd, uint32_t c, uint32_t s2, uint32_t b2)
     const int                         dm = sd.dm;
     const WwmiMod::Component* const   wc = sd.wc;
     const PortHooks&                  hk = sd.hk;
-    RtSetNoteWeight(c); // RT M4: a component drawn in sub-draws with different textures keeps the largest one's
+    RtSetNoteDraw(s2, c); // RT M4: a component drawn in sub-draws with different textures keeps the largest one's
     uint32_t&                         did = sd.did;
     const RfxGlowState                rfx_glow = g_disable_tex ? RfxGlowState{} : WithSectionRfxMaps(sd.rfx_glow, sd.dm, sd.wc ? (int)sd.wc->index : -1, sd.hk.srv_gen0);
     const RfxTexLatch                 rfx_tex = g_disable_tex ? RfxTexLatch{} : sd.rfx_tex;

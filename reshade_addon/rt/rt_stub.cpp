@@ -60,7 +60,7 @@ void RtObserveDraw(reshade::api::command_list*, uint32_t, uint32_t, int32_t, uin
 void RtPresentTick() {}
 void RtNoteSlotTexture(int, int, ID3D12Resource*, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*) {}
 void RtNoteKeptTexture(int, int, ID3D12Resource*, ID3D12Resource*) {}
-void RtSetNoteWeight(uint32_t) {}
+void RtSetNoteDraw(uint32_t, uint32_t) {}
 void RtNoteDrawOutcome(int, int, int) {}
 void RtDrawOverlay()
 {

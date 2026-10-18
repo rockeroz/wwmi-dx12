@@ -117,7 +117,7 @@ void RtNoteSlotTexture(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRI
 void RtNoteKeptTexture(int mod, int comp, ID3D12Resource* game, ID3D12Resource* swapped);
 // The index count of the sub-draw whose binds are noted next on this thread (a component's material table can hold one
 // texture set: the largest sub-draw's wins).
-void RtSetNoteWeight(uint32_t index_count);
+void RtSetNoteDraw(uint32_t first_index, uint32_t index_count);
 // Once per frame from the present path, while the add-on is enabled: the module's hold transitions
 // (entering the hold gives every stamped texture slot back to the game) and its periodic work.
 void RtPresentTick();
