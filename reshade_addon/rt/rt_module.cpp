@@ -3123,7 +3123,7 @@ void RtNoteCopy(command_list* cmd_list, resource src, uint64_t src_off, resource
     if (Mode() != 2 || !(g_have_char_inst.load(std::memory_order_relaxed) || g_m3_any.load(std::memory_order_relaxed)) || size < 64 ||
         size > (8ull << 20) || !src.handle)
         return;
-    const bool small = size < 256;
+    const bool short_copy = size < 256; // (not "small": a Windows header macro)
     CopyRec r;
     r.cl = cmd_list;
     r.gen = CmdGen(cmd_list);
@@ -3134,7 +3134,7 @@ void RtNoteCopy(command_list* cmd_list, resource src, uint64_t src_off, resource
     r.src_va = BufferVa(src, src_off);
     r.frame = g_frame_id;
     std::lock_guard l(g_copy_m);
-    if (small) g_small_copies[g_small_next++ & 255] = r;
+    if (short_copy) g_small_copies[g_small_next++ & 255] = r;
     else g_copies[g_copy_next++ & 511] = r;
 }
 
