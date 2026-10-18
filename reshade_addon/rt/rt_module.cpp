@@ -844,6 +844,7 @@ struct TlasRec {
     uint32_t             m5_r0 = 0, m5_recs = 0;
     uint64_t             m5_stride = 0;
     std::vector<uint8_t> m5_block; // the newest block (records R0 ..)
+    uint64_t             m5_src = 0; // ...made from the hit group table at this (UPLOAD source) address: its shader ids
 };
 std::mutex                                           g_m3_m; // everything below
 std::map<uint64_t, ModBlas>                          g_m3;   // the game's BLAS (dest VA) -> ours
@@ -2052,7 +2053,7 @@ constexpr uint32_t kM5Region = 4096, kM5TableSlots = 40; // per frame in flight:
 constexpr uint32_t kM5SlotRecs = 192, kM5MaxGeoms = 64, kM5Slots = 8; // a character's slot: 64 geometries x 3 ray types
 uint32_t           g_m5_r0 = 0;                                       // our block's first record (fixed once set)
 std::map<uint64_t, uint32_t> g_m5_slot;                               // character (game BLAS) -> its slot
-std::map<uint64_t, std::pair<uint64_t, std::vector<uint8_t>>> g_m5_last; // character -> (stride, its last records)
+std::map<uint64_t, std::pair<uint64_t, std::vector<uint8_t>>> g_m5_last; // character -> (table source, its last records)
 struct M5HeapCur {
     uint32_t frame = UINT32_MAX, used = 0;
 };
@@ -2336,7 +2337,13 @@ bool M5AfterRays(command_list* cmd_list, resource rg_res, uint64_t rg_off, uint6
         M5Why(skip);
         return true;
     }
-    memcpy(e->up_ptr, t->m5_block.data(), t->m5_block.size());
+    // a block made from another table holds another pipeline's shader identifiers: zeros instead (null hit groups -- our
+    // characters miss this dispatch's rays, nothing reads a wrong record)
+    if (t->m5_src == rd_va) memcpy(e->up_ptr, t->m5_block.data(), t->m5_block.size());
+    else {
+        memset(e->up_ptr, 0, t->m5_block.size());
+        M5Why("dispatch traced with a null block (its block was made from another table)");
+    }
     D3D12_RESOURCE_BARRIER br{};
     br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     br.Transition.pResource = e->res.Get();
@@ -2534,11 +2541,11 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
                     m5_bad.insert(mb);
                     recs.clear();
                 } else
-                    g_m5_last[game] = { hit_stride, recs };
+                    g_m5_last[game] = { rd_va, recs };
             }
-            if (recs.empty()) { // not in this dispatch (or failed): its last records, if any
+            if (recs.empty()) { // not in this dispatch (or failed): its last records made from this same table (same shader ids)
                 const auto lt = g_m5_last.find(game);
-                if (lt != g_m5_last.end() && lt->second.first == hit_stride && !(mb && m5_bad.count(mb))) recs = lt->second.second;
+                if (lt != g_m5_last.end() && lt->second.first == rd_va && !(mb && m5_bad.count(mb))) recs = lt->second.second;
             }
             if (!recs.empty()) memcpy(at, recs.data(), (std::min)(recs.size(), size_t(kM5SlotRecs) * hit_stride));
         }
@@ -2663,6 +2670,7 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
             t.m5_stride = hit_stride;
             t.m5_recs = uint32_t(m5_block.size() / hit_stride);
             t.m5_block = std::move(m5_block);
+            t.m5_src = rd_va;
         }
     }
     // M4: the committed records' vertex factory slots (txs: one RecTx per candidate / instance already ours, each now
