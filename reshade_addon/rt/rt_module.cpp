@@ -242,7 +242,7 @@ private:
         CreateDirectoryW(dir_.c_str(), nullptr);
         const std::wstring path = dir_ + L"\\rt_observe.log";
         MoveFileExW(path.c_str(), (path + L".prev").c_str(), MOVEFILE_REPLACE_EXISTING);
-        f_ = _wfsopen(path.c_str(), L"wb", _SH_DENYWR);
+        f_ = _wfsopen(path.c_str(), L"wb", _SH_DENYNO); // readable (and zippable) while the game runs
         if (!f_) {
             ReshadeLog(reshade::log::level::warning, "wwmi-dx12 RT module: cannot create %s (error %lu)", Utf8(path).c_str(),
                 GetLastError());
@@ -1678,10 +1678,20 @@ struct SlotTex {
     ID3D12Resource*             res = nullptr;
     uint32_t                    frame = 0;
     unsigned                    gen = 0;
+    uint32_t                    hash = 0, hframe = 0; // the game texture's identity (target it stands for), refreshed
 };
 std::mutex                                                g_slot_tex_m;
 std::map<std::tuple<int, int, uint64_t>, SlotTex>         g_slot_tex;
 uint64_t                                                  g_slot_tex_notes = 0;
+// The same by the game texture's identity: the RT table may hold another resource of the same texture (another streamed
+// copy). (mod, identity) -> the newest stamp. g_slot_tex_m.
+std::map<std::pair<int, uint32_t>, SlotTex>               g_slot_tex_h;
+uint32_t TexIdentityNorm(uint32_t h) // a streamed lower mip's identity -> the target's
+{
+    if (!h) return 0;
+    const uint32_t t = TexLodTargetOf(h);
+    return t ? t : h;
+}
 constexpr uint32_t                                        kSlotTexAge = 600; // frames a stamp stays usable
 // Game textures a raster draw of the mod reads as the game bound them (no stamp): (mod, game resource) -> frame.
 std::map<std::pair<int, uint64_t>, uint32_t> g_raster_kept;
@@ -1725,7 +1735,14 @@ bool SlotTexFor(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRIPTOR_HA
     else // another component of the mod stamping the same game texture
         for (const auto& [k, v] : g_slot_tex)
             if (std::get<0>(k) == mod && std::get<2>(k) == reinterpret_cast<uint64_t>(game) && (!best || v.frame > best->frame)) best = &v;
-    if (!best || best->gen != gen || g_frame_id - best->frame > kSlotTexAge || !best->src.ptr) return false;
+    if (!best || best->gen != gen || g_frame_id - best->frame > kSlotTexAge || !best->src.ptr) {
+        // by identity: the same texture in another resource
+        const uint32_t h = TexIdentityNorm(TexHashOf(reinterpret_cast<uint64_t>(game)));
+        const auto     ih = h ? g_slot_tex_h.find({ mod, h }) : g_slot_tex_h.end();
+        if (ih == g_slot_tex_h.end() || ih->second.gen != gen || g_frame_id - ih->second.frame > kSlotTexAge || !ih->second.src.ptr) return false;
+        *out = ih->second.src;
+        return true;
+    }
     *out = best->src;
     return true;
 }
@@ -3244,11 +3261,19 @@ void RtNoteSlotTexture(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRI
     e.res = mod_res;
     e.frame = g_frame_id;
     e.gen = PortApi::LoadGeneration();
+    if (fresh || g_frame_id - e.hframe > 60) {
+        e.hash = TexIdentityNorm(TexHashOf(reinterpret_cast<uint64_t>(game)));
+        e.hframe = g_frame_id;
+    }
+    if (e.hash) {
+        if (g_slot_tex_h.size() > 4096) g_slot_tex_h.clear();
+        g_slot_tex_h[{ mod, e.hash }] = e;
+    }
     if (fresh) {
         static std::atomic<uint32_t> s_log{ 0 };
         if (s_log.fetch_add(1) < 64)
-            g_log.Line(true, "RTM4 slot stamp mod=%d comp=%d: game texture %p (%s) -> mod texture %p (%s)", mod, comp, (void*)game,
-                TexDesc(game).c_str(), (void*)mod_res, TexDesc(mod_res).c_str());
+            g_log.Line(true, "RTM4 slot stamp mod=%d comp=%d: game texture %p (%s, identity %08x) -> mod view %llx (%s)", mod, comp, (void*)game,
+                TexDesc(game).c_str(), e.hash, (unsigned long long)src.ptr, TexDesc(mod_res).c_str());
     }
 }
 
