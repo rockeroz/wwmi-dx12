@@ -110,6 +110,9 @@ void RtNoteExecute(reshade::api::command_queue* queue, reshade::api::command_lis
 void RtNoteRays(reshade::api::command_list* cmd_list, reshade::api::resource rg_res, uint64_t rg_off, uint64_t rg_size,
     reshade::api::resource miss_res, uint64_t miss_off, uint64_t miss_size, uint64_t miss_stride, reshade::api::resource hit_res,
     uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, uint32_t w, uint32_t h, uint32_t d);
+// A raster draw of mod component (mod, comp) stamped its texture over the game's texture `game` (section_ps_stamp.cpp):
+// M4 puts the same texture in that section's ray tracing material table.
+void RtNoteSlotTexture(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRIPTOR_HANDLE src, ID3D12Resource* mod_res);
 // Once per frame from the present path, while the add-on is enabled: the module's hold transitions
 // (entering the hold gives every stamped texture slot back to the game) and its periodic work.
 void RtPresentTick();

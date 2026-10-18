@@ -1667,6 +1667,34 @@ void M4Observe(device* dev, uint64_t game, const ModBlas& mb, const RecTx& tx, u
 // mod's attributes at the mod's vertex indices. Only once the records and instances are ours. rt_m4 = 0: off. g_m3_m.
 uint64_t g_m4_tables = 0, g_m4_slots = 0;
 uint64_t g_m4_tex_mod = 0, g_m4_tex_swapped = 0, g_m4_tex_norule = 0, g_m4_tex_nosrv = 0; // texture slots seen
+uint64_t g_m4_tex_slot = 0; // ...given the mod's texture its raster draw stamps over the same game texture
+// Slot-style mods (`ps-tN = ref ResourceTexture_X` in their component sections, no hash rule): what each raster draw of
+// a mod component stamped over which game texture (section_ps_stamp.cpp), so the material table of the same section
+// gets the same texture. (mod, comp, game resource) -> the mod's view. Own mutex: noted from the draw threads.
+struct SlotTex {
+    D3D12_CPU_DESCRIPTOR_HANDLE src{};
+    ID3D12Resource*             res = nullptr;
+    uint32_t                    frame = 0;
+    unsigned                    gen = 0;
+};
+std::mutex                                                g_slot_tex_m;
+std::map<std::tuple<int, int, uint64_t>, SlotTex>         g_slot_tex;
+uint64_t                                                  g_slot_tex_notes = 0;
+constexpr uint32_t                                        kSlotTexAge = 600; // frames a stamp stays usable
+bool SlotTexFor(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRIPTOR_HANDLE* out)
+{
+    std::lock_guard l(g_slot_tex_m);
+    const unsigned  gen = PortApi::LoadGeneration();
+    const SlotTex*  best = nullptr;
+    const auto      it = g_slot_tex.find({ mod, comp, reinterpret_cast<uint64_t>(game) });
+    if (it != g_slot_tex.end()) best = &it->second;
+    else // another component of the mod stamping the same game texture
+        for (const auto& [k, v] : g_slot_tex)
+            if (std::get<0>(k) == mod && std::get<2>(k) == reinterpret_cast<uint64_t>(game) && (!best || v.frame > best->frame)) best = &v;
+    if (!best || best->gen != gen || g_frame_id - best->frame > kSlotTexAge || !best->src.ptr) return false;
+    *out = best->src;
+    return true;
+}
 int      M4Mode()
 {
     static int s = -1;
@@ -1726,7 +1754,7 @@ void M4Apply(device* dev, const ModBlas& mb, const RecTx& tx, uint64_t stride, u
         }
         // then the material's textures, up to the next table's first buffer: the game's, unless the core swapped the
         // descriptor at placement; one a mod replaces (by hash rule) gets the mod's texture, as the raster draws it
-        uint32_t tex_mod = 0, tex_sw = 0, tex_none = 0, tex_nosrv = 0;
+        uint32_t tex_mod = 0, tex_sw = 0, tex_none = 0, tex_nosrv = 0, tex_slot = 0;
         for (uint32_t end = k + 24; what.size() && k < end; ++k) {
             ResInfo ri{};
             if (!g_heap_to_res.find({ ts.heap, ts.base + k }, ri) || !ri.view_handle) break;
@@ -1745,6 +1773,12 @@ void M4Apply(device* dev, const ModBlas& mb, const RecTx& tx, uint64_t stride, u
             }
             const uint32_t rule = TexRuleHashFor(TexHashOf(reinterpret_cast<uint64_t>(res)));
             if (!rule) {
+                D3D12_CPU_DESCRIPTOR_HANDLE st{};
+                if (SlotTexFor(mb.pose_mod[g], int(g), res, &st)) {
+                    g_d3d12_device->CopyDescriptorsSimple(1, { cpu0 + SIZE_T(ts.base + k) * inc }, st, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                    ++tex_slot;
+                    continue;
+                }
                 ++tex_none;
                 continue;
             }
@@ -1760,9 +1794,11 @@ void M4Apply(device* dev, const ModBlas& mb, const RecTx& tx, uint64_t stride, u
         g_m4_tex_swapped += tex_sw;
         g_m4_tex_norule += tex_none;
         g_m4_tex_nosrv += tex_nosrv;
+        g_m4_tex_slot += tex_slot;
         if (!what.empty()) {
-            char t[96];
-            snprintf(t, sizeof t, " | textures: %u mod already, %u swapped, %u no rule, %u rule without texture", tex_mod, tex_sw, tex_none, tex_nosrv);
+            char t[128];
+            snprintf(t, sizeof t, " | textures: %u mod already, %u swapped, %u from slot stamps, %u no rule, %u rule without texture", tex_mod, tex_sw,
+                tex_slot, tex_none, tex_nosrv);
             what += t;
             ++g_m4_tables;
             static std::atomic<uint32_t> s_log{ 0 };
@@ -2013,9 +2049,17 @@ void M3Summary()
                 (unsigned long long)mb.rays_covered, (unsigned long long)mb.rays_live, (unsigned long long)mb.rays_found,
                 mb.redirected ? int(g_frame_id - mb.redirected) : -1, mb.builds);
     for (const auto& [why, n] : g_m3_why) g_log.Line(true, "RTM3WHY %llu: %s", (unsigned long long)n, why.c_str());
-    g_log.Line(true, "RTM4SUM rt_m4=%d tables rewritten=%llu slots=%llu textures: mod already %llu, swapped %llu, no rule %llu, rule without texture %llu",
+    size_t slot_maps = 0;
+    uint64_t slot_notes = 0;
+    {
+        std::lock_guard l(g_slot_tex_m);
+        slot_maps = g_slot_tex.size();
+        slot_notes = g_slot_tex_notes;
+    }
+    g_log.Line(true, "RTM4SUM rt_m4=%d tables rewritten=%llu slots=%llu textures: mod already %llu, swapped %llu, from slot stamps %llu, no rule %llu, "
+        "rule without texture %llu | slot stamps noted %llu (%zu game->mod pairs)",
         M4Mode(), (unsigned long long)g_m4_tables, (unsigned long long)g_m4_slots, (unsigned long long)g_m4_tex_mod, (unsigned long long)g_m4_tex_swapped,
-        (unsigned long long)g_m4_tex_norule, (unsigned long long)g_m4_tex_nosrv);
+        (unsigned long long)g_m4_tex_slot, (unsigned long long)g_m4_tex_norule, (unsigned long long)g_m4_tex_nosrv, (unsigned long long)slot_notes, slot_maps);
     std::string fw;
     for (const auto& [why, n] : g_m3_full_why) fw += " | " + std::to_string(n) + " " + why;
     if (!fw.empty()) g_log.Line(true, "RTM3FULL full BLAS builds by reason:%s", fw.c_str());
@@ -3092,3 +3136,25 @@ void Log(bool essential, _Printf_format_string_ const char* fmt, ...)
     g_log.Line(essential, "%s", buf);
 }
 } // namespace rtskin
+
+// A raster draw of mod component (mod, comp) stamped the mod's texture `src` (its resource mod_res) over the game's
+// texture `game` in its pixel shader's table (section_ps_stamp.cpp): the RT material table of that section gets the
+// same (M4Apply).
+void RtNoteSlotTexture(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRIPTOR_HANDLE src, ID3D12Resource* mod_res)
+{
+    if (mod < 0 || comp < 0 || !game || !src.ptr || !mod_res || game == mod_res) return;
+    std::lock_guard l(g_slot_tex_m);
+    ++g_slot_tex_notes;
+    if (g_slot_tex.size() > 4096) g_slot_tex.clear();
+    SlotTex& e = g_slot_tex[{ mod, comp, reinterpret_cast<uint64_t>(game) }];
+    const bool fresh = e.res != mod_res;
+    e.src = src;
+    e.res = mod_res;
+    e.frame = g_frame_id;
+    e.gen = PortApi::LoadGeneration();
+    if (fresh) {
+        static std::atomic<uint32_t> s_log{ 0 };
+        if (s_log.fetch_add(1) < 64)
+            g_log.Line(true, "RTM4 slot stamp mod=%d comp=%d: game texture %p -> mod texture %p", mod, comp, (void*)game, (void*)mod_res);
+    }
+}

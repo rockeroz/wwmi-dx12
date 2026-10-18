@@ -8,6 +8,7 @@
 #include "draw_parts.h"
 #include "../textures/tex_eager.h" // a mod's textures still loading: its null is "not yet", not "unbind"
 #include "../rabbitfx/rabbitfx_bind.h"
+#include "../rt/rt_hooks.h" // RtNoteSlotTexture
 #include <algorithm>
 #include <unordered_map>
 
@@ -136,6 +137,10 @@ static void PlanStamps(SectionPsStamps& out, device* dev, const RootParam* root,
         if (!ts) continue;
         const uint32_t slot = ts.base + b.offset;
         if (slot >= ts.Heap()->GetDesc().NumDescriptors) continue;
+        if (res) { // RT M4: the game texture this stamp replaces, for the section's ray tracing material table
+            ResInfo gri{};
+            if (g_heap_to_res.find({ ts.heap, slot }, gri) && gri.res && gri.res != res) RtNoteSlotTexture(dm, comp, gri.res, src, res);
+        }
         SectionPsSlot s;
         s.reg = r;
         s.param = b.param;
