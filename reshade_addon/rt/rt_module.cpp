@@ -1679,7 +1679,9 @@ struct SlotTex {
     uint32_t                    frame = 0;
     unsigned                    gen = 0;
     uint32_t                    hash = 0, hframe = 0; // the game texture's identity (target it stands for), refreshed
+    uint32_t                    weight = 0, wframe = 0; // index count of the sub-draw that bound it, and when
 };
+thread_local uint32_t t_note_weight = 0;
 std::mutex                                                g_slot_tex_m;
 std::map<std::tuple<int, int, uint64_t>, SlotTex>         g_slot_tex;
 uint64_t                                                  g_slot_tex_notes = 0;
@@ -3256,6 +3258,17 @@ void RtNoteSlotTexture(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRI
     ++g_slot_tex_notes;
     if (g_slot_tex.size() > 4096) g_slot_tex.clear();
     SlotTex& e = g_slot_tex[{ mod, comp, reinterpret_cast<uint64_t>(game) }];
+    const uint32_t weight = t_note_weight;
+    // sub-draws of one component binding different textures over the same game texture: one material table, so the
+    // largest sub-draw (by indices) seen in the last two frames keeps it
+    if (e.src.ptr && e.src.ptr != src.ptr && g_frame_id - e.wframe <= 2 && weight < e.weight) {
+        e.frame = g_frame_id;
+        return;
+    }
+    if (e.src.ptr != src.ptr || weight >= e.weight || g_frame_id - e.wframe > 2) {
+        e.weight = weight;
+        e.wframe = g_frame_id;
+    }
     const bool fresh = e.src.ptr != src.ptr;
     e.src = src;
     e.res = mod_res;
@@ -3303,4 +3316,9 @@ void RtNoteKeptTexture(int mod, int comp, ID3D12Resource* game, ID3D12Resource* 
         static std::atomic<uint32_t> s_log{ 0 };
         if (s_log.fetch_add(1) < 64) g_log.Line(true, "RTM4 raster keeps mod=%d comp=%d: game texture %p (%s)", mod, comp, (void*)game, TexDesc(game).c_str());
     }
+}
+
+void RtSetNoteWeight(uint32_t index_count)
+{
+    t_note_weight = index_count;
 }
