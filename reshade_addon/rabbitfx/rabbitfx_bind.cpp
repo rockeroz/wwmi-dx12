@@ -5,6 +5,7 @@
 #include "../hooks/cb_ring.h"
 #include "../../src/gpu_progress.h"
 #include "../draw/read_slots.h"
+#include "../rt/rt_hooks.h" // RtNoteSlotTexture
 
 static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_shadow_srv_heap;
 static uint32_t                                     g_shadow_srv_cap = 0;
@@ -509,6 +510,12 @@ RfxBindState RfxDecideAndBind(reshade::api::command_list* cmd_list, ID3D12Graphi
     push(ns, nor);
     push(ls, lit);
     push(ms, mat);
+    // RT M4: the game texture each map replaces, for the section's ray tracing material table
+    for (const WclSlotOvr& b : binds) {
+        ResInfo gri{};
+        if (b.reg >= 0 && b.reg < 4 && b.srv.ptr && g_heap_to_res.find(HeapKey{ heap, w.srv_base + (uint32_t)b.reg }, gri) && gri.res)
+            RtNoteSlotTexture(mod_idx, comp_idx, gri.res, b.srv, nullptr);
+    }
     // One shadow window per draw: a second mirror would be taken from the GAME's table and lose these.
     if (extra) binds.insert(binds.end(), extra->begin(), extra->end());
     st = BindThroughShadow(cmd_list, cl, w, binds);

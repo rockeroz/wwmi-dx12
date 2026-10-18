@@ -3225,12 +3225,12 @@ void Log(bool essential, _Printf_format_string_ const char* fmt, ...)
 // same (M4Apply).
 void RtNoteSlotTexture(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRIPTOR_HANDLE src, ID3D12Resource* mod_res)
 {
-    if (mod < 0 || comp < 0 || !game || !src.ptr || !mod_res || game == mod_res) return;
+    if (mod < 0 || comp < 0 || !game || !src.ptr || game == mod_res) return; // mod_res may be unknown (RabbitFX maps)
     std::lock_guard l(g_slot_tex_m);
     ++g_slot_tex_notes;
     if (g_slot_tex.size() > 4096) g_slot_tex.clear();
     SlotTex& e = g_slot_tex[{ mod, comp, reinterpret_cast<uint64_t>(game) }];
-    const bool fresh = e.res != mod_res;
+    const bool fresh = e.src.ptr != src.ptr;
     e.src = src;
     e.res = mod_res;
     e.frame = g_frame_id;
