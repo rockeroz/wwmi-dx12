@@ -2337,25 +2337,38 @@ bool M5Armed()
     return false;
 }
 
-// The block an extended copy of the game's table made from source rd_va gets: t's newest (made from that same table)
-// if it is, else each slot's last records made from it, else zeros -- a null hit group: no shader runs. g_m3_m held.
-void M5BlockFor(const TlasRec* t, uint64_t rd_va, uint64_t stride, std::vector<uint8_t>* out, bool* null_block)
+// The block an extended copy of the game's table made from source rd_va gets (every slot): t's newest when made from that
+// same table; else, per slot, its character's last records made from it, or records made from it now (M3's records of
+// the character's instance at its game contribution, then its extra geometries' -- an indirect dispatch recorded before
+// this frame's first direct one), else zeros -- a null hit group: no shader runs. g_m3_m held.
+void M5BlockFor(device* dev, const TlasRec* t, ID3D12Resource* rd, uint64_t rd_va, uint64_t hit_size, uint64_t stride, std::vector<uint8_t>* out,
+    bool* null_block)
 {
     *null_block = false;
-    if (t && t->m5_src == rd_va && t->m5_stride == stride && !t->m5_block.empty()) {
+    const size_t full = size_t(kM5Slots) * kM5SlotRecs * stride;
+    if (t && t->m5_src == rd_va && t->m5_stride == stride && t->m5_block.size() == full) {
         *out = t->m5_block;
         return;
     }
-    uint32_t top = t ? (t->m5_recs + kM5SlotRecs - 1) / kM5SlotRecs : 0;
-    for (const auto& [gk, sk] : g_m5_slot) top = (std::max)(top, sk + 1);
-    if (!top) top = 1;
-    out->assign(size_t(top) * kM5SlotRecs * stride, 0);
+    out->assign(full, 0);
     bool any = false;
     for (const auto& [game, k] : g_m5_slot) {
-        const auto lt = g_m5_last.find(game);
-        if (k >= top || lt == g_m5_last.end() || lt->second.first != rd_va || lt->second.second.empty()) continue;
-        memcpy(out->data() + size_t(k) * kM5SlotRecs * stride, lt->second.second.data(),
-            (std::min)(lt->second.second.size(), size_t(kM5SlotRecs) * stride));
+        if (k >= kM5Slots) continue;
+        std::vector<uint8_t> recs;
+        const auto           lt = g_m5_last.find(game);
+        if (lt != g_m5_last.end() && lt->second.first == rd_va)
+            recs = lt->second.second;
+        else if (const auto mit = g_m3.find(game); mit != g_m3.end() && dev && rd) {
+            ModBlas& mb = mit->second;
+            RecTx    tx;
+            if (mb.ok && !mb.m5.empty() && mb.orig_contrib != UINT32_MAX && M3Records(mb, rd, rd_va, hit_size, stride, mb.orig_contrib, &tx) &&
+                M5Block(dev, mb, tx, stride, &recs) && recs.size() <= size_t(kM5SlotRecs) * stride)
+                g_m5_last[game] = { rd_va, recs };
+            else
+                recs.clear();
+        }
+        if (recs.empty()) continue;
+        memcpy(out->data() + size_t(k) * kM5SlotRecs * stride, recs.data(), (std::min)(recs.size(), size_t(kM5SlotRecs) * stride));
         any = true;
     }
     *null_block = !any;
@@ -2396,7 +2409,7 @@ uint64_t M5Extend(command_list* cmd_list, ID3D12GraphicsCommandList4* cl, const 
         return 0;
     }
     std::vector<uint8_t> blk;
-    M5BlockFor(t, rd_va, hit_stride, &blk, null_block);
+    M5BlockFor(cmd_list->get_device(), t, rd, rd_va, hit_size, hit_stride, &blk, null_block);
     uint64_t h = 1469598103934665603ull;
     for (uint8_t b : blk) h = (h ^ b) * 1099511628211ull;
     if (g_m5_uses_frame != g_frame_id) {
@@ -2505,7 +2518,7 @@ struct M5IndNote {
 };
 M5IndNote g_m5_ind_ring[32];
 uint32_t  g_m5_ind_next = 0;
-uint64_t  g_m5_ind_seen = 0, g_m5_ind_patched = 0, g_m5_ind_skipped = 0, g_m5_ind_plain = 0;
+uint64_t  g_m5_ind_seen = 0, g_m5_ind_patched = 0, g_m5_ind_skipped = 0, g_m5_ind_plain = 0, g_m5_ind_nohit = 0;
 
 // M5 (observe): the current frame's direct dispatches (state object, tables), for the indirect ones to be compared with.
 struct M5Direct {
@@ -2675,10 +2688,13 @@ bool M5Indirect(command_list* cmd_list, resource args, uint64_t args_off, uint32
     D3D12_DISPATCH_RAYS_DESC desc{};
     const bool have = src && GuardedPrivateRead(src, src_va, reinterpret_cast<uint8_t*>(&desc), uint32_t(sizeof desc)) == sizeof desc;
     const auto& hg = desc.HitGroupTable;
+    // (observed: the game copies the desc's first 88 bytes from UPLOAD memory and the dimensions from the GPU; some
+    // dispatches have an empty hit group table -- they read no records, wherever an instance points)
+    const bool  no_hits = have && hg.SizeInBytes == 0;
     const bool  looks = have && desc.RayGenerationShaderRecord.StartAddress && desc.RayGenerationShaderRecord.SizeInBytes &&
-                       desc.RayGenerationShaderRecord.SizeInBytes <= 4096 && hg.StartAddress && !(hg.StartAddress & 63) && hg.StrideInBytes >= 32 &&
-                       hg.StrideInBytes <= 4096 && !(hg.StrideInBytes & 31) && hg.SizeInBytes && hg.SizeInBytes % hg.StrideInBytes == 0 &&
-                       desc.MissShaderTable.StrideInBytes <= 4096;
+                       desc.RayGenerationShaderRecord.SizeInBytes <= 4096 && desc.MissShaderTable.StrideInBytes <= 4096 &&
+                       (no_hits || (hg.StartAddress && !(hg.StartAddress & 63) && hg.StrideInBytes >= 32 && hg.StrideInBytes <= 4096 &&
+                                       !(hg.StrideInBytes & 31) && hg.SizeInBytes % hg.StrideInBytes == 0));
     static std::atomic<uint32_t> s_log{ 0 };
     if (s_log.fetch_add(1) < 8)
         g_log.Line(true,
@@ -2695,8 +2711,8 @@ bool M5Indirect(command_list* cmd_list, resource args, uint64_t args_off, uint32
     M5IndNote& note = g_m5_ind_ring[g_m5_ind_next++ & 31];
     note = { reinterpret_cast<const void*>(cmd_list->get_native()), frame, args_va, "game's table" };
     {
-        // (observe) the first ones that do not read as a desc, and a few of sampled frames, in full -- with a readback of the
-        // arguments as the GPU executes them (after the game's own writes into them)
+        // (observe) the first ones that do not read as a desc, and a few of sampled frames, in full (162922d also read the
+        // arguments back from the GPU: the 88 bytes copied from UPLOAD memory, then the dimensions)
         static uint32_t s_sample = UINT32_MAX, s_samples = 0, s_last = 0, s_in = 0, s_bad = 0;
         bool            detail = false;
         if (copies_noted) {
@@ -2724,38 +2740,6 @@ bool M5Indirect(command_list* cmd_list, resource args, uint64_t args_off, uint32
                 (unsigned long long)g_m5_dir.hit_va, (unsigned long long)g_m5_dir.hit_size, (unsigned long long)g_m5_dir.rg_va,
                 (unsigned long long)args_va, HeapTypeOf(ares), ares ? (unsigned long long)ares->GetDesc().Width : 0ull, max_count, from, cp,
                 have ? (looks ? "" : " (does not read as a desc)") : "", have ? M5DescText(desc).c_str() : "-", have ? M5Hex(raw, sizeof raw).c_str() : "-");
-            ComPtr<ID3D12GraphicsCommandList> gcl;
-            if (ares && max_count == 1 && g_m5_rb_total < 8 && g_m5_rbs.size() < 8 &&
-                SUCCEEDED(reinterpret_cast<IUnknown*>(cmd_list->get_native())->QueryInterface(IID_PPV_ARGS(&gcl))) && gcl) {
-                const uint64_t off = args_va - ares->GetGPUVirtualAddress(), width = ares->GetDesc().Width;
-                const uint32_t n = uint32_t((std::min)(uint64_t(128), width > off ? width - off : 0));
-                M5Readback     r;
-                if (n >= sizeof(D3D12_DISPATCH_RAYS_DESC) &&
-                    SUCCEEDED(CreateD3D12Buffer(g_d3d12_device, D3D12_HEAP_TYPE_READBACK, 256, D3D12_RESOURCE_STATE_COPY_DEST, &r.rb))) {
-                    // the arguments are INDIRECT_ARGUMENT here (the ExecuteIndirect that follows requires it): a read-only
-                    // round trip through COPY_SOURCE
-                    D3D12_RESOURCE_BARRIER br{};
-                    br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                    br.Transition.pResource = ares;
-                    br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                    br.Transition.StateBefore = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
-                    br.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-                    M3Marker(gcl.Get(), L"wwmi rt-m5: indirect arguments readback");
-                    gcl->ResourceBarrier(1, &br);
-                    gcl->CopyBufferRegion(r.rb.Get(), 0, ares, off, n);
-                    std::swap(br.Transition.StateBefore, br.Transition.StateAfter);
-                    gcl->ResourceBarrier(1, &br);
-                    r.stamp = GpuStamp();
-                    r.frame = frame;
-                    r.args_va = args_va;
-                    r.n = n;
-                    r.pso = pso;
-                    r.dir_hit = same_frame ? g_m5_dir.hit_va : 0;
-                    r.dir_hit_size = same_frame ? g_m5_dir.hit_size : 0;
-                    g_m5_rbs.push_back(std::move(r));
-                    ++g_m5_rb_total;
-                }
-            }
         }
     }
     const TlasRec* t = M5OnTlas();
@@ -2780,6 +2764,11 @@ bool M5Indirect(command_list* cmd_list, resource args, uint64_t args_off, uint32
                              : max_count != 1 ? "an indirect ray dispatch with more than one command"
                                               : nullptr;
         if (cannot) return refuse(cannot);
+        if (no_hits) {
+            ++g_m5_ind_nohit;
+            note.what = "no hit groups";
+            return false;
+        }
     }
     if (!t && !M5Armed()) { // nothing points at our block: the game's table serves (and no instance enters the block this frame)
         ++g_m5_ind_plain;
@@ -2969,6 +2958,9 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
             mb->m5_contrib = g_m5_r0 + uint32_t(k) * kM5SlotRecs;
             top = (std::max)(top, uint32_t(k) + 1);
         }
+        // every slot, always: a table extended earlier in the frame (an indirect dispatch's) must cover any slot an
+        // instance is pointed at later in it
+        top = kM5Slots;
         m5_block.assign(size_t(top) * kM5SlotRecs * hit_stride, 0);
         for (const auto& [game, k] : g_m5_slot) {
             uint8_t* at = m5_block.data() + size_t(k) * kM5SlotRecs * hit_stride;
@@ -3285,10 +3277,10 @@ void M3Summary()
         for (const auto& [wy, n] : g_m5_why) why += " | " + std::to_string(n) + " " + wy;
         g_log.Line(true,
             "RTM5SUM rt_m5=%d%s dispatches extended=%llu skipped=%llu table copies=%llu | indirect ray dispatches=%llu (our table %llu, skipped %llu, "
-            "game's table %llu) | blocks=%llu (failed %llu) tables=%llu (failed %llu) game tables reach %u%s",
+            "game's table %llu, no hit groups %llu) | blocks=%llu (failed %llu) tables=%llu (failed %llu) game tables reach %u%s",
             M5Mode(), g_m5_off.load() ? " (off: indirect rays)" : "", (unsigned long long)g_m5_ext, (unsigned long long)g_m5_skip,
             (unsigned long long)g_m5_copies, (unsigned long long)g_m5_ind_seen, (unsigned long long)g_m5_ind_patched,
-            (unsigned long long)g_m5_ind_skipped, (unsigned long long)g_m5_ind_plain, (unsigned long long)g_m5_blocks,
+            (unsigned long long)g_m5_ind_skipped, (unsigned long long)g_m5_ind_plain, (unsigned long long)g_m5_ind_nohit, (unsigned long long)g_m5_blocks,
             (unsigned long long)g_m5_block_fail, (unsigned long long)g_m5_tables, (unsigned long long)g_m5_table_fail, g_m5_game_hi, why.c_str());
     }
     std::string fw;
