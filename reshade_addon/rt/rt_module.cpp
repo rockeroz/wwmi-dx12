@@ -840,11 +840,10 @@ struct TlasRec {
     bool            decided = false; // the rays came before its list was submitted: written then, never gated
     // M5: instances of it point at a block of records of ours past the game's hit group table (R0..): every dispatch must
     // then trace with our extended table
-    bool                 m5_decided = false, m5_on = false;
+    bool                 m5_on = false;
     uint32_t             m5_r0 = 0, m5_recs = 0;
     uint64_t             m5_stride = 0;
     std::vector<uint8_t> m5_block; // the newest block (records R0 ..)
-    std::vector<std::pair<ModBlas*, uint32_t>> m5_layout; // character -> its contribution in the block
 };
 std::mutex                                           g_m3_m; // everything below
 std::map<uint64_t, ModBlas>                          g_m3;   // the game's BLAS (dest VA) -> ours
@@ -999,6 +998,7 @@ void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const ac
             else base_ranges[g] = poses[g].ranges;
         }
     if (extras.size() > 24) extras.resize(24);
+    if (n + extras.size() > 64) extras.resize(n < 64 ? 64 - n : 0); // a character's slot of records holds 64 geometries (kM5MaxGeoms)
     const uint32_t N = n + uint32_t(extras.size());
     // topology: the index ranges of each geometry (a section the mod does not draw: one degenerate triangle)
     std::vector<std::vector<std::pair<uint32_t, uint32_t>>> sig(N);
@@ -2048,7 +2048,11 @@ void M4Apply(device* dev, const ModBlas& mb, const RecTx& tx, uint64_t stride, u
 uint64_t           g_m5_tables = 0, g_m5_table_fail = 0, g_m5_ext = 0, g_m5_skip = 0, g_m5_blocks = 0, g_m5_block_fail = 0;
 uint32_t           g_m5_game_hi = 0; // the highest table start of the game's seen in a ray tracing heap
 std::map<std::string, uint64_t> g_m5_why; // skipped dispatches / failed blocks by reason
-constexpr uint32_t kM5Region = 1024, kM5TableSlots = 40;
+constexpr uint32_t kM5Region = 4096, kM5TableSlots = 40; // per frame in flight: ~100 tables of 40
+constexpr uint32_t kM5SlotRecs = 192, kM5MaxGeoms = 64, kM5Slots = 8; // a character's slot: 64 geometries x 3 ray types
+uint32_t           g_m5_r0 = 0;                                       // our block's first record (fixed once set)
+std::map<uint64_t, uint32_t> g_m5_slot;                               // character (game BLAS) -> its slot
+std::map<uint64_t, std::pair<uint64_t, std::vector<uint8_t>>> g_m5_last; // character -> (stride, its last records)
 struct M5HeapCur {
     uint32_t frame = UINT32_MAX, used = 0;
 };
@@ -2410,8 +2414,11 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
         int      sig;
         uint32_t orig; // the game's contribution of the instance
     };
-    // M5: characters with extra geometries need their records in our block (R0..), and every dispatch our extended table
-    const bool m5_ok = M5Mode() && src && hit_stride >= 72;
+    // M5: characters with extra geometries need their records in our block (R0..), and every dispatch our extended table.
+    // R0 is fixed for the session at the first such dispatch (twice the game's table, at least 16384 records)
+    if (M5Mode() && src && hit_stride >= 72 && !g_m5_r0)
+        g_m5_r0 = uint32_t(((std::max)(uint64_t(16384), 2 * (hit_size / hit_stride)) + 1023) & ~uint64_t(1023));
+    const bool m5_ok = M5Mode() && src && hit_stride >= 72 && g_m5_r0 && hit_size <= uint64_t(g_m5_r0) * hit_stride;
     std::vector<Cand>  cands;    // to point at our BLAS (gate closed)
     std::vector<RecTx> txs;      // records to make ours: the candidates', then those of instances naming ours already
     std::vector<std::pair<ModBlas*, uint64_t>> tx_owner; // each RecTx's character (M4)
@@ -2475,58 +2482,75 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
             tx_owner.push_back({ &mb, game });
         }
     }
-    // M5: the block's layout (decided at the TLAS's first dispatch with such a character), then this dispatch's block; a
-    // character whose block cannot be made keeps the game's BLAS (its instances back), never a contribution past a table
+    // M5: every character with extras has a fixed slot of kM5SlotRecs records at R0 + slot * kM5SlotRecs (R0 fixed for the
+    // session), so an instance pointing there from any TLAS of the last frames always finds its records, or zeros (a null
+    // hit group: no shader), never the end of a table. This dispatch's block: every slot, the characters' records made
+    // now (or their last ones).
     std::vector<uint8_t> m5_block;
     std::set<ModBlas*>   m5_bad;
     if (m5_ok) {
-        if (!t.m5_decided) {
-            std::vector<ModBlas*> chars;
-            for (const Cand& c : cands)
-                if (!c.mb->m5.empty() && std::find(chars.begin(), chars.end(), c.mb) == chars.end()) chars.push_back(c.mb);
-            if (!chars.empty()) {
-                t.m5_decided = true;
-                t.m5_stride = hit_stride;
-                t.m5_r0 = uint32_t(((hit_size / hit_stride) + 1024 + 1023) & ~uint64_t(1023));
-                uint32_t cur = t.m5_r0;
-                for (ModBlas* mb : chars) {
-                    t.m5_layout.push_back({ mb, cur });
-                    cur += mb->total * 3;
+        for (auto it = g_m5_slot.begin(); it != g_m5_slot.end();) // characters gone free their slot
+            it = g_m3.count(it->first) ? std::next(it) : g_m5_slot.erase(it);
+        auto slot_of = [&](uint64_t game) -> int {
+            const auto it = g_m5_slot.find(game);
+            if (it != g_m5_slot.end()) return int(it->second);
+            for (uint32_t k = 0; k < kM5Slots; ++k) {
+                bool used = false;
+                for (const auto& [gk, sk] : g_m5_slot) used = used || sk == k;
+                if (!used) {
+                    g_m5_slot[game] = k;
+                    return int(k);
                 }
-                t.m5_recs = cur - t.m5_r0;
             }
+            return -1;
+        };
+        std::vector<std::pair<ModBlas*, uint64_t>> chars; // characters with extras in this dispatch
+        for (const auto& [mb, game] : tx_owner)
+            if (!mb->m5.empty() && std::none_of(chars.begin(), chars.end(), [&](const auto& c) { return c.first == mb; })) chars.push_back({ mb, game });
+        uint32_t top = 0;
+        for (const auto& [gk, sk] : g_m5_slot) top = (std::max)(top, sk + 1);
+        for (const auto& [mb, game] : chars) {
+            const int k = slot_of(game);
+            if (k < 0 || mb->total > kM5MaxGeoms) {
+                m5_bad.insert(mb);
+                continue;
+            }
+            mb->m5_contrib = g_m5_r0 + uint32_t(k) * kM5SlotRecs;
+            top = (std::max)(top, uint32_t(k) + 1);
         }
-        if (t.m5_decided) {
-            for (const auto& [mb, at] : t.m5_layout) {
-                mb->m5_contrib = at;
+        m5_block.assign(size_t(top) * kM5SlotRecs * hit_stride, 0);
+        for (const auto& [game, k] : g_m5_slot) {
+            uint8_t* at = m5_block.data() + size_t(k) * kM5SlotRecs * hit_stride;
+            ModBlas* mb = nullptr;
+            for (const auto& c : chars)
+                if (c.second == game) mb = c.first;
+            std::vector<uint8_t> recs;
+            if (mb && !m5_bad.count(mb)) {
                 size_t ti = 0;
                 while (ti < tx_owner.size() && tx_owner[ti].first != mb) ++ti;
-                const size_t before = m5_block.size();
-                if (ti == tx_owner.size() || hit_stride != t.m5_stride || before != size_t(at - t.m5_r0) * hit_stride ||
-                    !M5Block(cmd_list->get_device(), *mb, txs[ti], hit_stride, &m5_block)) {
+                if (ti == tx_owner.size() || !M5Block(cmd_list->get_device(), *mb, txs[ti], hit_stride, &recs) ||
+                    recs.size() > size_t(kM5SlotRecs) * hit_stride) {
                     ++g_m5_block_fail;
                     m5_bad.insert(mb);
-                    m5_block.resize(before);
-                }
+                    recs.clear();
+                } else
+                    g_m5_last[game] = { hit_stride, recs };
             }
-            if (!m5_bad.empty()) { // the layout is all or nothing: every character with extras keeps the game's BLAS
-                for (const auto& p : t.m5_layout) m5_bad.insert(p.first);
-                m5_block.clear();
+            if (recs.empty()) { // not in this dispatch (or failed): its last records, if any
+                const auto lt = g_m5_last.find(game);
+                if (lt != g_m5_last.end() && lt->second.first == hit_stride && !(mb && m5_bad.count(mb))) recs = lt->second.second;
             }
+            if (!recs.empty()) memcpy(at, recs.data(), (std::min)(recs.size(), size_t(kM5SlotRecs) * hit_stride));
         }
-        // characters with extras not in the layout (they came after the TLAS's first dispatch) cannot point at it
-        for (const Cand& c : cands)
-            if (!c.mb->m5.empty() && (!t.m5_decided || std::none_of(t.m5_layout.begin(), t.m5_layout.end(),
-                                                           [&](const auto& p) { return p.first == c.mb; })))
-                m5_bad.insert(c.mb);
     }
     if (!m5_bad.empty()) {
-        // drop the bad characters' candidates; their instances already ours become stale (put back below if writable)
+        // the characters whose block failed keep the game's BLAS: their candidates dropped, their instances already ours
+        // stale (put back below if writable; if not, their slot holds zeros -- a null hit group -- or their last records)
         std::vector<Cand>  keep_c, keep_m;
         std::vector<RecTx> keep_tx;
         std::vector<std::pair<ModBlas*, uint64_t>> keep_own;
         for (size_t i = 0; i < txs.size(); ++i)
-            if (!m5_bad.count(tx_owner[i].first) || tx_owner[i].first->m5.empty()) {
+            if (!m5_bad.count(tx_owner[i].first)) {
                 keep_tx.push_back(std::move(txs[i]));
                 keep_own.push_back(tx_owner[i]);
             }
@@ -2550,8 +2574,8 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
         UnmapUpload(t.res);
         return ok;
     };
-    auto write_as = [&](const Cand& c, uint64_t as) -> bool { // ours: in the block when the character has extras
-        const bool block = as != c.game && !c.mb->m5.empty() && c.mb->m5_contrib != UINT32_MAX && t.m5_decided;
+    auto write_as = [&](const Cand& c, uint64_t as) -> bool { // ours: in its slot of the block when the character has extras
+        const bool block = as != c.game && m5_ok && !c.mb->m5.empty() && c.mb->m5_contrib != UINT32_MAX && !m5_bad.count(c.mb);
         return write_inst(c, as, block ? c.mb->m5_contrib : c.orig);
     };
     // every instance naming our BLAS back to the game's (the TLAS has not read them yet): nothing of ours goes in
@@ -2619,19 +2643,25 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
             g_log.Line(true, "RTM3 redirect f=%u: TLAS %llx (%u instances, gate %llu) reads our BLAS for %zu instance(s); records patched", frame,
                 (unsigned long long)t.dest, t.count, (unsigned long long)t.gate, cands.size());
     }
-    // M5: instances now point at our block: every dispatch from here traces with our extended table
-    if (!backed && committed && t.m5_decided && !m5_block.empty()) {
-        bool any = false;
-        for (const Cand& c : cands) any = any || !c.mb->m5.empty();
-        for (const Cand& c : mine) any = any || !c.mb->m5.empty();
+    // M5: instances now point at our block: every dispatch from here traces with our extended table (the block of this
+    // dispatch: newest records of every slot)
+    if (m5_ok && !m5_block.empty()) {
+        bool any = t.m5_on;
+        if (!backed && committed) {
+            for (const Cand& c : cands) any = any || (!c.mb->m5.empty() && !m5_bad.count(c.mb));
+            for (const Cand& c : mine) any = any || (!c.mb->m5.empty() && !m5_bad.count(c.mb));
+        }
         if (any) {
             if (!t.m5_on) {
                 static std::atomic<uint32_t> s_first{ 0 };
                 if (s_first.fetch_add(1) < 4)
-                    g_log.Line(true, "RTM5 on f=%u: TLAS %llx, block of %u record(s) at %u (game table %llu records), %zu character(s)", frame,
-                        (unsigned long long)t.dest, t.m5_recs, t.m5_r0, (unsigned long long)(hit_size / hit_stride), t.m5_layout.size());
+                    g_log.Line(true, "RTM5 on f=%u: TLAS %llx, block of %zu record(s) at %u (game table %llu records), %zu slot(s)", frame,
+                        (unsigned long long)t.dest, m5_block.size() / hit_stride, g_m5_r0, (unsigned long long)(hit_size / hit_stride), g_m5_slot.size());
             }
             t.m5_on = true;
+            t.m5_r0 = g_m5_r0;
+            t.m5_stride = hit_stride;
+            t.m5_recs = uint32_t(m5_block.size() / hit_stride);
             t.m5_block = std::move(m5_block);
         }
     }
