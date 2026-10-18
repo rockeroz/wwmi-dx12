@@ -27,6 +27,7 @@
 #include "../hooks/resource_tracker.h"
 #include "../instrumentation/removal_pin.h"
 #include "../../src/d3d12_buffer.h"
+#include "../../src/gpu_progress.h" // GpuStamp / GpuPassed (M5 extended tables)
 #include "../mods/layout_registry.h" // TableStartOf
 #include "../mods/skeleton.h"        // SnapshotGameCB
 #include "../textures/texture_module.h" // TexHoldForRetry / TexRetryMissed
@@ -786,8 +787,21 @@ void ObserveRays(resource rg_res, uint64_t rg_off, uint64_t rg_size, resource mi
 // before DispatchRays (its list unsubmitted, the hit table's copy from UPLOAD in it) the TLAS is rebuilt in place from
 // a GPU copy of the game's final instances with our BLAS addresses over the character's, and the records are patched
 // in the copy's UPLOAD source -- both or neither.
+// M5: a group of a component's sub-draws that binds its own texture set (a mod drawing one component in pieces with
+// different textures, e.g. Qingxiao): an extra geometry of our BLAS, with records and a material table of its own.
+using M5Binds = std::vector<std::pair<uint64_t, uint64_t>>; // (game texture resource, mod view), sorted
+struct M5Extra {
+    uint32_t                                   tmpl = 0; // the section (game geometry) whose records it copies
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;   // its sub-draws (first index, count) in the mod's index buffer
+    M5Binds                                    binds;
+    uint64_t                                   key = 0;  // identity of (section, binds) for the table cache
+};
 struct ModBlas {
-    uint32_t                                                geoms = 0;
+    uint32_t                                                geoms = 0; // the game's geometries (sections)
+    uint32_t                                                total = 0; // ours: geoms + extra (M5) geometries
+    std::vector<M5Extra>                                    m5;        // geometry geoms + i is m5[i]
+    uint32_t                                                orig_contrib = UINT32_MAX; // the game's contribution of its instance
+    uint32_t                                                m5_contrib = UINT32_MAX;   // ours, when its records are in our block
     uint64_t                                                game_ib = 0; // the game's geometry 0 IB (its records' base)
     std::vector<uint64_t>                                   game_off;    // each geometry's offset from it
     uint32_t                                                game_iw = 0;
@@ -824,6 +838,13 @@ struct TlasRec {
     uint64_t        dest = 0;  // the TLAS it builds
     uint64_t        gate = 0;  // the gate value its list waits for (0 = not gated)
     bool            decided = false; // the rays came before its list was submitted: written then, never gated
+    // M5: instances of it point at a block of records of ours past the game's hit group table (R0..): every dispatch must
+    // then trace with our extended table
+    bool                 m5_decided = false, m5_on = false;
+    uint32_t             m5_r0 = 0, m5_recs = 0;
+    uint64_t             m5_stride = 0;
+    std::vector<uint8_t> m5_block; // the newest block (records R0 ..)
+    std::vector<std::pair<ModBlas*, uint32_t>> m5_layout; // character -> its contribution in the block
 };
 std::mutex                                           g_m3_m; // everything below
 std::map<uint64_t, ModBlas>                          g_m3;   // the game's BLAS (dest VA) -> ours
@@ -903,6 +924,10 @@ void M3Marker(ID3D12GraphicsCommandList* cl, const wchar_t* what)
     cl->SetMarker(0, what, UINT((wcslen(what) + 1) * sizeof(wchar_t)));
 }
 
+int  M5Mode();
+void M5Split(int mod, int comp, const std::vector<std::pair<uint32_t, uint32_t>>& ranges, std::vector<std::pair<uint32_t, uint32_t>>* base,
+     std::vector<M5Extra>* extras);
+
 // The game builds / updates a character BLAS from a ring the module poses a mod for: build ours next to it, from the
 // raster's last poses of the mod's components (one geometry per section, as the game's).
 void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const acceleration_structure_build_input* inputs, uint32_t n,
@@ -964,23 +989,38 @@ void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const ac
         M3Refuse("the list is not an ID3D12GraphicsCommandList4");
         return;
     }
+    // M5: a section whose sub-draws bind different texture sets keeps the largest set's sub-draws; each other set is an
+    // extra geometry (n + i) with its own records and material table
+    std::vector<M5Extra> extras;
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> base_ranges(n);
+    for (uint32_t g = 0; g < n; ++g)
+        if (poses[g].mod >= 0) {
+            if (M5Mode() && extras.size() < 24) M5Split(poses[g].mod, int(g), poses[g].ranges, &base_ranges[g], &extras);
+            else base_ranges[g] = poses[g].ranges;
+        }
+    if (extras.size() > 24) extras.resize(24);
+    const uint32_t N = n + uint32_t(extras.size());
     // topology: the index ranges of each geometry (a section the mod does not draw: one degenerate triangle)
-    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> sig(n);
-    std::vector<ID3D12Resource*>                            sig_idx(n, nullptr);
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> sig(N);
+    std::vector<ID3D12Resource*>                            sig_idx(N, nullptr);
     uint64_t                                                any_vb = 0;
     uint32_t                                                any_verts = 0;
     for (uint32_t g = 0; g < n; ++g)
         if (poses[g].mod >= 0) {
-            sig[g] = poses[g].ranges;
+            sig[g] = base_ranges[g];
             sig_idx[g] = poses[g].idx;
             any_vb = poses[g].pos_va;
             any_verts = poses[g].verts;
         }
-    const bool topo = !mb.blas || !mb.ib || mb.geoms != n || sig != mb.sig || sig_idx != mb.sig_idx;
+    for (uint32_t e = 0; e < extras.size(); ++e) {
+        sig[n + e] = extras[e].ranges;
+        sig_idx[n + e] = poses[extras[e].tmpl].idx;
+    }
+    const bool topo = !mb.blas || !mb.ib || mb.geoms != n || mb.total != N || sig != mb.sig || sig_idx != mb.sig_idx;
     if (topo) {
-        std::vector<uint32_t> off(n), cnt(n);
+        std::vector<uint32_t> off(N), cnt(N);
         uint64_t              total = 0;
-        for (uint32_t g = 0; g < n; ++g) {
+        for (uint32_t g = 0; g < N; ++g) {
             uint32_t c = 0;
             for (const auto& r : sig[g]) c += r.second;
             off[g] = uint32_t(total * 4);
@@ -997,7 +1037,7 @@ void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const ac
             M3Refuse("could not create the index buffer");
             return;
         }
-        for (uint32_t g = 0; g < n; ++g) {
+        for (uint32_t g = 0; g < N; ++g) {
             uint64_t o = off[g];
             for (const auto& [s2, c] : sig[g]) {
                 cl->CopyBufferRegion(ib.Get(), o, sig_idx[g], uint64_t(s2) * 4, uint64_t(c) * 4);
@@ -1020,15 +1060,18 @@ void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const ac
         mb.topo_frame = frame;
     }
     mb.geoms = n;
+    mb.total = N;
+    mb.m5 = extras;
     mb.game_ib = gib[0];
     mb.game_off.resize(n);
     for (uint32_t g = 0; g < n; ++g) mb.game_off[g] = gib[g] - gib[0];
     mb.game_iw = iw;
     mb.gflags = gflags;
-    mb.vb.resize(n);
-    mb.verts.resize(n);
-    mb.pose_mod.assign(n, -1);
-    mb.pose_slot.assign(n, -1);
+    mb.gflags.resize(N);
+    mb.vb.resize(N);
+    mb.verts.resize(N);
+    mb.pose_mod.assign(N, -1);
+    mb.pose_slot.assign(N, -1);
     for (uint32_t g = 0; g < n; ++g)
         if (poses[g].mod >= 0) {
             mb.pose_mod[g] = poses[g].mod;
@@ -1038,9 +1081,17 @@ void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const ac
         mb.vb[g] = poses[g].mod >= 0 ? poses[g].pos_va : any_vb;
         mb.verts[g] = poses[g].mod >= 0 ? poses[g].verts : any_verts;
     }
-    std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> gd(n);
+    for (uint32_t e = 0; e < extras.size(); ++e) { // an extra geometry: its section's pose and flags
+        const uint32_t t = extras[e].tmpl;
+        mb.gflags[n + e] = mb.gflags[t];
+        mb.vb[n + e] = mb.vb[t];
+        mb.verts[n + e] = mb.verts[t];
+        mb.pose_mod[n + e] = mb.pose_mod[t];
+        mb.pose_slot[n + e] = mb.pose_slot[t];
+    }
+    std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> gd(N);
     const uint64_t                              ib_va = mb.ib->GetGPUVirtualAddress();
-    for (uint32_t g = 0; g < n; ++g) {
+    for (uint32_t g = 0; g < N; ++g) {
         D3D12_RAYTRACING_GEOMETRY_DESC& d = gd[g];
         d.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
         d.Flags = D3D12_RAYTRACING_GEOMETRY_FLAGS(mb.gflags[g]);
@@ -1056,12 +1107,12 @@ void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const ac
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS in{};
     in.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
     in.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
-    in.NumDescs = n;
+    in.NumDescs = N;
     in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     in.pGeometryDescs = gd.data();
     // an update keeps every geometry's index / vertex count and flags (DXR update constraints): anything else, a full build
-    std::vector<uint32_t> cur_cnt(n), cur_verts(n), cur_flags(n);
-    for (uint32_t g = 0; g < n; ++g) {
+    std::vector<uint32_t> cur_cnt(N), cur_verts(N), cur_flags(N);
+    for (uint32_t g = 0; g < N; ++g) {
         cur_cnt[g] = mb.ib_cnt[g];
         cur_verts[g] = mb.verts[g];
         cur_flags[g] = mb.gflags[g];
@@ -1139,10 +1190,14 @@ void M3OnCharBlas(command_list* cmd_list, uint64_t game, uint64_t ring, const ac
         ++g_m3_builds;
         if (mb.builds++ < 3 || topo) {
             std::string geo;
-            for (uint32_t g = 0; g < n && geo.size() < 900; ++g) {
-                char b[96];
-                snprintf(b, sizeof b, " [%u: mod %d, %u tris (game %llu), %zu range(s)]", g, poses[g].mod, mb.ib_cnt[g] / 3,
-                    (unsigned long long)((g + 1 < n ? gib[g + 1] - gib[g] : 0) / (iw ? iw * 3 : 1)), sig[g].size());
+            for (uint32_t g = 0; g < N && geo.size() < 1400; ++g) {
+                char b[112];
+                if (g < n)
+                    snprintf(b, sizeof b, " [%u: mod %d, %u tris (game %llu), %zu range(s)]", g, poses[g].mod, mb.ib_cnt[g] / 3,
+                        (unsigned long long)((g + 1 < n ? gib[g + 1] - gib[g] : 0) / (iw ? iw * 3 : 1)), sig[g].size());
+                else
+                    snprintf(b, sizeof b, " [%u: M5 extra of section %u, %u tris, %zu range(s), %zu bind(s)]", g, extras[g - n].tmpl, mb.ib_cnt[g] / 3,
+                        sig[g].size(), extras[g - n].binds.size());
                 geo += b;
             }
             g_log.Line(true, "RTM3 blas %s game=%llx ours=%llx (%llu bytes) ring=%llx geometries=%u%s", topo ? "built (new topology)" : "rebuilt",
@@ -1734,6 +1789,62 @@ std::string TexDesc(ID3D12Resource* r)
     snprintf(b, sizeof b, "f%u %llux%u m%u", unsigned(d.Format), (unsigned long long)d.Width, d.Height, unsigned(d.MipLevels));
     return b;
 }
+// rt_m5: 1 (default) a component's sub-draws binding different texture sets get a geometry, records and a material
+// table each in the ray traced scene; 0 one texture set per section (the largest sub-draw's).
+int M5Mode()
+{
+    static int s = -1;
+    if (s < 0 && !g_addon_ini_path.empty()) s = GetPrivateProfileIntW(L"wwmi-dx12", L"rt_m5", 1, g_addon_ini_path.c_str()) != 0 ? 1 : 0;
+    return s < 0 ? 0 : s;
+}
+
+// A section's pose ranges grouped by the texture set their sub-draws bound (sub-draws seen binding in the last 60
+// frames): the group of the largest sub-draw (and every sub-draw not seen binding) stays the section's -- the set M4 gives
+// the section's own table (SlotTexFor keeps the largest sub-draw's binds); each other group is an extra.
+// g_m3_m held (takes g_slot_tex_m).
+void M5Split(int mod, int comp, const std::vector<std::pair<uint32_t, uint32_t>>& ranges, std::vector<std::pair<uint32_t, uint32_t>>* base,
+    std::vector<M5Extra>* extras)
+{
+    *base = ranges;
+    std::map<M5Binds, std::pair<std::vector<std::pair<uint32_t, uint32_t>>, uint64_t>> groups;
+    std::vector<std::pair<uint32_t, uint32_t>>                                          loose;
+    {
+        std::lock_guard l(g_slot_tex_m);
+        for (const auto& r : ranges) {
+            const auto it = g_m5_subdraws.find({ mod, comp, r.first });
+            if (it == g_m5_subdraws.end() || g_frame_id - it->second.frame > 60 || it->second.binds.empty()) {
+                loose.push_back(r);
+                continue;
+            }
+            M5Binds key = it->second.binds;
+            std::sort(key.begin(), key.end());
+            auto& gr = groups[key];
+            gr.first.push_back(r);
+            gr.second = (std::max)(gr.second, uint64_t(r.second));
+        }
+    }
+    if (groups.size() < 2) return;
+    auto best = groups.begin();
+    for (auto it = groups.begin(); it != groups.end(); ++it)
+        if (it->second.second > best->second.second) best = it;
+    base->clear();
+    *base = loose;
+    base->insert(base->end(), best->second.first.begin(), best->second.first.end());
+    std::sort(base->begin(), base->end());
+    for (auto it = groups.begin(); it != groups.end(); ++it) {
+        if (it == best) continue;
+        M5Extra e;
+        e.tmpl = uint32_t(comp);
+        e.ranges = it->second.first;
+        std::sort(e.ranges.begin(), e.ranges.end());
+        e.binds = it->first;
+        uint64_t k = 1469598103934665603ull ^ uint64_t(comp);
+        for (const auto& [a, b] : e.binds) k = (k ^ a) * 1099511628211ull ^ b;
+        e.key = k * 1099511628211ull;
+        extras->push_back(std::move(e));
+    }
+}
+
 bool SlotTexFor(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRIPTOR_HANDLE* out)
 {
     std::lock_guard l(g_slot_tex_m);
@@ -1927,6 +2038,331 @@ void M4Apply(device* dev, const ModBlas& mb, const RecTx& tx, uint64_t stride, u
     }
 }
 
+// ==== M5: a geometry, records and a material table per texture set of a section's sub-draws ==========================
+// The game's hit group records of an instance are contiguous (contribution + geometry * 3 + ray type): extra geometries
+// cannot have records in the game's table. So the instance of a character with extra geometries points at a block of
+// records of ours at R0, past the game's table, and every DispatchRays then traces with an extended copy of the game's
+// table (the game's records, then our block) -- or not at all for that dispatch, never past the end of a table. The
+// extra geometries' material tables are copies of their section's, with their own textures, in the top of the game's
+// ray tracing descriptor heap (RTM5 rays: ~32k of 250k descriptors used), one region per frame in flight.
+uint64_t           g_m5_tables = 0, g_m5_table_fail = 0, g_m5_ext = 0, g_m5_skip = 0, g_m5_blocks = 0, g_m5_block_fail = 0;
+uint32_t           g_m5_game_hi = 0; // the highest table start of the game's seen in a ray tracing heap
+std::map<std::string, uint64_t> g_m5_why; // skipped dispatches / failed blocks by reason
+constexpr uint32_t kM5Region = 1024, kM5TableSlots = 40;
+struct M5HeapCur {
+    uint32_t frame = UINT32_MAX, used = 0;
+};
+std::map<uint64_t, M5HeapCur>                                g_m5_cur;
+std::map<std::tuple<uint64_t, uint32_t, uint64_t>, uint64_t> g_m5_tabs; // (heap, source table, set) -> our table, this frame
+uint32_t                                                     g_m5_tabs_frame = UINT32_MAX;
+ComPtr<ID3D12DescriptorHeap>                                 g_m5_null_heap;
+struct M5Ext {
+    ComPtr<ID3D12Resource> res, up;
+    uint64_t               cap = 0, up_cap = 0, stamp = 0;
+    uint8_t*               up_ptr = nullptr;
+};
+std::vector<M5Ext> g_m5_ring;
+uint32_t           g_m5_ring_next = 0;
+
+void M5Why(const char* why)
+{
+    ++g_m5_why[why];
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE M5NullSrv()
+{
+    if (!g_m5_null_heap && g_d3d12_device) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 1;
+        if (FAILED(g_d3d12_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_m5_null_heap)))) return { 0 };
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        g_d3d12_device->CreateShaderResourceView(nullptr, &sd, g_m5_null_heap->GetCPUDescriptorHandleForHeapStart());
+    }
+    return g_m5_null_heap ? g_m5_null_heap->GetCPUDescriptorHandleForHeapStart() : D3D12_CPU_DESCRIPTOR_HANDLE{ 0 };
+}
+
+// A game texture of an extra geometry's table: the set's own bind over it (by resource, else by texture identity), else
+// what the section's table gets (M4's order).
+bool M5ResolveTex(int mod, uint32_t g, ID3D12Resource* res, const M5Binds& set, D3D12_CPU_DESCRIPTOR_HANDLE* out)
+{
+    for (const auto& [game, src] : set)
+        if (game == reinterpret_cast<uint64_t>(res) && src) {
+            out->ptr = SIZE_T(src);
+            return true;
+        }
+    if (const uint32_t h = TexIdentityNorm(TexHashOf(reinterpret_cast<uint64_t>(res))))
+        for (const auto& [game, src] : set)
+            if (src && TexIdentityNorm(TexHashOf(game)) == h) {
+                out->ptr = SIZE_T(src);
+                return true;
+            }
+    if (SlotTexFor(mod, int(g), res, out)) return true;
+    if (const uint32_t hash = TexHashOf(reinterpret_cast<uint64_t>(res))) {
+        const wchar_t* own_ns = mod >= 0 && size_t(mod) < g_geomods.size() && !g_geomods[size_t(mod)].wcl_ns.empty()
+            ? g_geomods[size_t(mod)].wcl_ns.c_str() : nullptr;
+        ModLoader::TexEntry e;
+        if (ModLoader::TexEntryAt(TexSelectIdxNs(hash, own_ns), &e) && e.srv.ptr) {
+            *out = e.srv;
+            return true;
+        }
+        if (const uint32_t rule = TexRuleHashFor(hash)) {
+            const D3D12_CPU_DESCRIPTOR_HANDLE src = TexReplacement(rule);
+            if (src.ptr) {
+                *out = src;
+                return true;
+            }
+        }
+        if (const uint32_t tgt = TexLodTargetOf(hash); tgt && ModLoader::TexEntryAt(TexSelectIdxNs(tgt, own_ns), &e) && e.srv.ptr) {
+            *out = e.srv;
+            return true;
+        }
+    }
+    return RasterSwapFor(mod, res, out);
+}
+
+// The material table of extra geometry ge (of mb): a copy of its section's table src_tab in our region of the same heap,
+// with the mod's vertex factory views and the set's textures. Its GPU handle, or 0. g_m3_m held.
+uint64_t M5Table(device* dev, uint64_t src_tab, const ModBlas& mb, uint32_t ge, const M5Extra& ex)
+{
+    const TableStart ts = TableStartOf(dev, descriptor_table{ src_tab });
+    if (!ts) {
+        M5Why("table: the section's table is in no known heap");
+        return 0;
+    }
+    ID3D12DescriptorHeap*            heap = ts.Heap();
+    const D3D12_DESCRIPTOR_HEAP_DESC hd = heap->GetDesc();
+    if (hd.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !(hd.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) || hd.NumDescriptors < 65536) {
+        M5Why("table: the section's heap is small or not shader visible");
+        return 0;
+    }
+    g_m5_game_hi = (std::max)(g_m5_game_hi, ts.base);
+    const uint32_t region0 = hd.NumDescriptors - 3 * kM5Region;
+    if (g_m5_game_hi + 8192 >= region0) {
+        M5Why("table: the game's tables reach near the top of the heap");
+        return 0;
+    }
+    if (g_m5_tabs_frame != g_frame_id) {
+        g_m5_tabs.clear();
+        g_m5_tabs_frame = g_frame_id;
+    }
+    const auto key = std::make_tuple(ts.heap, ts.base, ex.key);
+    if (const auto it = g_m5_tabs.find(key); it != g_m5_tabs.end()) return it->second;
+    M5HeapCur& cur = g_m5_cur[ts.heap];
+    if (cur.frame != g_frame_id) {
+        cur.frame = g_frame_id;
+        cur.used = 0;
+    }
+    if (cur.used + kM5TableSlots > kM5Region) {
+        M5Why("table: our region of the heap is full this frame");
+        return 0;
+    }
+    const D3D12_CPU_DESCRIPTOR_HANDLE null_srv = M5NullSrv();
+    if (!null_srv.ptr) return 0;
+    const uint32_t dst = region0 + (g_frame_id % 3) * kM5Region + cur.used;
+    cur.used += kM5TableSlots;
+    const UINT   inc = g_d3d12_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const SIZE_T cpu0 = heap->GetCPUDescriptorHandleForHeapStart().ptr;
+    const SIZE_T heap_lo = cpu0, heap_hi = cpu0 + SIZE_T(hd.NumDescriptors) * inc;
+    // the section's table as the game wrote it (from the CPU views it copied), our stamps where the core stamped
+    for (uint32_t i = 0; i < kM5TableSlots; ++i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE src = null_srv;
+        ResInfo                     ri{};
+        if (g_heap_to_res.find({ ts.heap, ts.base + i }, ri)) {
+            ModLoader::TexEntry stamp{};
+            if (ri.swapped && ModLoader::TexEntryAt(ModLoader::TexIndexOf(ri.swapped), &stamp) && stamp.srv.ptr) src = stamp.srv;
+            else if (ri.view_handle && (SIZE_T(ri.view_handle) < heap_lo || SIZE_T(ri.view_handle) >= heap_hi)) src = { SIZE_T(ri.view_handle) };
+        }
+        g_d3d12_device->CopyDescriptorsSimple(1, { cpu0 + SIZE_T(dst + i) * inc }, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+    // the vertex factory views (the mod's, as M4 gives the section's table), then the textures
+    const int       mod = mb.pose_mod[ge], slot = mb.pose_slot[ge];
+    rtskin::VfViews v{};
+    uint32_t        vfmt = 0, k = 0;
+    for (; k < 8; ++k) {
+        ResInfo ri{};
+        if (!g_heap_to_res.find({ ts.heap, ts.base + k }, ri) || !ri.view_handle) break;
+        const resource_view_desc vd = dev->get_resource_view_desc(resource_view{ ri.view_handle });
+        if (vd.type != resource_view_type::buffer) break;
+        const uint32_t fmt = uint32_t(vd.format);
+        const bool     uv = fmt == uint32_t(DXGI_FORMAT_R16G16_FLOAT) || fmt == uint32_t(DXGI_FORMAT_R32G32_FLOAT);
+        if (uv && vfmt != fmt) {
+            rtskin::MakeVfViews(mod, slot, fmt, &v);
+            vfmt = fmt;
+        } else if (!vfmt) {
+            rtskin::MakeVfViews(mod, slot, 0, &v);
+            vfmt = 1;
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE src{};
+        if (uv) src = v.uv;
+        else if (fmt == uint32_t(DXGI_FORMAT_R16G16B16A16_SNORM)) src = v.tan;
+        else if (fmt == uint32_t(DXGI_FORMAT_R8G8B8A8_UNORM) || fmt == uint32_t(DXGI_FORMAT_B8G8R8A8_UNORM)) src = v.col;
+        if (src.ptr) g_d3d12_device->CopyDescriptorsSimple(1, { cpu0 + SIZE_T(dst + k) * inc }, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+    for (const uint32_t end = (std::min)(k + 24, kM5TableSlots); k < end; ++k) {
+        ResInfo ri{};
+        if (!g_heap_to_res.find({ ts.heap, ts.base + k }, ri) || !ri.view_handle) break;
+        const resource_view_desc vd = dev->get_resource_view_desc(resource_view{ ri.view_handle });
+        if (vd.type == resource_view_type::buffer || vd.type == resource_view_type::unknown) break;
+        if ((ri.swapped && ri.swapped != ri.res) || !ri.res) continue;
+        D3D12_CPU_DESCRIPTOR_HANDLE t{};
+        if (M5ResolveTex(mod, ex.tmpl, ri.res, ex.binds, &t))
+            g_d3d12_device->CopyDescriptorsSimple(1, { cpu0 + SIZE_T(dst + k) * inc }, t, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+    ++g_m5_tables;
+    const uint64_t gpu = heap->GetGPUDescriptorHandleForHeapStart().ptr + uint64_t(dst) * inc;
+    g_m5_tabs[key] = gpu;
+    return gpu;
+}
+
+// A character's block: its sections' records (as M3 made them ours) then each extra geometry's (its section's, with its
+// own index range and material table), appended to out. g_m3_m held.
+bool M5Block(device* dev, const ModBlas& mb, const RecTx& tx, uint64_t stride, std::vector<uint8_t>* out)
+{
+    const uint32_t n = mb.geoms, N = mb.total;
+    if (mb.m5.empty() || N != n + mb.m5.size() || tx.mine.size() < size_t(n) * 3 * stride || mb.ib_off.size() < N || mb.vb.size() < N) {
+        M5Why("block: the character's records or geometries do not match");
+        return false;
+    }
+    const size_t at = out->size();
+    out->resize(at + size_t(N) * 3 * stride);
+    uint8_t* blk = out->data() + at;
+    memcpy(blk, tx.mine.data(), size_t(n) * 3 * stride);
+    for (uint32_t e = 0; e < uint32_t(mb.m5.size()); ++e) {
+        const M5Extra& ex = mb.m5[e];
+        if (ex.tmpl >= n) {
+            out->resize(at);
+            return false;
+        }
+        for (uint32_t r = 0; r < 3; ++r) {
+            uint8_t* rec = blk + (size_t(n + e) * 3 + r) * stride;
+            memcpy(rec, tx.mine.data() + (size_t(ex.tmpl) * 3 + r) * stride, size_t(stride));
+            const uint32_t off = mb.ib_off[n + e];
+            const uint64_t vb = mb.vb[n + e];
+            memcpy(rec + 52, &off, 4);
+            memcpy(rec + 40, &vb, 8);
+            uint64_t tab;
+            memcpy(&tab, rec + 64, 8);
+            if (!tab) continue;
+            const uint64_t mine = M5Table(dev, tab, mb, n + e, ex);
+            if (!mine) {
+                ++g_m5_table_fail;
+                out->resize(at);
+                return false;
+            }
+            memcpy(rec + 64, &mine, 8);
+        }
+    }
+    ++g_m5_blocks;
+    return true;
+}
+
+M5Ext* M5TakeExt(uint64_t need, uint64_t up_need) // g_m3_m held
+{
+    for (size_t tries = 0; tries < g_m5_ring.size(); ++tries) {
+        M5Ext& e = g_m5_ring[g_m5_ring_next++ % g_m5_ring.size()];
+        if (e.stamp && !GpuPassed(e.stamp)) continue;
+        if (e.cap < need) {
+            ComPtr<ID3D12Resource> r;
+            const uint64_t         cap = (need + need / 4 + 65535) & ~uint64_t(65535);
+            if (FAILED(CreateD3D12Buffer(g_d3d12_device, D3D12_HEAP_TYPE_DEFAULT, cap, D3D12_RESOURCE_STATE_COMMON, &r))) return nullptr;
+            M3Retire(e.res);
+            e.res = r;
+            e.cap = cap;
+        }
+        if (e.up_cap < up_need) {
+            ComPtr<ID3D12Resource> u;
+            const uint64_t         cap = (up_need + up_need / 4 + 65535) & ~uint64_t(65535);
+            if (FAILED(CreateD3D12Buffer(g_d3d12_device, D3D12_HEAP_TYPE_UPLOAD, cap, D3D12_RESOURCE_STATE_GENERIC_READ, &u))) return nullptr;
+            void*             p = nullptr;
+            const D3D12_RANGE none{ 0, 0 };
+            if (FAILED(u->Map(0, &none, &p)) || !p) return nullptr;
+            if (e.up) e.up->Unmap(0, nullptr);
+            M3Retire(e.up);
+            e.up = u;
+            e.up_cap = cap;
+            e.up_ptr = static_cast<uint8_t*>(p);
+        }
+        return &e;
+    }
+    if (g_m5_ring.size() >= 16) return nullptr;
+    g_m5_ring.emplace_back();
+    g_m5_ring_next = uint32_t(g_m5_ring.size() - 1);
+    return M5TakeExt(need, up_need);
+}
+
+uint64_t M5Va(resource r, uint64_t off)
+{
+    return r.handle ? reinterpret_cast<ID3D12Resource*>(r.handle)->GetGPUVirtualAddress() + off : 0;
+}
+
+// After M3: a TLAS of the last frames has instances pointing at our block -- this dispatch traces with the game's table
+// extended by our block (issued here; the game's call is skipped), or is skipped. true = skip the game's call.
+bool M5AfterRays(command_list* cmd_list, resource rg_res, uint64_t rg_off, uint64_t rg_size, resource miss_res, uint64_t miss_off,
+    uint64_t miss_size, uint64_t miss_stride, resource hit_res, uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, resource call_res,
+    uint64_t call_off, uint64_t call_size, uint64_t call_stride, uint32_t w, uint32_t h, uint32_t d)
+{
+    if (!cmd_list) return false;
+    std::lock_guard l(g_m3_m);
+    const TlasRec* t = nullptr;
+    for (const TlasRec& r : g_m3_tlas)
+        if (r.res && r.m5_on && int32_t(g_frame_id - r.frame) <= 2 && (!t || r.seq > t->seq)) t = &r;
+    if (!t) return false;
+    ID3D12Resource* rd = nullptr;
+    uint64_t        rd_va = 0;
+    const char*     why = nullptr;
+    const bool      src = M3HitSource(cmd_list, hit_res, hit_off, hit_size, g_frame_id, &rd, &rd_va, &why, nullptr);
+    const uint64_t  r0b = uint64_t(t->m5_r0) * hit_stride;
+    const char*     skip = !src                         ? "dispatch skipped: the hit group table's source is unknown"
+                           : t->m5_block.empty()        ? "dispatch skipped: no block of records"
+                           : hit_stride != t->m5_stride ? "dispatch skipped: another record stride"
+                           : hit_size > r0b             ? "dispatch skipped: the game's table reaches our block"
+                                                        : nullptr;
+    ComPtr<ID3D12GraphicsCommandList4> cl;
+    if (!skip && (FAILED(reinterpret_cast<IUnknown*>(cmd_list->get_native())->QueryInterface(IID_PPV_ARGS(&cl))) || !cl))
+        skip = "dispatch skipped: the list is not an ID3D12GraphicsCommandList4";
+    M5Ext* e = skip ? nullptr : M5TakeExt(r0b + t->m5_block.size(), t->m5_block.size());
+    if (!skip && !e) skip = "dispatch skipped: no extended table buffer";
+    if (skip) {
+        ++g_m5_skip;
+        M5Why(skip);
+        return true;
+    }
+    memcpy(e->up_ptr, t->m5_block.data(), t->m5_block.size());
+    D3D12_RESOURCE_BARRIER br{};
+    br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    br.Transition.pResource = e->res.Get();
+    br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    br.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    br.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    M3Marker(cl.Get(), L"wwmi rt-m5: extended hit group table");
+    cl->ResourceBarrier(1, &br);
+    cl->CopyBufferRegion(e->res.Get(), 0, rd, rd_va - rd->GetGPUVirtualAddress(), hit_size);
+    cl->CopyBufferRegion(e->res.Get(), r0b, e->up.Get(), 0, t->m5_block.size());
+    br.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    br.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    cl->ResourceBarrier(1, &br);
+    e->stamp = GpuStamp();
+    D3D12_DISPATCH_RAYS_DESC dr{};
+    dr.RayGenerationShaderRecord = { M5Va(rg_res, rg_off), rg_size };
+    dr.MissShaderTable = { M5Va(miss_res, miss_off), miss_size, miss_stride };
+    dr.HitGroupTable = { e->res->GetGPUVirtualAddress(), r0b + t->m5_block.size(), hit_stride };
+    dr.CallableShaderTable = { M5Va(call_res, call_off), call_size, call_stride };
+    dr.Width = w;
+    dr.Height = h;
+    dr.Depth = d;
+    cl->DispatchRays(&dr);
+    RemovalPin::Ours(reinterpret_cast<const void*>(cmd_list->get_native()), "rt-m5 dispatch rays");
+    if (g_m5_ext++ < 4)
+        g_log.Line(true, "RTM5 dispatch f=%u %ux%u: traced with our extended table (%llu game records, block of %u at %u)", g_frame_id, w, h,
+            (unsigned long long)(hit_size / hit_stride), t->m5_recs, t->m5_r0);
+    return true;
+}
+
 // DispatchRays (rt_m3=1). The TLAS these rays trace (the newest built) is still gated: every instance naming a
 // character's BLAS whose records are the character's (and of a kind whose records were) is pointed at our BLAS in the
 // game's own instance memory, its records at our buffers -- all or none -- and the gate opens. A TLAS whose gate is
@@ -1972,7 +2408,10 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
         uint32_t idx;
         uint64_t game;
         int      sig;
+        uint32_t orig; // the game's contribution of the instance
     };
+    // M5: characters with extra geometries need their records in our block (R0..), and every dispatch our extended table
+    const bool m5_ok = M5Mode() && src && hit_stride >= 72;
     std::vector<Cand>  cands;    // to point at our BLAS (gate closed)
     std::vector<RecTx> txs;      // records to make ours: the candidates', then those of instances naming ours already
     std::vector<std::pair<ModBlas*, uint64_t>> tx_owner; // each RecTx's character (M4)
@@ -1998,8 +2437,12 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
             if (GuardedPrivateRead(t.res, t.va + uint64_t(idx) * 64, inst, 64) != 64) continue;
             uint64_t as;
             memcpy(&as, inst + 56, 8);
-            const uint32_t contrib = inst[52] | inst[53] << 8 | inst[54] << 16;
+            const uint32_t inst_contrib = inst[52] | inst[53] << 8 | inst[54] << 16;
             const int      sig = inst[51] << 8 | inst[55];
+            // an instance already pointing at our block: its records are still the game's at its own contribution
+            const bool     in_block = as == ours && mb.m5_contrib != UINT32_MAX && inst_contrib == mb.m5_contrib && mb.orig_contrib != UINT32_MAX;
+            const uint32_t contrib = in_block ? mb.orig_contrib : inst_contrib;
+            if (!in_block) mb.orig_contrib = contrib;
             mb.contrib = contrib;
             RecTx      tx;
             const bool valid = src && M3Records(mb, rd, rd_va, hit_size, hit_stride, contrib, &tx);
@@ -2009,9 +2452,9 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
                 if (valid) {
                     txs.push_back(std::move(tx));
                     tx_owner.push_back({ &mb, game });
-                    mine.push_back({ &mb, idx, game, sig });
+                    mine.push_back({ &mb, idx, game, sig, contrib });
                 } else
-                    stale.push_back({ &mb, idx, game, sig });
+                    stale.push_back({ &mb, idx, game, sig, contrib });
                 continue;
             }
             if (!live) continue;
@@ -2023,17 +2466,93 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
                 M3Refuse(src ? "an instance's records are not the character's (it keeps the game's BLAS)" : why);
                 continue;
             }
-            cands.push_back({ &mb, idx, game, sig });
+            if (!mb.m5.empty() && !m5_ok) {
+                M3Refuse("M5: extra geometries, but no hit group table to extend (it keeps the game's BLAS)");
+                continue;
+            }
+            cands.push_back({ &mb, idx, game, sig, contrib });
             txs.push_back(std::move(tx));
             tx_owner.push_back({ &mb, game });
         }
     }
-    auto write_as = [&](const Cand& c, uint64_t as) -> bool {
-        uint8_t* p = MapUpload(t.res, t.va + uint64_t(c.idx) * 64 + 56, 8);
+    // M5: the block's layout (decided at the TLAS's first dispatch with such a character), then this dispatch's block; a
+    // character whose block cannot be made keeps the game's BLAS (its instances back), never a contribution past a table
+    std::vector<uint8_t> m5_block;
+    std::set<ModBlas*>   m5_bad;
+    if (m5_ok) {
+        if (!t.m5_decided) {
+            std::vector<ModBlas*> chars;
+            for (const Cand& c : cands)
+                if (!c.mb->m5.empty() && std::find(chars.begin(), chars.end(), c.mb) == chars.end()) chars.push_back(c.mb);
+            if (!chars.empty()) {
+                t.m5_decided = true;
+                t.m5_stride = hit_stride;
+                t.m5_r0 = uint32_t(((hit_size / hit_stride) + 1024 + 1023) & ~uint64_t(1023));
+                uint32_t cur = t.m5_r0;
+                for (ModBlas* mb : chars) {
+                    t.m5_layout.push_back({ mb, cur });
+                    cur += mb->total * 3;
+                }
+                t.m5_recs = cur - t.m5_r0;
+            }
+        }
+        if (t.m5_decided) {
+            for (const auto& [mb, at] : t.m5_layout) {
+                mb->m5_contrib = at;
+                size_t ti = 0;
+                while (ti < tx_owner.size() && tx_owner[ti].first != mb) ++ti;
+                const size_t before = m5_block.size();
+                if (ti == tx_owner.size() || hit_stride != t.m5_stride || before != size_t(at - t.m5_r0) * hit_stride ||
+                    !M5Block(cmd_list->get_device(), *mb, txs[ti], hit_stride, &m5_block)) {
+                    ++g_m5_block_fail;
+                    m5_bad.insert(mb);
+                    m5_block.resize(before);
+                }
+            }
+            if (!m5_bad.empty()) { // the layout is all or nothing: every character with extras keeps the game's BLAS
+                for (const auto& p : t.m5_layout) m5_bad.insert(p.first);
+                m5_block.clear();
+            }
+        }
+        // characters with extras not in the layout (they came after the TLAS's first dispatch) cannot point at it
+        for (const Cand& c : cands)
+            if (!c.mb->m5.empty() && (!t.m5_decided || std::none_of(t.m5_layout.begin(), t.m5_layout.end(),
+                                                           [&](const auto& p) { return p.first == c.mb; })))
+                m5_bad.insert(c.mb);
+    }
+    if (!m5_bad.empty()) {
+        // drop the bad characters' candidates; their instances already ours become stale (put back below if writable)
+        std::vector<Cand>  keep_c, keep_m;
+        std::vector<RecTx> keep_tx;
+        std::vector<std::pair<ModBlas*, uint64_t>> keep_own;
+        for (size_t i = 0; i < txs.size(); ++i)
+            if (!m5_bad.count(tx_owner[i].first) || tx_owner[i].first->m5.empty()) {
+                keep_tx.push_back(std::move(txs[i]));
+                keep_own.push_back(tx_owner[i]);
+            }
+        for (const Cand& c : cands)
+            if (!m5_bad.count(c.mb)) keep_c.push_back(c);
+            else M3Refuse("M5: the character's block of records could not be made (it keeps the game's BLAS)");
+        for (const Cand& c : mine)
+            if (!m5_bad.count(c.mb)) keep_m.push_back(c);
+            else stale.push_back(c);
+        cands.swap(keep_c);
+        mine.swap(keep_m);
+        txs.swap(keep_tx);
+        tx_owner.swap(keep_own);
+    }
+    // the instance's BLAS address (+56) and hit group contribution (+52..54; +55 is its flags)
+    auto write_inst = [&](const Cand& c, uint64_t as, uint32_t contrib) -> bool {
+        uint8_t* p = MapUpload(t.res, t.va + uint64_t(c.idx) * 64 + 52, 12);
         if (!p) return false;
-        const bool ok = GuardedCopy(p, &as, 8);
+        const uint8_t cb[3] = { uint8_t(contrib), uint8_t(contrib >> 8), uint8_t(contrib >> 16) };
+        const bool    ok = GuardedCopy(p, cb, 3) && GuardedCopy(p + 4, &as, 8);
         UnmapUpload(t.res);
         return ok;
+    };
+    auto write_as = [&](const Cand& c, uint64_t as) -> bool { // ours: in the block when the character has extras
+        const bool block = as != c.game && !c.mb->m5.empty() && c.mb->m5_contrib != UINT32_MAX && t.m5_decided;
+        return write_inst(c, as, block ? c.mb->m5_contrib : c.orig);
     };
     // every instance naming our BLAS back to the game's (the TLAS has not read them yet): nothing of ours goes in
     auto all_back = [&]() {
@@ -2099,6 +2618,22 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
         if (s_first.fetch_add(1) < 4)
             g_log.Line(true, "RTM3 redirect f=%u: TLAS %llx (%u instances, gate %llu) reads our BLAS for %zu instance(s); records patched", frame,
                 (unsigned long long)t.dest, t.count, (unsigned long long)t.gate, cands.size());
+    }
+    // M5: instances now point at our block: every dispatch from here traces with our extended table
+    if (!backed && committed && t.m5_decided && !m5_block.empty()) {
+        bool any = false;
+        for (const Cand& c : cands) any = any || !c.mb->m5.empty();
+        for (const Cand& c : mine) any = any || !c.mb->m5.empty();
+        if (any) {
+            if (!t.m5_on) {
+                static std::atomic<uint32_t> s_first{ 0 };
+                if (s_first.fetch_add(1) < 4)
+                    g_log.Line(true, "RTM5 on f=%u: TLAS %llx, block of %u record(s) at %u (game table %llu records), %zu character(s)", frame,
+                        (unsigned long long)t.dest, t.m5_recs, t.m5_r0, (unsigned long long)(hit_size / hit_stride), t.m5_layout.size());
+            }
+            t.m5_on = true;
+            t.m5_block = std::move(m5_block);
+        }
     }
     // M4: the committed records' vertex factory slots (txs: one RecTx per candidate / instance already ours, each now
     // ours; tx_owner: its character)
@@ -2263,6 +2798,13 @@ void M3Summary()
         M4Mode(), (unsigned long long)g_m4_tables, (unsigned long long)g_m4_slots, (unsigned long long)g_m4_tex_mod, (unsigned long long)g_m4_tex_swapped,
         (unsigned long long)g_m4_tex_lod, (unsigned long long)g_m4_tex_rsw, (unsigned long long)g_m4_tex_slot, (unsigned long long)g_m4_tex_norule, (unsigned long long)g_m4_tex_nosrv, (unsigned long long)slot_notes, slot_maps);
     M5SubDrawSummary();
+    {
+        std::string why;
+        for (const auto& [wy, n] : g_m5_why) why += " | " + std::to_string(n) + " " + wy;
+        g_log.Line(true, "RTM5SUM rt_m5=%d dispatches extended=%llu skipped=%llu blocks=%llu (failed %llu) tables=%llu (failed %llu) game tables reach %u%s",
+            M5Mode(), (unsigned long long)g_m5_ext, (unsigned long long)g_m5_skip, (unsigned long long)g_m5_blocks, (unsigned long long)g_m5_block_fail,
+            (unsigned long long)g_m5_tables, (unsigned long long)g_m5_table_fail, g_m5_game_hi, why.c_str());
+    }
     std::string fw;
     for (const auto& [why, n] : g_m3_full_why) fw += " | " + std::to_string(n) + " " + why;
     if (!fw.empty()) g_log.Line(true, "RTM3FULL full BLAS builds by reason:%s", fw.c_str());
@@ -2337,16 +2879,20 @@ void RtNoteExecute(command_queue* queue, command_list* cmd_list)
         if (r.cl == cmd_list && r.gen == gen) r.executed = true;
 }
 
-void RtNoteRays(command_list* cmd_list, resource rg_res, uint64_t rg_off, uint64_t rg_size, resource miss_res, uint64_t miss_off,
-    uint64_t miss_size, uint64_t miss_stride, resource hit_res, uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, uint32_t w,
-    uint32_t h, uint32_t d)
+bool RtNoteRays(command_list* cmd_list, resource rg_res, uint64_t rg_off, uint64_t rg_size, resource miss_res, uint64_t miss_off,
+    uint64_t miss_size, uint64_t miss_stride, resource hit_res, uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, resource call_res,
+    uint64_t call_off, uint64_t call_size, uint64_t call_stride, uint32_t w, uint32_t h, uint32_t d)
 {
-    if (Mode() == 0) return;
+    if (Mode() == 0) return false;
     NoteRtFrame();
     g_c.rays.fetch_add(1, std::memory_order_relaxed);
     ObserveRays(rg_res, rg_off, rg_size, miss_res, miss_off, miss_size, miss_stride, hit_res, hit_off, hit_size, hit_stride, w, h, d);
-    if (Mode() == 2) M5ObserveRays(cmd_list, hit_res, hit_off, hit_size, hit_stride, w, h);
-    if (Mode() == 2) M3Redirect(cmd_list, hit_res, hit_off, hit_size, hit_stride);
+    if (Mode() != 2) return false;
+    M5ObserveRays(cmd_list, hit_res, hit_off, hit_size, hit_stride, w, h);
+    M3Redirect(cmd_list, hit_res, hit_off, hit_size, hit_stride);
+    // M5: instances pointing past the game's table: this dispatch is issued with our extended table (or skipped)
+    return M3On() && M5AfterRays(cmd_list, rg_res, rg_off, rg_size, miss_res, miss_off, miss_size, miss_stride, hit_res, hit_off, hit_size,
+                         hit_stride, call_res, call_off, call_size, call_stride, w, h, d);
 }
 
 // Present: a gate still closed for an earlier frame's TLAS (no rays came for it) opens.

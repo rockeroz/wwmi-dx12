@@ -107,9 +107,11 @@ void RtNoteCopy(reshade::api::command_list* cmd_list, reshade::api::resource src
 void RtOnDeviceRemoved();
 // A list submitted (ExecuteCommandLists): from now on what it reads from UPLOAD memory may already be on the GPU.
 void RtNoteExecute(reshade::api::command_queue* queue, reshade::api::command_list* cmd_list);
-void RtNoteRays(reshade::api::command_list* cmd_list, reshade::api::resource rg_res, uint64_t rg_off, uint64_t rg_size,
+// true = the module issued the dispatch itself (M5: with an extended hit group table) or it must not run: skip the game's.
+bool RtNoteRays(reshade::api::command_list* cmd_list, reshade::api::resource rg_res, uint64_t rg_off, uint64_t rg_size,
     reshade::api::resource miss_res, uint64_t miss_off, uint64_t miss_size, uint64_t miss_stride, reshade::api::resource hit_res,
-    uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, uint32_t w, uint32_t h, uint32_t d);
+    uint64_t hit_off, uint64_t hit_size, uint64_t hit_stride, reshade::api::resource call_res, uint64_t call_off, uint64_t call_size,
+    uint64_t call_stride, uint32_t w, uint32_t h, uint32_t d);
 // A raster draw of mod component (mod, comp) stamped its texture over the game's texture `game` (section_ps_stamp.cpp):
 // M4 puts the same texture in that section's ray tracing material table.
 void RtNoteSlotTexture(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRIPTOR_HANDLE src, ID3D12Resource* mod_res);
