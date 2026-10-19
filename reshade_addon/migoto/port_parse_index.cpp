@@ -16,6 +16,7 @@
 #include <mutex>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -647,6 +648,120 @@ void ForEachModIni(void (*cb)(const wchar_t*, const wchar_t*, const wchar_t*, vo
             }
         },
         &ctx);
+}
+
+// MODTREE: what lies under d3dx.ini's include_recursive roots against what their engine parsed -- each folder holding
+// .ini files (parsed / not), each entry an exclude_recursive pattern drops (a mod manager's DISABLED* folders), links. A
+// mod that "does not show" and never appears in the WwmiMod lines: is its folder there, excluded, or there and unparsed?
+static bool ModTreeGlob(const wchar_t* pat, const wchar_t* s) // case-insensitive * and ?
+{
+    const wchar_t* star = nullptr;
+    const wchar_t* back = nullptr;
+    while (*s) {
+        if (*pat == L'*') {
+            star = pat++;
+            back = s;
+        } else if (*pat == L'?' || towlower(*pat) == towlower(*s)) {
+            ++pat;
+            ++s;
+        } else if (star) {
+            pat = star + 1;
+            s = ++back;
+        } else
+            return false;
+    }
+    while (*pat == L'*') ++pat;
+    return !*pat;
+}
+
+void LogModTree()
+{
+    if (!g_loaded) return;
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    wchar_t                               base_c[MAX_PATH] = {};
+    MigotoPort::MigotoDir(base_c, MAX_PATH);
+    const std::wstring base(base_c);
+    const std::wstring d3dx = base + L"d3dx.ini";
+    std::vector<std::wstring> excl;
+    {
+        std::vector<wchar_t> buf(8192);
+        const DWORD          n = GetPrivateProfileSectionW(L"Include", buf.data(), (DWORD)buf.size(), d3dx.c_str());
+        for (const wchar_t* p = buf.data(); p < buf.data() + n && *p; p += wcslen(p) + 1) {
+            std::wstring line(p);
+            const size_t eq = line.find(L'=');
+            if (eq == std::wstring::npos) continue;
+            auto trim = [](std::wstring s) {
+                const size_t a = s.find_first_not_of(L" \t"), b = s.find_last_not_of(L" \t");
+                return a == std::wstring::npos ? std::wstring() : s.substr(a, b - a + 1);
+            };
+            if (trim(line.substr(0, eq)) == L"exclude_recursive") excl.push_back(trim(line.substr(eq + 1)));
+        }
+    }
+    std::set<std::wstring> parsed; // lower-case relative paths of the inis the engine parsed
+    PortForEachIniFile(
+        [](const std::wstring& rel, const std::wstring&, void* u) {
+            std::wstring p = rel;
+            for (auto& ch : p) ch = ch == L'/' ? L'\\' : (wchar_t)towlower(ch);
+            static_cast<std::set<std::wstring>*>(u)->insert(p);
+        },
+        &parsed);
+    std::string pats;
+    for (const auto& e : excl) {
+        pats += " '";
+        for (const wchar_t ch : e) pats += ch < 128 ? char(ch) : '?';
+        pats += "'";
+    }
+    const std::vector<std::wstring> roots = IncludeRecursiveRoots(d3dx);
+    uint32_t total = 0, got = 0, folders = 0, excluded = 0, lines = 0;
+    std::function<void(const std::wstring&, int)> walk = [&](const std::wstring& rel, int depth) {
+        WIN32_FIND_DATAW fd{};
+        const HANDLE     h = FindFirstFileW((base + rel + L"\\*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) {
+            if (depth == 0) logger::write("MODTREE root '%ls' (include_recursive): not found under '%ls'", rel.c_str(), base.c_str());
+            return;
+        }
+        std::vector<std::wstring> dirs;
+        uint32_t                  inis = 0, inis_parsed = 0;
+        std::wstring              unparsed;
+        do {
+            const std::wstring name = fd.cFileName;
+            if (name == L"." || name == L"..") continue;
+            bool ex = false;
+            for (const auto& e : excl) ex = ex || ModTreeGlob(e.c_str(), name.c_str());
+            if (ex) {
+                ++excluded;
+                if (lines++ < 120) logger::write("MODTREE excluded by exclude_recursive: %ls\\%ls%s", rel.c_str(), name.c_str(),
+                    (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "\\" : "");
+                continue;
+            }
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if ((fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) && lines++ < 120)
+                    logger::write("MODTREE link (junction / symlink): %ls\\%ls", rel.c_str(), name.c_str());
+                dirs.push_back(name);
+            } else if (name.size() > 4 && _wcsicmp(name.c_str() + name.size() - 4, L".ini") == 0) {
+                ++inis;
+                std::wstring p = rel + L"\\" + name;
+                for (auto& ch : p) ch = (wchar_t)towlower(ch);
+                if (parsed.count(p)) ++inis_parsed;
+                else if (unparsed.size() < 300) unparsed += L" '" + name + L"'";
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+        total += inis;
+        got += inis_parsed;
+        if (inis) {
+            ++folders;
+            if (lines++ < 120)
+                logger::write("MODTREE %ls: %u ini(s), %u parsed by their engine%s%ls", rel.c_str(), inis, inis_parsed,
+                    inis_parsed < inis ? " -- NOT parsed:" : "", inis_parsed < inis ? unparsed.c_str() : L"");
+        }
+        if (depth < 8)
+            for (const auto& d : dirs) walk(rel + L"\\" + d, depth + 1);
+    };
+    for (const auto& r : roots) walk(r, 0);
+    logger::write("MODTREE: %u ini file(s) in %u folder(s) under %zu include_recursive root(s), %u parsed by their engine; %u entr%s "
+                  "excluded by exclude_recursive (%s )",
+        total, folders, roots.size(), got, excluded, excluded == 1 ? "y" : "ies", pats.c_str());
 }
 
 void ForEachTextureOverride(void (*cb)(uint32_t, const wchar_t*, bool, const wchar_t*, void*), void* user)

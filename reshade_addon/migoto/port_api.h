@@ -209,6 +209,8 @@ unsigned Crc32c(unsigned seed, const void* data, size_t n);
 bool NamespaceForIni(const wchar_t* abs_ini_path, wchar_t* out, size_t out_chars);
 void ForEachModIni(void (*cb)(const wchar_t* abs_ini, const wchar_t* ns, const wchar_t* abs_root, void* user),
     void* user);
+// MODTREE log lines: the include_recursive tree on disk against the inis their engine parsed (excluded, linked, unparsed)
+void LogModTree();
 
 bool ResolveSection(const wchar_t* ns, const wchar_t* ns_hint2, const wchar_t* section,
     wchar_t* out, size_t out_chars);

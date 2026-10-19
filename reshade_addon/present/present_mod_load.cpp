@@ -78,6 +78,7 @@ void ModTexturesTick()
 void LoadGeometryMods()
 {
     if (g_wwmi_geom && !g_geom_loaded && g_d3d12_device && !g_wwmi_dir.empty()) {
+        PortApi::LogModTree(); // which mod folders their engine parsed, and which it did not (excluded / unparsed)
         for (auto& dm : ModLoader::EnumerateMods()) {
             struct ObjGroup {
                 std::wstring              ns;

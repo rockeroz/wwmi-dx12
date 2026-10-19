@@ -61,11 +61,108 @@ bool RunDrawShaderOverrides(const DrawArgs& da)
     return false;
 }
 
+// A mod part with geometry of its own: its index buffer loaded. A helper ini that declares a range only to know the
+// character is on screen (Denia "Prismatic Maiden" maker: a help image) or a part whose mesh files are missing (its s1u)
+// draws nothing: a draw several mods declare must not be claimed for it while a sibling of the same object has a mesh --
+// with RT on the module cannot pose it and holds the draw, and the game's model shows (6a096f9 test, f11501).
+static bool ModHasGeometry(int md)
+{
+    static const void*         s_for = nullptr;
+    static size_t              s_n = 0;
+    static std::vector<int8_t> s_has; // per mod: -1 not checked yet, 0 no, 1 yes
+    static std::mutex          s_m;
+    std::lock_guard            l(s_m);
+    const void*                front = g_geomods.empty() ? nullptr : (const void*)&g_geomods.front();
+    if (s_for != front || s_n != g_geomods.size()) {
+        s_for = front;
+        s_n = g_geomods.size();
+        s_has.assign(s_n, -1);
+    }
+    if (md < 0 || (size_t)md >= s_n) return false;
+    if (s_has[md] < 0) {
+        s_has[md] = 0;
+        for (const auto& r : g_geomods[md].mod.resources) {
+            if (!r.res) continue;
+            std::wstring n = r.name;
+            for (auto& ch : n) ch = (wchar_t)towlower(ch);
+            if (n.find(L"indexbuffer") != std::wstring::npos) {
+                s_has[md] = 1;
+                break;
+            }
+        }
+    }
+    return s_has[md] == 1;
+}
+
+// The slot s, or -- when its mod draws no geometry -- a candidate of the same object (same section hash) whose mod does.
+static int PreferDrawingSibling(int s, const std::vector<int>& cands, uint32_t first_index, uint32_t index_count)
+{
+    if (s < 0 || ModHasGeometry(g_merged_comps[s].mod_id)) return s;
+    const WwmiMod::Component* ws = WmodComp(g_merged_comps[s].mod_id, g_merged_comps[s].comp_idx);
+    if (!ws || !ws->ib_hash) return s;
+    for (const int c : cands) {
+        if (c == s) continue;
+        const WwmiMod::Component* wc = WmodComp(g_merged_comps[c].mod_id, g_merged_comps[c].comp_idx);
+        if (!wc || wc->ib_hash != ws->ib_hash || !ModHasGeometry(g_merged_comps[c].mod_id)) continue;
+        if (DiagChanged("SHAREDRANGE-GEOM", (int)(first_index ^ (index_count << 7)), (unsigned long long)c))
+            logger::write("SHAREDRANGE first=%u count=%u hash=%08x: mod %d draws no geometry of its own (no index buffer loaded) -- "
+                          "claimed for mod %d comp %d of the same object instead (every one's section still runs)",
+                first_index, index_count, ws->ib_hash, g_merged_comps[s].mod_id, g_merged_comps[c].mod_id, g_merged_comps[c].comp_idx);
+        return c;
+    }
+    return s;
+}
+
+// Which mod the draws reading a vertex buffer were claimed for through a range only that mod declares, lately: the
+// evidence for a range several mods of different objects declare when the IB hash cannot tell them apart -- with RT on,
+// vb0 is the skin cache's posed ring, whose contents hash to nothing an ini names (6a096f9 test: Denia's s-1 object,
+// whose first section's range s2u also declares, claimed for s2u).
+struct Vb0Claim {
+    int      mod = -1;
+    uint32_t frame = 0;
+};
+static std::mutex                             g_vb0_claim_m;
+static std::unordered_map<uint64_t, Vb0Claim> g_vb0_claim;
+static void NoteVb0Claim(uint64_t vb0, int mod)
+{
+    if (!vb0 || mod < 0) return;
+    std::lock_guard l(g_vb0_claim_m);
+    auto            it = g_vb0_claim.find(vb0);
+    if (it != g_vb0_claim.end()) {
+        it->second = { mod, g_frame_id };
+        return;
+    }
+    if (g_vb0_claim.size() >= 1024) {
+        for (auto e = g_vb0_claim.begin(); e != g_vb0_claim.end();)
+            e = g_frame_id - e->second.frame > 64 ? g_vb0_claim.erase(e) : std::next(e);
+        if (g_vb0_claim.size() >= 1024) g_vb0_claim.clear();
+    }
+    g_vb0_claim.emplace(vb0, Vb0Claim{ mod, g_frame_id });
+}
+static int Vb0ClaimMod(uint64_t vb0)
+{
+    if (!vb0) return -1;
+    std::lock_guard l(g_vb0_claim_m);
+    const auto      it = g_vb0_claim.find(vb0);
+    return it != g_vb0_claim.end() && g_frame_id - it->second.frame <= 16 ? it->second.mod : -1;
+}
+
+static int PickSharedRangeSlotRaw(command_list* cmd_list, uint32_t first_index, uint32_t index_count, int dflt,
+    const std::vector<int>& cands);
 static int PickSharedRangeSlot(command_list* cmd_list, uint32_t first_index, uint32_t index_count, int dflt)
 {
     auto sh = g_first_to_shared.find(FirstCountKey(first_index, index_count));
-    if (sh == g_first_to_shared.end()) return dflt;
+    if (sh == g_first_to_shared.end()) {
+        if (dflt >= 0) NoteVb0Claim(CmdGfx(cmd_list).vb[0].va, g_merged_comps[dflt].mod_id); // a range one mod declares
+        return dflt;
+    }
     const std::vector<int>& cands = sh->second;
+    return PreferDrawingSibling(PickSharedRangeSlotRaw(cmd_list, first_index, index_count, dflt, cands), cands, first_index, index_count);
+}
+
+static int PickSharedRangeSlotRaw(command_list* cmd_list, uint32_t first_index, uint32_t index_count, int dflt,
+    const std::vector<int>& cands)
+{
     ID3D12Resource*         ibr = nullptr;
     ID3D12Resource*         vbr = nullptr;
     uint64_t                ibva = 0;
@@ -87,6 +184,20 @@ static int PickSharedRangeSlot(command_list* cmd_list, uint32_t first_index, uin
         if (cv != g_char_mesh_vb0.end())
             for (int s : cands)
                 if (g_merged_comps[s].mod_id == cv->second.mod) return s;
+    }
+    int by_vb0 = -1; // the mod this vertex buffer's other sections were claimed for (ranges only it declares)
+    if (vbva) {
+        const int vm = Vb0ClaimMod(vbva);
+        for (int s : cands)
+            if (vm >= 0 && g_merged_comps[s].mod_id == vm) by_vb0 = s;
+    }
+    if (by_vb0 >= 0) {
+        if (g_debug && DiagChanged("SHAREDRANGE-VB0", (int)(first_index ^ (index_count << 7)), (unsigned long long)by_vb0))
+            logger::write("SHAREDRANGE first=%u count=%u: %zu mods declare this range; vb0 %llx's other sections were claimed for mod %d "
+                          "-- mod %d comp %d",
+                first_index, index_count, cands.size(), (unsigned long long)vbva, g_merged_comps[by_vb0].mod_id,
+                g_merged_comps[by_vb0].mod_id, g_merged_comps[by_vb0].comp_idx);
+        return by_vb0;
     }
     if (!ibr || !vbr || !vstride) return dflt;
     const uint32_t iboff = (uint32_t)(ibva - ibr->GetGPUVirtualAddress());
