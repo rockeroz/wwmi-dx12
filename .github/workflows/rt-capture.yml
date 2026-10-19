@@ -3,9 +3,9 @@ name: RT capture tool
 on:
   workflow_dispatch:
   push:
-    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'tests/mock_d3d12/**', 'reshade_addon/rt/**', '.github/workflows/rt-capture.yml', 'tools/ci/**']
+    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'tests/mock_d3d12/**', 'reshade_addon/rt/**', 'reshade_addon/textures/tex_eager.*', 'reshade_addon/migoto/port_vars.cpp', 'reshade_addon/draw/**', '.github/workflows/rt-capture.yml', 'tools/ci/**']
   pull_request:
-    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'tests/mock_d3d12/**', 'reshade_addon/rt/**', '.github/workflows/rt-capture.yml', 'tools/ci/**']
+    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'tests/mock_d3d12/**', 'reshade_addon/rt/**', 'reshade_addon/textures/tex_eager.*', 'reshade_addon/migoto/port_vars.cpp', 'reshade_addon/draw/**', '.github/workflows/rt-capture.yml', 'tools/ci/**']
 
 permissions:
   contents: read
@@ -40,8 +40,25 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force build_addon\rt_capture | Out-Null
           ./tools/ci/annotate.ps1 -VcVars -Title "rt_registry_test" -Command "cl /nologo /std:c++20 /EHsc /W4 /WX /MT tests\rt_registry_test.cpp /Febuild_addon\rt_capture\rt_registry_test.exe /Fobuild_addon\rt_capture\rt_registry_test.obj && build_addon\rt_capture\rt_registry_test.exe"
+      - name: CPU M5 reservation and publication policies
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build_addon\rt_capture | Out-Null
+          ./tools/ci/annotate.ps1 -VcVars -Title "rt_m5_policy_test" -Command "cl /nologo /std:c++20 /EHsc /W4 /WX /MT tests\rt_m5_policy_test.cpp /Febuild_addon\rt_capture\rt_m5_policy_test.exe /Fobuild_addon\rt_capture\rt_m5_policy_test.obj && build_addon\rt_capture\rt_m5_policy_test.exe"
+      - name: CPU M5 native ABI and submission ordering
+        if: always()
+        shell: pwsh
+        run: |
+          ./tools/ci/annotate.ps1 -VcVars -Title "rt_m5_native_test" -Command "cl /nologo /std:c++20 /EHsc /W4 /WX /MT tests\rt_m5_native_test.cpp reshade_addon\rt\rt_m5_critical.cpp /Febuild_addon\rt_capture\rt_m5_native_test.exe /Fobuild_addon\rt_capture\ && build_addon\rt_capture\rt_m5_native_test.exe"
       - name: Test offline analysis
         run: python -m unittest discover -s tests -p "test_rt_*py"
+      - name: CPU texture warmup and reload ordering
+        if: always()
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          ./tools/ci/annotate.ps1 -VcVars -Title "rt_tex_eager_test" -Command "cl /nologo /std:c++20 /EHsc /W4 /WX /MT tests\rt_tex_eager_test.cpp reshade_addon\textures\tex_eager.cpp /Febuild_addon\rt_capture\rt_tex_eager_test.exe /Fobuild_addon\rt_capture\ && build_addon\rt_capture\rt_tex_eager_test.exe"
       - uses: actions/upload-artifact@v4
         with:
           name: wwmi-rt-capture-development

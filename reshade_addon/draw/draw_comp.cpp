@@ -14,6 +14,7 @@
 #include "../hooks/pipeline_hooks.h"
 #include "../rt/rt_hooks.h"
 #include "draw_ctx.h"
+#include "draw_parts.h"
 #include "draw_inject.h"
 #include "../mods/wwmi_mod.h"
 #include "../migoto/dx12_bridge.h"
@@ -593,6 +594,8 @@ bool DrawComponent(InjectFrame& fr, int dm, const WwmiMod::Component* wc)
     auto       restore_state = [&]() { RestoreGameState(fr); };
     PROF(PROF_DI_DrawComp);
     if (dm < 0 || dm >= (int)g_geomods.size()) return false;
+    // Defensive gate for full-shadow and other routes that bypass ClaimDraw.
+    if (!ModTexturesReady(dm)) return false;
     uint32_t did = 0;
     if (g_wcl_draw && wc) {
         // DI:CompSetup: everything before PortSect; ended right before it (a span, not a block).

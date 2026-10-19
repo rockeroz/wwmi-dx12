@@ -287,8 +287,12 @@ void LoadDeferredNow(CustomResource* r)
     const bool this_load = it->second == g_generation;
     g_deferred_pending.erase(it);
     if (!g_loaded || !this_load || r->resource || r->view) return;
+    LARGE_INTEGER started{}, finished{}, frequency{};
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&started);
     ID3D11Resource* res = LoadDeferredTexture({ std::wstring(), r->filename, (unsigned)r->bind_flags, (unsigned)r->misc_flags,
         r->override_color_space == CustomColorSpace::SRGB });
+    QueryPerformanceCounter(&finished);
     if (!res) return;
     r->resource = res;
     r->device = g_dev.GetPassThroughOrigDevice1();
@@ -296,8 +300,9 @@ void LoadDeferredNow(CustomResource* r)
     MigotoPort::BumpSelectionInputs();
     const auto& names = CustomResourceNameIndex();
     const auto  n = names.find(r);
-    logger::write("TEXEAGER-NOW %ls: a copy or a compute bind read it before the background load had -- loaded now, as on DX11",
-        n != names.end() ? n->second.c_str() : r->filename.c_str());
+    logger::write("TEXEAGER-NOW %ls: a copy or a compute bind read it before background publication -- foreground load+staging %.1f ms",
+        n != names.end() ? n->second.c_str() : r->filename.c_str(),
+        frequency.QuadPart ? 1000.0 * double(finished.QuadPart - started.QuadPart) / double(frequency.QuadPart) : 0.0);
 }
 
 ID3D11Resource* LoadDeferredTexture(const DeferredTexture& t)
@@ -311,17 +316,30 @@ ID3D11Resource* LoadDeferredTexture(const DeferredTexture& t)
     return SUCCEEDED(hr) ? res : nullptr;
 }
 
-bool PublishDeferredTexture(const wchar_t* fq_name, ID3D11Resource* res)
+bool DeferredTexturePending(const DeferredTexture& t, unsigned generation)
 {
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
-    if (!g_loaded || !fq_name || !res) return false;
+    if (!g_loaded || g_generation != generation) return false;
+    auto it = customResources.find(t.fq_name);
+    if (it == customResources.end() || it->second.resource || it->second.view || it->second.filename != t.filename) return false;
+    auto pending = g_deferred_pending.find(&it->second);
+    return pending != g_deferred_pending.end() && pending->second == generation;
+}
+
+bool PublishDeferredTexture(const wchar_t* fq_name, ID3D11Resource* res, unsigned generation)
+{
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (!g_loaded || !fq_name || g_generation != generation) return false;
     auto it = customResources.find(fq_name);
     if (it == customResources.end() || it->second.resource || it->second.view) return false;
     CustomResource& r = it->second;
+    auto pending = g_deferred_pending.find(&r);
+    if (pending == g_deferred_pending.end() || pending->second != generation) return false;
+    g_deferred_pending.erase(pending);
+    if (!res) return true; // already substantiated: failed files retry only after a reload
     r.resource = res;
     r.device = g_dev.GetPassThroughOrigDevice1();
     r.is_null = false; // LoadFromFile's outcome
-    g_deferred_pending.erase(&r);
     MigotoPort::BumpSelectionInputs();
     return true;
 }

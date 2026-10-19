@@ -8,6 +8,13 @@
 
 TexEagerWorker g_tex_eager;
 
+bool TexEagerWorker::ReadyForDraw(int mod, const wchar_t* ns)
+{
+    if (!g_tex_deferred || mod < 0 || !ns || !*ns) return true;
+    OnClaimed(mod, ns, "texture warmup before mod commands");
+    return !Pending(mod);
+}
+
 std::atomic<uint8_t>& TexEagerWorker::Slot(int mod)
 {
     Table* t = table_.load(std::memory_order_relaxed);
@@ -28,8 +35,12 @@ std::atomic<uint8_t>& TexEagerWorker::Slot(int mod)
 void TexEagerWorker::OnClaimed(int mod, const wchar_t* ns, const char* why)
 {
     if (mod < 0 || !ns || !*ns) return;
-    const unsigned gen = PortApi::LoadGeneration();
+    unsigned gen = PortApi::LoadGeneration();
     if ((Flags(mod) & kQueued) && gen == gen_.load(std::memory_order_relaxed)) return;
+    // Calls can originate inside an engine command. Always acquire engine ->
+    // worker in that order, never worker -> engine on a different drawing thread.
+    PortApi::EngineScope engine;
+    gen = PortApi::LoadGeneration();
     Job job{ ns, why, mod, g_tex_deferred, gen, {} };
     {
         std::lock_guard l(mtx_);
@@ -49,6 +60,8 @@ void TexEagerWorker::OnClaimed(int mod, const wchar_t* ns, const char* why)
         s.store(job.texs.empty() ? kQueued : (uint8_t)(kQueued | (job.deferred ? kPending : 0)), std::memory_order_release);
         if (job.texs.empty()) return;
         queue_.push_back(std::move(job));
+        if (g_tex_deferred)
+            logger::write("TEXWARM mod=%d: queued %zu texture(s); keep the game's draw until background publication completes", mod, queue_.back().texs.size());
         if (!thread_.joinable()) thread_ = std::thread(&TexEagerWorker::Run, this);
     }
     cv_.notify_one();
@@ -89,14 +102,16 @@ void TexEagerWorker::Run()
             LARGE_INTEGER c;
             QueryPerformanceCounter(&a);
             if (job.deferred) {
+                // A legacy copy path may already have loaded it. Do not create
+                // another texture only to discard it at publication.
+                if (!PortApi::DeferredTexturePending(t, job.gen)) continue;
                 ID3D11Resource* res = PortApi::LoadDeferredTexture(t);
                 QueryPerformanceCounter(&b);
-                if (res) {
-                    if (PortApi::PublishDeferredTexture(t.fq_name.c_str(), res))
-                        ++made;
-                    else
-                        res->Release();
-                }
+                // Failure is also completed, so a missing file does not get
+                // retried synchronously on the first mod draw. A reload retries.
+                const bool accepted = PortApi::PublishDeferredTexture(t.fq_name.c_str(), res, job.gen);
+                if (res && accepted) ++made;
+                if (res && !accepted) res->Release();
                 QueryPerformanceCounter(&c);
                 locked += c.QuadPart - b.QuadPart;
                 if (b.QuadPart - a.QuadPart > longest) longest = b.QuadPart - a.QuadPart;
@@ -115,10 +130,11 @@ void TexEagerWorker::Run()
         }
         QueryPerformanceCounter(&t1);
         const double ms = 1000.0 / (double)f.QuadPart;
-        logger::write("TEXEAGER '%ls' (%s, %s): loaded %u of %zu texture(s) in %.0f ms, %.0f ms of it under the engine lock "
+        logger::write("TEXEAGER '%ls' (%s, %s): loaded %u of %zu texture(s) in %.0f ms, %.0f ms %s "
                       "(longest texture %.0f ms)%s",
             job.ns.c_str(), job.why, job.deferred ? "deferred" : "under the lock",
-            made, texs.size(), (double)(t1.QuadPart - t0.QuadPart) * ms, (double)locked * ms, (double)longest * ms,
+            made, texs.size(), (double)(t1.QuadPart - t0.QuadPart) * ms, (double)locked * ms,
+            job.deferred ? "publishing (including engine-lock wait)" : "under the engine lock", (double)longest * ms,
             stale ? " -- the inis were reloaded meanwhile, the rest waits for the next claim" : "");
     }
 }

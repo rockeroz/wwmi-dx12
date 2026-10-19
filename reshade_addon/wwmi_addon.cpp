@@ -2,6 +2,7 @@
 // addon_common.h, so an extracted file is a move rather than a re-derivation of which header declares
 // what. It is .cpp-only: it ends with `using namespace reshade::api`, which no header may impose.
 #include "addon_common.h"
+#include "rt/rt_hooks.h"
 #include <shlwapi.h>
 #include "migoto/dump_preview.h"
 #include "mods/claim_state.h"
@@ -118,6 +119,7 @@ static void on_init_device(device* dev)
     {
         g_is_dx12 = true;
         g_reshade_device = dev;
+        RtCriticalInit(dev); // reserve M5 capacity before the game can create descriptor heaps
         ActivateD3D12();
         ::logger::write("Init: d3d12 device; calling ModLoader::Init");
         ModLoader::Init(dev);
@@ -446,6 +448,7 @@ static void ActivateD3D12()
     reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OWN_DEVICE(HP(bind_descriptor_tables)));
     reshade::register_event<reshade::addon_event::reset_command_list>(OWN_DEVICE(HP(reset_command_list))); // the record follows D3D12: nothing survives a Reset
     reshade::register_event<reshade::addon_event::close_command_list>(OWN_DEVICE(HP(close_command_list)));
+    reshade::register_event<reshade::addon_event::destroy_command_list>(RtCriticalReset);
     reshade::register_event<reshade::addon_event::build_acceleration_structure>(OWN_DEVICE(HP(build_acceleration_structure))); // RT ACTIVE + the game's RT work in the pin's tallies
     reshade::register_event<reshade::addon_event::dispatch_rays>(OWN_DEVICE(HP(dispatch_rays)));
     reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(OWN_DEVICE(&on_draw_or_dispatch_indirect)); // RT M5: indirect DispatchRays
@@ -624,6 +627,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
 
 extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE)
 {
+    RtCriticalShutdown();
     if (s_infoq1) {
         if (s_infoq1_cookie) s_infoq1->UnregisterMessageCallback(s_infoq1_cookie);
         s_infoq1->Release();

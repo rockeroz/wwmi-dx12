@@ -76,3 +76,7 @@ bool RtModulePresent()
 {
     return false;
 }
+
+void RtCriticalInit(reshade::api::device*) {}
+void RtCriticalReset(reshade::api::command_list*) {}
+void RtCriticalShutdown() {}
