@@ -2,6 +2,7 @@
 // addon_common.h, so an extracted file is a move rather than a re-derivation of which header declares
 // what. It is .cpp-only: it ends with `using namespace reshade::api`, which no header may impose.
 #include "addon_common.h"
+#include "rt/rt_hooks.h"
 #include <shlwapi.h>
 #include "migoto/dump_preview.h"
 #include "mods/claim_state.h"
