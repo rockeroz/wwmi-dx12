@@ -14,6 +14,7 @@
 #include "../hooks/pipeline_hooks.h"
 #include "../rt/rt_hooks.h"
 #include "draw_ctx.h"
+#include "draw_parts.h"
 #include "draw_inject.h"
 #include "../mods/wwmi_mod.h"
 #include "../migoto/dx12_bridge.h"
