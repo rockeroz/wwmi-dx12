@@ -30,8 +30,11 @@ Mantiene las funciones M3/M4/M5 existentes; requiere prueba en el juego.
   cola distinta de la compuerta del TLAS.
 - Solo una transacción M3 confirmada puede rellenar y publicar el payload.
   Una publicación terminada es inmutable; los rellenos tardíos se rechazan.
-- Un trabajador independiente congela el fallback tras 50 ms si el payload
-  definitivo no llegó. El fallback contiene identificadores de hit shader nulos
+- Al terminar el frame, antes de Present, los payloads que no recibieron un
+  relleno coincidente congelan el fallback y abren su compuerta inmediatamente.
+  Un trabajador independiente conserva el plazo de 50 ms como salvaguarda si
+  no llega ese cierre de frame. No se reduce la ventana mientras aún se graban
+  los dispatches directos del frame. El fallback contiene identificadores de hit shader nulos
   en toda la tabla: evita combinar registros viejos con geometría nueva.
   Puede faltar la contribución RT de esa pasada. No se presenta como una solución
   visual para todas las transiciones: el objetivo es un fallo controlado y medible.
@@ -63,3 +66,22 @@ del heap: M5 conserva el rechazo explícito.
 - La compilación y estas pruebas no sustituyen la prueba de rendimiento y
   funcionamiento en el juego. La instantánea CPU de la tabla añade trabajo que
   debe medirse; el resto de riesgos M3/M4 de la revisión no se declara resuelto.
+
+## Regresión al cambiar de personaje (prueba 08b2546)
+
+El registro recibido acumuló 1499 payloads provisionales: 1301 publicados y 198
+fallbacks. La versión anterior dejaba los que no tenían relleno hasta el plazo
+del trabajador, incluso cuando el frame ya había terminado. Ahora se cierran
+al final del frame, con las mismas tablas nulas inmutables y leases GPU.
+
+`RTM5WAIT` distingue cierres de frame y expiraciones del trabajador, y cuenta
+las esperas insertadas. `wait_signal_us` y `max_wait_signal_us` miden tiempo CPU
+desde la primera inserción de Wait hasta Signal de cada payload: no son tiempo
+de ejecución GPU ni demuestran por sí solos cuánto se detuvo la GPU.
+
+Las pruebas nativas comprueban el cierre inmediato del fence, la inmutabilidad,
+el cierre antes de enviar una lista y que no reemplaza datos reales publicados.
+La captura también muestra cargas síncronas de texturas en TEXEAGER-NOW. Este
+cambio no modifica esa ruta: aún puede producir tirones de primera carga. El
+tiempo reportado por TEXEAGER como «under the engine lock» incluye esperar a
+adquirir ese bloqueo; no debe interpretarse entero como bloqueo del render.

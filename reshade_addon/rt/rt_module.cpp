@@ -2442,12 +2442,15 @@ void M5BlockFor(const TlasRec* t, uint64_t rd_va, uint32_t source_seq, uint64_t 
 }
 
 // Provisional blocks of past frames: dropped (counted when no direct dispatch refilled them). g_m3_m held.
-void M5PendingSweep()
+void M5PendingSweep(bool end_frame = false)
 {
     rtcritical::Poll();
     for (auto it = g_m5_pending.begin(); it != g_m5_pending.end();)
-        if (it->frame != g_frame_id) {
-            if (!it->filled) ++g_m5_refill_left;
+        if (int32_t(g_frame_id - it->frame) > 0 || (end_frame && it->frame == g_frame_id)) {
+            if (!it->filled) {
+                rtcritical::FinishFrame(it->publication);
+                ++g_m5_refill_left;
+            }
             it = g_m5_pending.erase(it);
         } else
             ++it;
@@ -3460,6 +3463,9 @@ void M3Summary()
         (unsigned long long)safe.reserved_heaps, (unsigned long long)safe.allocations, (unsigned long long)safe.submissions,
         (unsigned long long)safe.completed, (unsigned long long)safe.published, (unsigned long long)safe.fallback,
         (unsigned long long)safe.late_refills);
+    g_log.Line(true, "RTM5WAIT frame_fallback=%llu deadline_fallback=%llu queue_waits=%llu wait_signal_us=%llu max_wait_signal_us=%llu (CPU interval, not GPU time)",
+        (unsigned long long)safe.frame_fallbacks, (unsigned long long)safe.deadline_fallbacks, (unsigned long long)safe.queue_waits,
+        (unsigned long long)safe.wait_signal_us, (unsigned long long)safe.max_wait_signal_us);
     M5SubDrawSummary();
     {
         std::string why;
@@ -3606,6 +3612,11 @@ bool RtNoteRays(command_list* cmd_list, resource rg_res, uint64_t rg_off, uint64
 void M3PresentTick()
 {
     std::lock_guard l(g_m3_m);
+    // As with the TLAS gate below, this frame's direct rays are recorded by now.
+    // A payload still provisional has no matching refill coming this frame.
+    // Open that copy's gate before Present can wait for the GPU, rather than
+    // leaving it stalled until the independent 50 ms watchdog expires.
+    M5PendingSweep(true);
     for (const TlasRec& r : g_m3_tlas)
         if (M3GateClosed(r)) { // the frame's rays were recorded by now
             ++g_gate_early;

@@ -71,6 +71,7 @@ struct QueueStub {
     std::vector<int> order;
     Fence* fence = nullptr;
     uint64_t signaled = 0;
+    ID3D12Fence* waiting = nullptr;
 };
 static void STDMETHODCALLTYPE Execute(ID3D12CommandQueue* q, UINT, ID3D12CommandList* const*)
 {
@@ -81,9 +82,10 @@ static HRESULT STDMETHODCALLTYPE Signal(ID3D12CommandQueue* q, ID3D12Fence* f, U
     auto* s = reinterpret_cast<QueueStub*>(q); s->order.push_back(2);
     s->fence = static_cast<Fence*>(f); s->signaled = value; return S_OK;
 }
-static HRESULT STDMETHODCALLTYPE Wait(ID3D12CommandQueue* q, ID3D12Fence*, UINT64)
+static HRESULT STDMETHODCALLTYPE Wait(ID3D12CommandQueue* q, ID3D12Fence* fence, UINT64)
 {
-    reinterpret_cast<QueueStub*>(q)->order.push_back(0); return S_OK;
+    auto* s = reinterpret_cast<QueueStub*>(q);
+    s->order.push_back(0); s->waiting = fence; return S_OK;
 }
 __declspec(noinline) static D3D12_DESCRIPTOR_HEAP_DESC PublicDesc(ID3D12DescriptorHeap* heap) { return heap->GetDesc(); }
 
@@ -162,6 +164,27 @@ int main()
     Check(q.order == std::vector<int>({ 0, 1, 2 }), "publication wait, real submission, completion fence have the required order");
     resources.reset(); Reset(list); q.fence->done.store(q.signaled); Poll();
     Check(!Finalize(p, changed, {}) && bytes == block, "published bytes are immutable");
+    Check(!FinishFrame(p) && bytes == block, "frame end cannot replace an already published real payload");
+    std::vector<uint8_t> ended_bytes(128, 0);
+    auto ended = Pending(reinterpret_cast<ID3D12Resource*>(&upload), ended_bytes.data(), ended_bytes.size());
+    resources = std::make_shared<Resources>(); resources->publication = ended;
+    Record(list, 4, resources); q.order.clear();
+    Check(BeforeSubmit(queue, list, 4) && q.waiting && q.waiting->GetCompletedValue() == 0, "unfinished frame has a closed publication gate");
+    const auto frame_before = Statistics().frame_fallbacks;
+    Check(FinishFrame(ended) && IsPublished(ended) && q.waiting->GetCompletedValue() == 1,
+        "frame end signals pending gate synchronously, without waiting for the watchdog");
+    Check(!FinishFrame(ended) && Statistics().frame_fallbacks == frame_before + 1, "frame fallback is committed and counted once");
+    Check(!Finalize(ended, block, {}) && std::all_of(ended_bytes.begin(), ended_bytes.end(), [](uint8_t b) { return b == 0; }),
+        "late refill cannot modify a frame-closed payload");
+    queue->ExecuteCommandLists(1, lists);
+    resources.reset(); Reset(list); q.fence->done.store(q.signaled); Poll();
+    std::vector<uint8_t> before_submit_bytes(128, 0);
+    auto before_submit = Pending(reinterpret_cast<ID3D12Resource*>(&upload), before_submit_bytes.data(), before_submit_bytes.size());
+    Check(FinishFrame(before_submit), "frame can end before its list is submitted");
+    resources = std::make_shared<Resources>(); resources->publication = before_submit;
+    Record(list, 5, resources); q.order.clear();
+    Check(BeforeSubmit(queue, list, 5) && q.order.empty(), "frame-closed payload adds no redundant queue wait");
+    resources.reset(); Reset(list);
     std::vector<uint8_t> fallback(128, 0);
     auto timed = Pending(reinterpret_cast<ID3D12Resource*>(&upload), fallback.data(), fallback.size());
     for (int i = 0; i < 100 && !IsPublished(timed); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(2));

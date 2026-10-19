@@ -30,6 +30,8 @@ std::atomic<ID3D12Device*> target_device{ nullptr };
 std::atomic<bool> stopping{ false };
 std::atomic<uint64_t> reserved_heaps{ 0 }, allocations{ 0 }, submissions{ 0 }, completed{ 0 };
 std::atomic<uint64_t> published{ 0 }, fallbacks{ 0 }, late_refills{ 0 };
+std::atomic<uint64_t> frame_fallbacks{ 0 }, deadline_fallbacks{ 0 }, queue_waits{ 0 };
+std::atomic<uint64_t> wait_signal_us{ 0 }, max_wait_signal_us{ 0 };
 
 bool PatchSlot(void* object, size_t index, void* replacement)
 {
@@ -150,6 +152,7 @@ struct Publication {
     size_t bytes = 0;
     std::vector<DescriptorPtr> descriptors;
     std::chrono::steady_clock::time_point deadline;
+    std::chrono::steady_clock::time_point first_wait{};
 };
 namespace {
 std::mutex publications_mutex;
@@ -157,14 +160,33 @@ std::condition_variable publication_cv;
 std::vector<std::weak_ptr<Publication>> publications;
 std::thread publication_worker;
 
-void FreezeFallback(const PublicationPtr& p)
+// CPU time from inserting the first queue wait to signalling the gate, not GPU
+// execution time. The publication mutex makes this a single observation.
+void SignalPublication(Publication& p)
 {
-    std::lock_guard lock(p->mutex);
-    if (!p->state.Commit(false)) return;
-    // The upload was zeroed before any command referenced it. Do not write after freezing.
+    if (p.first_wait != std::chrono::steady_clock::time_point{}) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - p.first_wait).count();
+        const uint64_t us = elapsed > 0 ? uint64_t(elapsed) : 0;
+        wait_signal_us.fetch_add(us, std::memory_order_relaxed);
+        uint64_t high = max_wait_signal_us.load(std::memory_order_relaxed);
+        while (high < us && !max_wait_signal_us.compare_exchange_weak(high, us, std::memory_order_relaxed)) {}
+    }
     _mm_sfence();
-    p->gate->Signal(1);
+    p.gate->Signal(1);
+}
+enum class FallbackCause { deadline, frame_end, shutdown };
+bool FreezeFallback(const PublicationPtr& p, FallbackCause cause)
+{
+    if (!p) return false;
+    std::lock_guard lock(p->mutex);
+    if (!p->state.Commit(false)) return false;
+    // The upload was zeroed before any command referenced it. Do not write after freezing.
+    SignalPublication(*p);
     ++fallbacks;
+    if (cause == FallbackCause::frame_end) ++frame_fallbacks;
+    if (cause == FallbackCause::deadline) ++deadline_fallbacks;
+    return true;
 }
 void Worker()
 {
@@ -176,7 +198,7 @@ void Worker()
         lock.unlock();
         const auto now = std::chrono::steady_clock::now();
         for (const auto& weak : pending)
-            if (auto p = weak.lock(); p && now >= p->deadline) FreezeFallback(p);
+            if (auto p = weak.lock(); p && now >= p->deadline) FreezeFallback(p, FallbackCause::deadline);
         lock.lock();
     }
 }
@@ -244,11 +266,11 @@ bool Finalize(const PublicationPtr& p, const std::vector<uint8_t>& block, const 
     memcpy(p->mapped, block.data(), block.size());
     p->descriptors = descriptors;
     p->state.Commit(true);
-    _mm_sfence();
-    p->gate->Signal(1);
+    SignalPublication(*p);
     ++published;
     return true;
 }
+bool FinishFrame(const PublicationPtr& p) { return FreezeFallback(p, FallbackCause::frame_end); }
 bool IsPublished(const PublicationPtr& p)
 {
     if (!p) return true;
@@ -276,10 +298,14 @@ bool BeforeSubmit(ID3D12CommandQueue* queue, const void* list, uint64_t generati
         const auto& p = r->publication;
         if (!p) continue;
         std::lock_guard lock(p->mutex);
-        if (p->state.Get() == PublicationState::pending &&
-            (!hooked || FAILED(queue->Wait(p->gate.Get(), 1)))) {
-            p->state.Commit(false);
-            _mm_sfence(); p->gate->Signal(1); ++fallbacks;
+        if (p->state.Get() == PublicationState::pending) {
+            if (!hooked || FAILED(queue->Wait(p->gate.Get(), 1))) {
+                p->state.Commit(false);
+                SignalPublication(*p); ++fallbacks;
+            } else {
+                if (p->first_wait == std::chrono::steady_clock::time_point{}) p->first_wait = std::chrono::steady_clock::now();
+                ++queue_waits;
+            }
         }
     }
     if (!hooked) {
@@ -299,7 +325,10 @@ void Poll()
         ++completed;
     }
 }
-Stats Statistics() { return { reserved_heaps.load(), allocations.load(), submissions.load(), completed.load(), published.load(), fallbacks.load(), late_refills.load() }; }
+Stats Statistics() {
+    return { reserved_heaps.load(), allocations.load(), submissions.load(), completed.load(), published.load(), fallbacks.load(), late_refills.load(),
+        frame_fallbacks.load(), deadline_fallbacks.load(), queue_waits.load(), wait_signal_us.load(), max_wait_signal_us.load() };
+}
 void Shutdown()
 {
     std::vector<PublicationPtr> pending;
@@ -308,7 +337,7 @@ void Shutdown()
         stopping = true;
         for (const auto& weak : publications) if (auto p = weak.lock()) pending.push_back(p);
     }
-    for (const auto& p : pending) FreezeFallback(p);
+    for (const auto& p : pending) FreezeFallback(p, FallbackCause::shutdown);
     publication_cv.notify_one();
     if (publication_worker.joinable()) publication_worker.join();
     {
