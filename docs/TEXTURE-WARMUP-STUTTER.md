@@ -6,7 +6,7 @@ tirones al cambiar de personaje seguían presentes y reaparecieron cargas
 `TEXEAGER-NOW` desde copias o binds de cálculo. Estos datos no prueban una única
 causa de todos los tirones, pero permiten corregir esa ruta síncrona concreta.
 
-Con la opción existente `tex_deferred` activada (valor por defecto), el primer
+Con la opción existente `tex_background` activada (valor por defecto), el primer
 dibujo identificado encola las texturas de su namespace y de sus componentes
 fusionados. Mientras el trabajador termina, se deja pasar el dibujo original,
 antes de publicar variables de detección, estampar texturas o ejecutar comandos
@@ -18,7 +18,8 @@ El resultado visible esperado es un breve modelo original mientras se preparan
 las texturas, seguido del mod. No se precargan todos los mods de la instalación.
 Los personajes ya preparados no vuelven a esperar al cambiar entre ellos, salvo
 que se recargue la configuración. No requiere editar el INI. La opción
-`tex_deferred=0` mantiene el comportamiento anterior explícito.
+`tex_background=0` mantiene el comportamiento anterior explícito. En el overlay
+es A12, «Load mod textures in the background».
 
 El trabajador omite texturas ya suministradas por otra ruta. La publicación se
 valida dentro del bloqueo del motor contra la generación que solicitó la carga;
