@@ -127,13 +127,40 @@ int main()
     auto recycled = Allocate(heap, 40);
     Check(recycled->first == 250080, "range reused only after the real queue fence completes");
 
+    // The same recording can execute on two queues. Completing just one cannot
+    // release a descriptor lease that the second queue still reads.
+    static QueueStub q2{ queue_table.data(), {}, nullptr, 0 };
+    auto* queue2 = reinterpret_cast<ID3D12CommandQueue*>(&q2);
+    auto shared = Allocate(heap, 40);
+    const uint32_t shared_first = shared->first;
+    resources = std::make_shared<Resources>(); resources->descriptors.push_back(shared);
+    const void* second_list = reinterpret_cast<void*>(0x5678);
+    Record(second_list, 2, resources);
+    Check(BeforeSubmit(queue, second_list, 2) && BeforeSubmit(queue2, second_list, 2), "track both submitting queues");
+    ID3D12CommandList* second[] = { reinterpret_cast<ID3D12CommandList*>(const_cast<void*>(second_list)) };
+    queue->ExecuteCommandLists(1, second); queue2->ExecuteCommandLists(1, second);
+    resources.reset(); shared.reset(); Reset(second_list);
+    q.fence->done.store(q.signaled); Poll();
+    auto busy = Allocate(heap, 40);
+    Check(busy->first != shared_first, "first queue completion does not release the second queue's lease");
+    q2.fence->done.store(q2.signaled); Poll();
+    auto both_done = Allocate(heap, 40);
+    Check(both_done->first == shared_first, "lease released after both queues finish");
+
     std::array<void*, 15> resource_table{};
     resource_table[1] = reinterpret_cast<void*>(&Ref); resource_table[2] = reinterpret_cast<void*>(&Ref);
     resource_table[7] = reinterpret_cast<void*>(&DeviceOf);
     StubDevice upload{ resource_table.data() };
     std::vector<uint8_t> bytes(128, 0), block(128, 0x4f), changed(128, 0x3b);
     auto p = Pending(reinterpret_cast<ID3D12Resource*>(&upload), bytes.data(), bytes.size());
+    resources = std::make_shared<Resources>(); resources->publication = p;
+    Record(list, 3, resources);
+    q.order.clear();
+    Check(BeforeSubmit(queue, list, 3) && q.order == std::vector<int>({ 0 }), "pending copy gets its own queue wait before submission");
     Check(p && Finalize(p, block, { recycled }), "publish complete snapshot");
+    queue->ExecuteCommandLists(1, lists);
+    Check(q.order == std::vector<int>({ 0, 1, 2 }), "publication wait, real submission, completion fence have the required order");
+    resources.reset(); Reset(list); q.fence->done.store(q.signaled); Poll();
     Check(!Finalize(p, changed, {}) && bytes == block, "published bytes are immutable");
     std::vector<uint8_t> fallback(128, 0);
     auto timed = Pending(reinterpret_cast<ID3D12Resource*>(&upload), fallback.data(), fallback.size());

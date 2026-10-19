@@ -27,6 +27,7 @@ struct Reservation {
     uint64_t native, cpu, gpu;
 };
 std::atomic<ID3D12Device*> target_device{ nullptr };
+std::atomic<bool> stopping{ false };
 std::atomic<uint64_t> reserved_heaps{ 0 }, allocations{ 0 }, submissions{ 0 }, completed{ 0 };
 std::atomic<uint64_t> published{ 0 }, fallbacks{ 0 }, late_refills{ 0 };
 
@@ -68,7 +69,7 @@ D3D12_DESCRIPTOR_HEAP_DESC* STDMETHODCALLTYPE HeapDesc(ID3D12DescriptorHeap* hea
 HRESULT STDMETHODCALLTYPE CreateHeap(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID iid, void** out)
 {
     const auto original = Original<CreateHeapFn>(device, 14);
-    const uint32_t extra = device == target_device.load(std::memory_order_acquire) && desc && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+    const uint32_t extra = !stopping.load(std::memory_order_acquire) && device == target_device.load(std::memory_order_acquire) && desc && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
         (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) ? ReservationCapacity(desc->NumDescriptors) : 0;
     if (!extra || !out || iid != __uuidof(ID3D12DescriptorHeap)) return original(device, desc, iid, out);
     auto expanded = *desc;
@@ -155,7 +156,6 @@ std::mutex publications_mutex;
 std::condition_variable publication_cv;
 std::vector<std::weak_ptr<Publication>> publications;
 std::thread publication_worker;
-bool stopping = false;
 
 void FreezeFallback(const PublicationPtr& p)
 {
@@ -184,7 +184,7 @@ void Worker()
 
 bool InitDevice(ID3D12Device* device)
 {
-    if (!device) return false;
+    if (!device || stopping.load(std::memory_order_acquire)) return false;
     target_device.store(device, std::memory_order_release);
     return PatchSlot(device, 14, reinterpret_cast<void*>(&CreateHeap));
 }
@@ -271,7 +271,7 @@ bool BeforeSubmit(ID3D12CommandQueue* queue, const void* list, uint64_t generati
         if (it == recordings.end() || it->second.generation != generation) return true;
         refs = it->second.resources;
     }
-    const bool hooked = queue && PatchSlot(queue, 10, reinterpret_cast<void*>(&Execute));
+    const bool hooked = !stopping.load(std::memory_order_acquire) && queue && PatchSlot(queue, 10, reinterpret_cast<void*>(&Execute));
     for (const auto& r : refs) {
         const auto& p = r->publication;
         if (!p) continue;
@@ -311,6 +311,7 @@ void Shutdown()
     for (const auto& p : pending) FreezeFallback(p);
     publication_cv.notify_one();
     if (publication_worker.joinable()) publication_worker.join();
+    {
     std::lock_guard lock(patch_mutex);
     for (auto it = patches.rbegin(); it != patches.rend(); ++it) {
         DWORD protection;
@@ -318,7 +319,16 @@ void Shutdown()
         InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(it->slot), it->original, it->replacement);
         DWORD ignored; VirtualProtect(it->slot, sizeof(void*), protection, &ignored);
     }
-    // Callbacks are uninstalled at addon shutdown; GPU references stay pinned in
-    // the module until process teardown rather than being discarded on a timeout.
+    }
+    // A live addon unload must not destroy resources referenced by recorded or
+    // in-flight commands. Keep those graphs until process teardown; no worker or
+    // callback into the unloaded module is needed to preserve the COM objects.
+    auto* pinned_until_exit = new std::vector<std::shared_ptr<Resources>>;
+    std::lock_guard jobs_lock(jobs_mutex);
+    for (const auto& entry : recordings)
+        pinned_until_exit->insert(pinned_until_exit->end(), entry.second.resources.begin(), entry.second.resources.end());
+    for (const auto& flight : flights)
+        pinned_until_exit->insert(pinned_until_exit->end(), flight.resources.begin(), flight.resources.end());
+    pinned_until_exit->insert(pinned_until_exit->end(), quarantine.begin(), quarantine.end());
 }
 } // namespace rtcritical

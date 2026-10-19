@@ -3253,13 +3253,13 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
     // dispatch: newest records of every slot)
     if (m5_ok && !m5_block.empty()) {
         // the frame's records of this table: into the extended copies of it recorded earlier with a provisional block
-        M5Refill(rd, rd_va, hit_size, copy.seq, hit_stride, m5_block);
+        if (!backed && committed) M5Refill(rd, rd_va, hit_size, copy.seq, hit_stride, m5_block);
         bool any = t.m5_on;
         if (!backed && committed) {
             for (const Cand& c : cands) any = any || (!c.mb->m5.empty() && !m5_bad.count(c.mb));
             for (const Cand& c : mine) any = any || (!c.mb->m5.empty() && !m5_bad.count(c.mb));
         }
-        if (any) {
+        if (any && !backed && committed) {
             if (!t.m5_on) {
                 static std::atomic<uint32_t> s_first{ 0 };
                 if (s_first.fetch_add(1) < 4)
