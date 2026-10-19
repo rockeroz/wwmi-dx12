@@ -2072,6 +2072,7 @@ struct M5Last {
     std::vector<rtcritical::DescriptorPtr> leases;
 };
 std::map<uint64_t, M5Last> g_m5_last;
+uint32_t g_m5_last_frame = UINT32_MAX;
 using M5TableKey = std::tuple<uint64_t, uint32_t, uint64_t, int, int, unsigned>;
 std::map<M5TableKey, rtcritical::DescriptorPtr> g_m5_tabs;
 std::map<uint64_t, std::weak_ptr<rtcritical::DescriptorLease>> g_m5_descriptors;
@@ -2977,6 +2978,13 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
     if (!M3On() || !g_m3_any.load(std::memory_order_relaxed) || hit_stride < 64 || !cmd_list) return;
     const uint32_t  frame = g_frame_id;
     std::lock_guard l(g_m3_m);
+    if (g_m5_last_frame != frame) {
+        // Cached records cannot serve another source generation. Dropping their
+        // CPU leases here does not release descriptors pinned by TLAS snapshots
+        // or real GPU submissions, and avoids filling the reservation forever.
+        g_m5_last.clear();
+        g_m5_last_frame = frame;
+    }
     if (M3Mode() == 2) return; // diagnostic: our BLAS built, nothing redirected
     const TlasRec* tp = nullptr; // the TLAS these rays trace: the newest built
     for (const TlasRec& r : g_m3_tlas)
