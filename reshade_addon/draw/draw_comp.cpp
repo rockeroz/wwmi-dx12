@@ -829,7 +829,36 @@ bool DrawComponent(InjectFrame& fr, int dm, const WwmiMod::Component* wc)
             }
             if (!pal.no_cb3) PortApi::PushGameConstantBuffer('v', 3, port_cb3_res, port_cb3_va, w3);
             {
-                const RootCbvBind obj = ObjectCbOf(cmd_list);
+                RootCbvBind obj = ObjectCbOf(cmd_list);
+                // With ray tracing on, the game also draws characters from its skin cache (the posed vertices in vb0): those
+                // passes bind neither a bone CB nor the object CB. An instance-skeleton mod (WWMI Tools 1.7: its section
+                // asks `vs-cb2 == 3380.7777` for its instance) then draws nothing there and the game's original parts
+                // show (Hsin "Linglang": 9 of 18 section runs a frame; mods without the instance check draw on). Such a
+                // pass gets the object CB this component's skinned draw had this frame -- the same instance, the same
+                // pool slot, its skeleton as that draw left it.
+                struct ObjSeen {
+                    RootCbvBind cb;
+                    uint32_t    frame = 0;
+                };
+                static std::mutex                         s_obj_m;
+                static std::unordered_map<uint32_t, ObjSeen> s_obj; // (mod, comp) -> its last object CB
+                const uint32_t                            key = (uint32_t(dm) << 8) | (uint32_t(wc->index) & 0xff);
+                if (obj.res && obj.va) {
+                    std::lock_guard l(s_obj_m);
+                    s_obj[key] = { obj, g_frame_id };
+                } else if (!port_cb4_res) {
+                    std::lock_guard l(s_obj_m);
+                    const auto it = s_obj.find(key);
+                    if (it != s_obj.end() && it->second.frame == g_frame_id) {
+                        obj = it->second.cb;
+                        ++g_port_obj_borrowed;
+                        if (logger::enabled(1) && DiagOnce("OBJCB-BORROW", (int)key))
+                            logger::write("OBJCB-BORROW f=%u mod=%d comp=%d vs=%016llx: a pass with no bone and no object CB (the skin "
+                                          "cache's posed vertices) gets this component's object CB of this frame (%llx) -- its instance "
+                                          "capture sees the character's instance",
+                                g_frame_id, dm, wc->index, (unsigned long long)vs_hash, (unsigned long long)obj.va);
+                    }
+                }
                 if (obj.res && obj.va) PortApi::PushGameConstantBuffer('v', 2, obj.res, obj.va, kDx11ObjectCbByteWidth);
             }
 

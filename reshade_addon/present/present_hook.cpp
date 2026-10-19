@@ -163,6 +163,7 @@ static void FrameStep(command_queue* queue, swapchain* sc, bool at_present)
     g_draw_replace_count.Roll();
     g_port_sect_runs.Roll();
     g_port_sect_nocb.Roll();
+    g_port_obj_borrowed.Roll();
     g_port_fellback_count.Roll();
     for (GeoMod& gm : g_geomods) {
         gm.replaced.Roll();

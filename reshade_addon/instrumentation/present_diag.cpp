@@ -162,12 +162,12 @@ void Heartbeat(uint32_t texinj_last)
             s_rfx_prev = rfx_now;
             logger::report("HEARTBEAT f=%u replaced=%u texinj=%u learnedVB=%zu(%+ld) "
                            "portDisp=%llu portDispCall=%llu "
-                           "sect=%u nocb=%u drewnothing=%u refusedNoCL=%u unmet=%u rfx=%u gmiss=%u%s",
+                           "sect=%u nocb=%u (object cb borrowed %u) drewnothing=%u refusedNoCL=%u unmet=%u rfx=%u gmiss=%u%s",
                 g_frame_id, g_draw_replace_count.last.load(), texinj_last,
                 learned, grew,
                 MigotoPort::DispatchesIssued(), MigotoPort::DispatchCalls(),
                 g_port_sect_runs.last.load(),
-                g_port_sect_nocb.last.load(), g_port_fellback_count.last.load(),
+                g_port_sect_nocb.last.load(), g_port_obj_borrowed.last.load(), g_port_fellback_count.last.load(),
                 PortApi::TakeRefusedNoCl(),
                 MigotoPort::ShimUnmetTakeCount(), rfx_win, g_global_tex_miss.load(), per.c_str());
             {

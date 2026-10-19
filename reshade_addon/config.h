@@ -28,6 +28,7 @@ inline std::atomic<int>      g_chaintrace_frames{ 0 };
 inline FrameCounter          g_port_fellback_count;
 inline FrameCounter          g_port_sect_runs;
 inline FrameCounter          g_port_sect_nocb;
+inline FrameCounter          g_port_obj_borrowed; // skin cache passes given their component's object CB of the frame (draw_comp.cpp)
 inline bool                  g_lod_pin = false;           // recognise the char's lower-LOD draws (log only)
 inline bool                  g_dump_game_textures = true; // frame dump includes the game's bindless textures
 inline bool                  g_shader_replace = false;    // swap a game shader for one of ours by hash

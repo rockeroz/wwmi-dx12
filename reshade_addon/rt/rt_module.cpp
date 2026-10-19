@@ -2873,7 +2873,10 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
     // M5: characters with extra geometries need their records in our block (R0..), and every dispatch our extended table.
     // R0 is fixed for the session at the first such dispatch (twice the game's table, at least 16384 records)
     if (M5Mode() && src && hit_stride >= 72 && !g_m5_r0) {
-        g_m5_r0 = uint32_t(((std::max)(uint64_t(16384), 2 * (hit_size / hit_stride)) + 1023) & ~uint64_t(1023));
+        // (16384 was fixed while the game's table was 3780 records; it grew past it 1800 frames later, f9410: M5 off. The
+        // tables seen reach ~20000 records; an extended copy is R0 x stride bytes, 8 MB here, of which only the game's
+        // table and the block are copied)
+        g_m5_r0 = uint32_t(((std::max)(uint64_t(65536), 2 * (hit_size / hit_stride)) + 1023) & ~uint64_t(1023));
         g_m5_stride = hit_stride;
     }
     // (not in a frame an indirect ray dispatch was recorded with the game's own table: it would read past its end)
