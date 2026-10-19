@@ -4559,4 +4559,119 @@ void RtDrawOverlay()
         pending_d = g_reg.PendingDraws();
         skin_cs = g_judge.SkinShaders();
     }
-    ImGui::TextDisabled("  rings: %zu  (BLAS geoms waiting %zu, draws waiting %zu)", rings.si
+    ImGui::TextDisabled("  rings: %zu  (BLAS geoms waiting %zu, draws waiting %zu)", rings.size(), pending_g, pending_d);
+    for (const rtm::Ring& r : rings)
+        ImGui::TextDisabled("    va=%llx %.2f MB mod=%d%s geoms=%u confirmed %u frames ago", (unsigned long long)r.va,
+            double(r.bytes) / (1024.0 * 1024.0), r.mod, r.weak ? " (first+count only)" : "", r.geometries, g_frame_id - r.confirmed_frame);
+    ImGui::TextDisabled("  compute shaders binding a ring: %zu  dispatches: %llu  sampled: %llu", skin_cs,
+        (unsigned long long)g_c.ring_dispatches.load(), (unsigned long long)g_c.pal_records.load());
+    ImGui::TextDisabled("  snapshots: %llu (UPLOAD %llu, faults %llu)  bins: %llu (%.1f MB)  best bone-like run: %u (cs %016llx p%u)",
+        (unsigned long long)g_c.snapshots.load(), (unsigned long long)g_c.snapshot_upload.load(),
+        (unsigned long long)g_c.snapshot_faults.load(), (unsigned long long)g_c.bins.load(),
+        double(g_c.bin_bytes.load()) / (1024.0 * 1024.0), g_c.best_bone_run.load(), (unsigned long long)g_c.best_bone_cs.load(),
+        g_c.best_bone_param.load());
+    ImGui::TextDisabled("  inspection cost so far: %.1f ms   log lines dropped: %llu  bins dropped: %llu",
+        double(g_c.inspect_us.load()) / 1000.0, (unsigned long long)g_c.dropped_lines.load(), (unsigned long long)g_c.dropped_bins.load());
+    const std::wstring dir = g_log.Dir();
+    if (!dir.empty()) ImGui::TextDisabled("  log: %ls\\rt_observe.log", dir.c_str());
+    else ImGui::TextDisabled("  log: not open (see ReShade.log)");
+}
+
+// rt_skin.cpp's lines go to the same log (buffered, written at present).
+namespace rtskin {
+void Log(bool essential, _Printf_format_string_ const char* fmt, ...)
+{
+    char    buf[1024];
+    va_list a;
+    va_start(a, fmt);
+    vsnprintf(buf, sizeof buf, fmt, a);
+    va_end(a);
+    g_log.Line(essential, "%s", buf);
+}
+} // namespace rtskin
+
+// A raster draw of mod component (mod, comp) stamped the mod's texture `src` (its resource mod_res) over the game's
+// texture `game` in its pixel shader's table (section_ps_stamp.cpp): the RT material table of that section gets the
+// same (M4Apply).
+void RtNoteSlotTexture(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRIPTOR_HANDLE src, ID3D12Resource* mod_res)
+{
+    if (mod < 0 || comp < 0 || !game || !src.ptr || game == mod_res) return; // mod_res may be unknown (RabbitFX maps)
+    std::lock_guard l(g_slot_tex_m);
+    ++g_slot_tex_notes;
+    if (g_slot_tex.size() > 4096) g_slot_tex.clear();
+    if (t_note_first != UINT32_MAX && g_m5_subdraws.size() < 4096) {
+        SubDrawBinds& sb = g_m5_subdraws[{ mod, comp, t_note_first }];
+        if (sb.frame != g_frame_id) {
+            sb.frame = g_frame_id;
+            sb.binds.clear();
+        }
+        sb.count = t_note_weight;
+        const std::pair<uint64_t, uint64_t> b{ reinterpret_cast<uint64_t>(game), src.ptr };
+        if (std::find(sb.binds.begin(), sb.binds.end(), b) == sb.binds.end() && sb.binds.size() < 16) sb.binds.push_back(b);
+    }
+    SlotTex& e = g_slot_tex[{ mod, comp, reinterpret_cast<uint64_t>(game) }];
+    const uint32_t weight = t_note_weight;
+    // sub-draws of one component binding different textures over the same game texture: one material table, so the
+    // largest sub-draw (by indices) seen in the last two frames keeps it
+    if (e.src.ptr && e.src.ptr != src.ptr && g_frame_id - e.wframe <= 2 && weight < e.weight) {
+        e.frame = g_frame_id;
+        return;
+    }
+    if (e.src.ptr != src.ptr || weight >= e.weight || g_frame_id - e.wframe > 2) {
+        e.weight = weight;
+        e.wframe = g_frame_id;
+    }
+    const bool fresh = e.src.ptr != src.ptr;
+    e.src = src;
+    e.res = mod_res;
+    e.frame = g_frame_id;
+    e.gen = PortApi::LoadGeneration();
+    if (fresh || g_frame_id - e.hframe > 60) {
+        e.hash = TexIdentityNorm(TexHashOf(reinterpret_cast<uint64_t>(game)));
+        e.hframe = g_frame_id;
+    }
+    if (e.hash) {
+        if (g_slot_tex_h.size() > 4096) g_slot_tex_h.clear();
+        g_slot_tex_h[{ mod, e.hash }] = e;
+    }
+    if (fresh) {
+        static std::atomic<uint32_t> s_log{ 0 };
+        if (s_log.fetch_add(1) < 64)
+            g_log.Line(true, "RTM4 slot stamp mod=%d comp=%d: game texture %p (%s, identity %08x) -> mod view %llx (%s)", mod, comp, (void*)game,
+                TexDesc(game).c_str(), e.hash, (unsigned long long)src.ptr, TexDesc(mod_res).c_str());
+    }
+}
+
+// A raster draw of mod component (mod, comp) reads the game's texture `game` as bound (section_ps_stamp.cpp).
+void RtNoteKeptTexture(int mod, int comp, ID3D12Resource* game, ID3D12Resource* swapped)
+{
+    if (mod < 0 || !game) return;
+    std::lock_guard l(g_slot_tex_m);
+    if (swapped && swapped != game) { // the slot holds a mod texture the core placed (placement swap / in-place stamp)
+        if (g_raster_swap.size() > 4096) g_raster_swap.clear();
+        auto& e = g_raster_swap[{ mod, reinterpret_cast<uint64_t>(game) }];
+        const bool fresh = e.first != swapped;
+        e = { swapped, g_frame_id };
+        if (fresh) {
+            static std::atomic<uint32_t> s_log{ 0 };
+            if (s_log.fetch_add(1) < 96)
+                g_log.Line(true, "RTM4 raster swap mod=%d comp=%d: game texture %p (%s h%08x) -> mod texture %p (%s)", mod, comp, (void*)game,
+                    TexDesc(game).c_str(), TexHashOf(reinterpret_cast<uint64_t>(game)), (void*)swapped, TexDesc(swapped).c_str());
+        }
+        return;
+    }
+    if (g_raster_kept.size() > 4096) g_raster_kept.clear();
+    uint32_t& f = g_raster_kept[{ mod, reinterpret_cast<uint64_t>(game) }];
+    const bool fresh = !f;
+    f = g_frame_id;
+    if (fresh) {
+        static std::atomic<uint32_t> s_log{ 0 };
+        if (s_log.fetch_add(1) < 64) g_log.Line(true, "RTM4 raster keeps mod=%d comp=%d: game texture %p (%s)", mod, comp, (void*)game, TexDesc(game).c_str());
+    }
+}
+
+void RtSetNoteDraw(uint32_t first_index, uint32_t index_count)
+{
+    t_note_weight = index_count;
+    t_note_first = first_index;
+}
