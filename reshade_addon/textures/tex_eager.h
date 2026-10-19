@@ -12,6 +12,9 @@
 class TexEagerWorker {
 public:
     void OnClaimed(int mod, const wchar_t* ns, const char* why); // `why` is a literal
+    // Poll only: retain the game's draw until this mod's textures are complete.
+    // No mod command list may run yet, including one-time texture copies.
+    bool ReadyForDraw(int mod, const wchar_t* ns);
     bool Pending(int mod) const { return (Flags(mod) & kPending) != 0; }
     void Stop();
     ~TexEagerWorker()

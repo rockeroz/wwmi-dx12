@@ -88,6 +88,22 @@ const ReadSlots& DrawReadSlots(reshade::api::command_list* cmd_list)
 }
 
 // A mod a claimed draw runs: detected (`$object_detected`) and its textures wanted now.
+bool ModTexturesReady(int mod_id)
+{
+    if (mod_id < 0 || mod_id >= (int)g_geomods.size()) return true;
+    return g_tex_eager.ReadyForDraw(mod_id, g_geomods[mod_id].wcl_ns.c_str());
+}
+
+bool ClaimedTexturesReady(const MergedComp& mc)
+{
+    bool ready = ModTexturesReady(mc.mod_id);
+    // Queue every dependency even when the first is pending, so merged mods
+    // do not warm up in a sequence of first-draw stalls.
+    for (const int s : mc.with)
+        if (s >= 0 && size_t(s) < g_merged_comps.size()) ready = ModTexturesReady(g_merged_comps[s].mod_id) && ready;
+    return ready;
+}
+
 static void NoteClaimedMod(int mod_id)
 {
     if (mod_id < 0 || mod_id >= (int)g_geomods.size()) return;

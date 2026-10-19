@@ -268,7 +268,9 @@ struct DeferredTexture {
 };
 void            BeginDeferredTextures(const wchar_t* ns, std::vector<DeferredTexture>& out);
 ID3D11Resource* LoadDeferredTexture(const DeferredTexture& t);
-bool            PublishDeferredTexture(const wchar_t* fq_name, ID3D11Resource* res);
+bool            DeferredTexturePending(const DeferredTexture& t, unsigned generation);
+// Accepts ownership only on success. A null resource completes a failed load.
+bool            PublishDeferredTexture(const wchar_t* fq_name, ID3D11Resource* res, unsigned generation);
 
 void TextureOverrideSection(uint32_t texture_hash, wchar_t* out, size_t out_chars);
 

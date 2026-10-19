@@ -494,6 +494,9 @@ std::optional<bool> ClaimDraw(const DrawArgs& da, BoneRoots& roots, DrawClaim& d
                 ri.vs_hash = vs_hash;
                 rt_hold = RtClaimNote(ri);
             }
+            if ((is_mod_char || char_vb || char_ibset) && (g_wcl_draw || ModGeomEnabled(md)) && !rt_hold &&
+                !ClaimedTexturesReady(g_merged_comps[mc_slot]))
+                return false; // native draw, before detection variables, texture stamps or mod commands
             if (g_debug && !is_mod_char && !char_vb && !char_ibset && DiagOnce("RTCLAIM", CompKey(md, ci)))
                 logger::write("RTCLAIM mod=%d comp=%d first=%u count=%u NOT IDENTIFIED: "
                               "char_vb=0 (vb0=%llx stride=%u inSkinPool=%d -- never learned) | char_ib=0 (ini hash=%08x computed=%08x%s) | "

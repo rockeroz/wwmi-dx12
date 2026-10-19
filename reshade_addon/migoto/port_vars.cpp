@@ -311,17 +311,30 @@ ID3D11Resource* LoadDeferredTexture(const DeferredTexture& t)
     return SUCCEEDED(hr) ? res : nullptr;
 }
 
-bool PublishDeferredTexture(const wchar_t* fq_name, ID3D11Resource* res)
+bool DeferredTexturePending(const DeferredTexture& t, unsigned generation)
 {
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
-    if (!g_loaded || !fq_name || !res) return false;
+    if (!g_loaded || g_generation != generation) return false;
+    auto it = customResources.find(t.fq_name);
+    if (it == customResources.end() || it->second.resource || it->second.view || it->second.filename != t.filename) return false;
+    auto pending = g_deferred_pending.find(&it->second);
+    return pending != g_deferred_pending.end() && pending->second == generation;
+}
+
+bool PublishDeferredTexture(const wchar_t* fq_name, ID3D11Resource* res, unsigned generation)
+{
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (!g_loaded || !fq_name || g_generation != generation) return false;
     auto it = customResources.find(fq_name);
     if (it == customResources.end() || it->second.resource || it->second.view) return false;
     CustomResource& r = it->second;
+    auto pending = g_deferred_pending.find(&r);
+    if (pending == g_deferred_pending.end() || pending->second != generation) return false;
+    g_deferred_pending.erase(pending);
+    if (!res) return true; // already substantiated: failed files retry only after a reload
     r.resource = res;
     r.device = g_dev.GetPassThroughOrigDevice1();
     r.is_null = false; // LoadFromFile's outcome
-    g_deferred_pending.erase(&r);
     MigotoPort::BumpSelectionInputs();
     return true;
 }

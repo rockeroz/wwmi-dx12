@@ -21,6 +21,8 @@ void DrawProbeVb6Reader(const DrawArgs& da, DrawClaim& dc);   // draw_probes.cpp
 void DrawProbeOffLeak(const DrawArgs& da, DrawClaim& dc);     // draw_probes.cpp
 void DrawProbeUnstamp(const ResInfo& ri, bool restored);      // draw_probes.cpp
 void StampClaimedTextures(const DrawArgs& da, DrawClaim& dc); // draw_texswap.cpp
+bool ModTexturesReady(int mod); // queues once; never waits for file I/O
+bool ClaimedTexturesReady(const MergedComp&); // includes every merged sibling
 // Where a game character draw binds each texture: recorded while crawling, linked from a seed (draw_comp.cpp).
 void NoteMeshPlaces(const DrawArgs& da);
 // Which textures a character draw read at ps-t0..t8, kept per list as DX11 keeps its slots (draw_comp.cpp).

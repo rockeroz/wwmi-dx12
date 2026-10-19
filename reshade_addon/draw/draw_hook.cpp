@@ -60,6 +60,7 @@ bool on_draw_indexed_body(command_list* cmd_list, uint32_t index_count, uint32_t
     if (g_merged_loaded) {
         auto hit = g_first_to_comp.find(FirstCountKey(first_index, index_count));
         if (hit != g_first_to_comp.end() && g_merged_comps[hit->second].hide && !RtHoldVanilla()) { // RTHOLD
+            if (!ClaimedTexturesReady(g_merged_comps[hit->second])) return false;
             t_x23_hidden = 1;
             return true;
         }
