@@ -5,6 +5,7 @@
 #include "../migoto/dx12_bridge.h"
 #include "../instrumentation/diag.h"
 #include "../instrumentation/hot_path.h"
+#include "../rt/rt_hooks.h"
 #include "pipeline_hooks.h" // the PSO -> shader-hash table on_bind_pipeline stamps from
 #include "../hud/uid_hide.h"
 
@@ -325,6 +326,7 @@ void on_reset_command_list(command_list* cmd_list)
 {
     PROF(PROF_CmdReset);
     if (!cmd_list) return;
+    RtCriticalReset(cmd_list);
     ++t_list_resets;
     HotPath::OnReset(cmd_list);
     RemovalPin::OnReset(reinterpret_cast<const void*>(cmd_list->get_native())); // the tally is per recording

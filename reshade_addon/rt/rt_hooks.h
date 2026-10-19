@@ -132,3 +132,9 @@ void RtDrawOverlay();
 
 // Is the RT module in this build? false = rt_stub.cpp: mods cannot be drawn while the game ray traces.
 bool RtModulePresent();
+
+// M5 critical resource ownership. Called before application heaps are created,
+// and when a command-list recording is discarded/reset.
+void RtCriticalInit(reshade::api::device*);
+void RtCriticalReset(reshade::api::command_list*);
+void RtCriticalShutdown();

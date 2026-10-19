@@ -34,6 +34,7 @@
 #include "rt_hooks.h"
 #include "rt_registry.h"
 #include "rt_skin.h"
+#include "rt_m5_critical.h"
 #include <cstdarg>
 #include <map>
 #include <set>
@@ -846,6 +847,8 @@ struct TlasRec {
     uint32_t             m5_r0 = 0, m5_recs = 0;
     uint64_t             m5_stride = 0;
     std::vector<uint8_t> m5_block; // the newest block (records R0 ..)
+    uint32_t             m5_block_frame = UINT32_MAX, m5_source_seq = 0;
+    std::vector<rtcritical::DescriptorPtr> m5_leases;
     uint64_t             m5_src = 0; // ...made from the hit group table at this (UPLOAD source) address: its shader ids
 };
 std::mutex                                           g_m3_m; // everything below
@@ -2055,19 +2058,40 @@ void M4Apply(device* dev, const ModBlas& mb, const RecTx& tx, uint64_t stride, u
 uint64_t           g_m5_tables = 0, g_m5_table_fail = 0, g_m5_ext = 0, g_m5_skip = 0, g_m5_blocks = 0, g_m5_block_fail = 0;
 uint32_t           g_m5_game_hi = 0; // the highest table start of the game's seen in a ray tracing heap
 std::map<std::string, uint64_t> g_m5_why; // skipped dispatches / failed blocks by reason
-constexpr uint32_t kM5Region = 4096, kM5TableSlots = 40; // per frame in flight: ~100 tables of 40
+constexpr uint32_t kM5TableSlots = 40; // per frame in flight: ~100 tables of 40
 constexpr uint32_t kM5SlotRecs = 192, kM5MaxGeoms = 64, kM5Slots = 8; // a character's slot: 64 geometries x 3 ray types
 uint32_t           g_m5_r0 = 0;                                       // our block's first record (fixed once set)
 uint64_t           g_m5_stride = 0;                                   // ...and the record stride it was set for
 uint64_t           g_m5_copies = 0;                                   // extended copies of a game table made
 uint64_t           g_m5_src_cached = 0;                               // ...whose source came from the frame's earlier find
 std::map<uint64_t, uint32_t> g_m5_slot;                               // character (game BLAS) -> its slot
-std::map<uint64_t, std::pair<uint64_t, std::vector<uint8_t>>> g_m5_last; // character -> (table source, its last records)
-struct M5HeapCur {
-    uint32_t frame = UINT32_MAX, used = 0;
+struct M5Last {
+    uint64_t first = 0;
+    std::vector<uint8_t> second;
+    uint32_t frame = 0, source_seq = 0;
+    std::vector<rtcritical::DescriptorPtr> leases;
 };
-std::map<uint64_t, M5HeapCur>                                g_m5_cur;
-std::map<std::tuple<uint64_t, uint32_t, uint64_t>, uint64_t> g_m5_tabs; // (heap, source table, set) -> our table, this frame
+std::map<uint64_t, M5Last> g_m5_last;
+using M5TableKey = std::tuple<uint64_t, uint32_t, uint64_t, int, int, unsigned>;
+std::map<M5TableKey, rtcritical::DescriptorPtr> g_m5_tabs;
+std::map<uint64_t, std::weak_ptr<rtcritical::DescriptorLease>> g_m5_descriptors;
+std::vector<rtcritical::DescriptorPtr> M5CaptureLeases(const std::vector<uint8_t>& block, uint64_t stride)
+{
+    std::vector<rtcritical::DescriptorPtr> out;
+    if (stride < 72) return out;
+    for (size_t i = 0; i + stride <= block.size(); i += size_t(stride)) {
+        uint64_t table = 0;
+        memcpy(&table, block.data() + i + 64, 8);
+        const auto it = g_m5_descriptors.find(table);
+        if (it == g_m5_descriptors.end()) continue;
+        if (auto lease = it->second.lock(); lease && std::find(out.begin(), out.end(), lease) == out.end()) out.push_back(std::move(lease));
+    }
+    return out;
+}
+void M5Remember(uint64_t game, uint64_t source, uint32_t sequence, const std::vector<uint8_t>& records, uint64_t stride)
+{
+    g_m5_last[game] = { source, records, g_frame_id, sequence, M5CaptureLeases(records, stride) };
+}
 uint32_t                                                     g_m5_tabs_frame = UINT32_MAX;
 ComPtr<ID3D12DescriptorHeap>                                 g_m5_null_heap;
 struct M5Ext {
@@ -2075,6 +2099,7 @@ struct M5Ext {
     uint64_t               cap = 0, up_cap = 0, stamp = 0;
     uint8_t*               up_ptr = nullptr;
     bool                   read_state = false; // res left in NON_PIXEL_SHADER_RESOURCE by its last use (else COMMON: new)
+    std::shared_ptr<rtcritical::Resources> owner;
     uint64_t               serial = 0;         // which use of it (each take a new one)
 };
 std::vector<M5Ext> g_m5_ring;
@@ -2091,6 +2116,9 @@ struct M5Pending {
     size_t   idx = 0; // in g_m5_ring
     uint64_t serial = 0, rd_va = 0, stride = 0;
     size_t   bytes = 0;
+    uint64_t prefix = 0;
+    uint32_t source_seq = 0;
+    rtcritical::PublicationPtr publication;
     uint32_t frame = 0;
     bool     filled = false;
 };
@@ -2181,33 +2209,24 @@ uint64_t M5Table(device* dev, uint64_t src_tab, const ModBlas& mb, uint32_t ge, 
         M5Why("table: the section's heap is small or not shader visible");
         return 0;
     }
-    g_m5_game_hi = (std::max)(g_m5_game_hi, ts.base);
-    const uint32_t region0 = hd.NumDescriptors - 3 * kM5Region;
-    if (g_m5_game_hi + 8192 >= region0) {
-        M5Why("table: the game's tables reach near the top of the heap");
-        return 0;
-    }
+    g_m5_game_hi = (std::max)(g_m5_game_hi, ts.base); // diagnostics only, never an allocation rule
     if (g_m5_tabs_frame != g_frame_id) {
         g_m5_tabs.clear();
         g_m5_tabs_frame = g_frame_id;
     }
-    const auto key = std::make_tuple(ts.heap, ts.base, ex.key);
-    if (const auto it = g_m5_tabs.find(key); it != g_m5_tabs.end()) return it->second;
-    M5HeapCur& cur = g_m5_cur[ts.heap];
-    if (cur.frame != g_frame_id) {
-        cur.frame = g_frame_id;
-        cur.used = 0;
-    }
-    if (cur.used + kM5TableSlots > kM5Region) {
-        M5Why("table: our region of the heap is full this frame");
+    const int mod = mb.pose_mod[ge], slot = mb.pose_slot[ge];
+    const M5TableKey key{ ts.heap, ts.base, ex.key, mod, slot, PortApi::LoadGeneration() };
+    if (const auto it = g_m5_tabs.find(key); it != g_m5_tabs.end()) return it->second->gpu.ptr;
+    const auto lease = rtcritical::Allocate(heap, kM5TableSlots);
+    if (!lease) {
+        M5Why("table: no exclusive reservation or all reserved descriptors are in flight");
         return 0;
     }
     const D3D12_CPU_DESCRIPTOR_HANDLE null_srv = M5NullSrv();
     if (!null_srv.ptr) return 0;
-    const uint32_t dst = region0 + (g_frame_id % 3) * kM5Region + cur.used;
-    cur.used += kM5TableSlots;
+    const uint32_t dst = lease->first;
     const UINT   inc = g_d3d12_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    const SIZE_T cpu0 = heap->GetCPUDescriptorHandleForHeapStart().ptr;
+    const SIZE_T cpu0 = lease->cpu.ptr - SIZE_T(dst) * inc;
     const SIZE_T heap_lo = cpu0, heap_hi = cpu0 + SIZE_T(hd.NumDescriptors) * inc;
     // the section's table as the game wrote it (from the CPU views it copied), our stamps where the core stamped
     uint32_t nulls = 0, null_lo = UINT32_MAX; // slots given the null view (unknown / a view in the heap itself), the first
@@ -2227,7 +2246,6 @@ uint64_t M5Table(device* dev, uint64_t src_tab, const ModBlas& mb, uint32_t ge, 
     }
     std::string detail; // (logged for the first tables of each (mod, section, set))
     // the vertex factory views (the mod's, as M4 gives the section's table), then the textures
-    const int       mod = mb.pose_mod[ge], slot = mb.pose_slot[ge];
     rtskin::VfViews v{};
     uint32_t        vfmt = 0, k = 0;
     for (; k < 8; ++k) {
@@ -2285,8 +2303,9 @@ uint64_t M5Table(device* dev, uint64_t src_tab, const ModBlas& mb, uint32_t ge, 
         }
     }
     ++g_m5_tables;
-    const uint64_t gpu = heap->GetGPUDescriptorHandleForHeapStart().ptr + uint64_t(dst) * inc;
-    g_m5_tabs[key] = gpu;
+    const uint64_t gpu = lease->gpu.ptr;
+    g_m5_tabs[key] = lease;
+    g_m5_descriptors[gpu] = lease;
     return gpu;
 }
 
@@ -2336,12 +2355,13 @@ M5Ext* M5TakeExt(uint64_t need, uint64_t up_need) // g_m3_m held
 {
     for (size_t tries = 0; tries < g_m5_ring.size(); ++tries) {
         M5Ext& e = g_m5_ring[g_m5_ring_next++ % g_m5_ring.size()];
-        if (e.stamp && !GpuPassed(e.stamp)) continue;
+        if (e.owner && (e.owner.use_count() != 1 || !rtcritical::IsPublished(e.owner->publication))) continue;
+        e.owner.reset();
         if (e.cap < need) {
             ComPtr<ID3D12Resource> r;
             const uint64_t         cap = (need + need / 4 + 65535) & ~uint64_t(65535);
             if (FAILED(CreateD3D12Buffer(g_d3d12_device, D3D12_HEAP_TYPE_DEFAULT, cap, D3D12_RESOURCE_STATE_COMMON, &r))) return nullptr;
-            M3Retire(e.res);
+            e.res.Reset();
             e.res = r;
             e.cap = cap;
             e.read_state = false;
@@ -2354,7 +2374,7 @@ M5Ext* M5TakeExt(uint64_t need, uint64_t up_need) // g_m3_m held
             const D3D12_RANGE none{ 0, 0 };
             if (FAILED(u->Map(0, &none, &p)) || !p) return nullptr;
             if (e.up) e.up->Unmap(0, nullptr);
-            M3Retire(e.up);
+            e.up.Reset();
             e.up = u;
             e.up_cap = cap;
             e.up_ptr = static_cast<uint8_t*>(p);
@@ -2397,44 +2417,26 @@ bool M5Armed()
 // same table; else, per slot, its character's last records made from it, or records made from it now (M3's records of
 // the character's instance at its game contribution, then its extra geometries' -- an indirect dispatch recorded before
 // this frame's first direct one), else zeros -- a null hit group: no shader runs. g_m3_m held.
-void M5BlockFor(device* dev, const TlasRec* t, ID3D12Resource* rd, uint64_t rd_va, uint64_t hit_size, uint64_t stride, std::vector<uint8_t>* out,
+void M5BlockFor(const TlasRec* t, uint64_t rd_va, uint32_t source_seq, uint64_t stride, std::vector<uint8_t>* out,
     bool* null_block, bool* provisional)
 {
-    *null_block = false;
-    *provisional = false;
     const size_t full = size_t(kM5Slots) * kM5SlotRecs * stride;
-    if (t && t->m5_src == rd_va && t->m5_stride == stride && t->m5_block.size() == full) {
+    if (t && t->m5_block_frame == g_frame_id && t->m5_source_seq == source_seq &&
+        t->m5_src == rd_va && t->m5_stride == stride && t->m5_block.size() == full) {
         *out = t->m5_block;
+        *null_block = false; *provisional = false;
         return;
     }
-    *provisional = true; // (not made by a direct dispatch of this table: M5Refill when one comes)
+    // No stale-generation records: the payload stays zero until the exact
+    // source copy's direct dispatch publishes its complete records.
     out->assign(full, 0);
-    bool any = false;
-    for (const auto& [game, k] : g_m5_slot) {
-        if (k >= kM5Slots) continue;
-        std::vector<uint8_t> recs;
-        const auto           lt = g_m5_last.find(game);
-        if (lt != g_m5_last.end() && lt->second.first == rd_va)
-            recs = lt->second.second;
-        else if (const auto mit = g_m3.find(game); mit != g_m3.end() && dev && rd) {
-            ModBlas& mb = mit->second;
-            RecTx    tx;
-            if (mb.ok && !mb.m5.empty() && mb.orig_contrib != UINT32_MAX && M3Records(mb, rd, rd_va, hit_size, stride, mb.orig_contrib, &tx) &&
-                M5Block(dev, mb, tx, stride, &recs) && recs.size() <= size_t(kM5SlotRecs) * stride)
-                g_m5_last[game] = { rd_va, recs };
-            else
-                recs.clear();
-        }
-        if (recs.empty()) continue;
-        memcpy(out->data() + size_t(k) * kM5SlotRecs * stride, recs.data(), (std::min)(recs.size(), size_t(kM5SlotRecs) * stride));
-        any = true;
-    }
-    *null_block = !any;
+    *null_block = true; *provisional = true;
 }
 
 // Provisional blocks of past frames: dropped (counted when no direct dispatch refilled them). g_m3_m held.
 void M5PendingSweep()
 {
+    rtcritical::Poll();
     for (auto it = g_m5_pending.begin(); it != g_m5_pending.end();)
         if (it->frame != g_frame_id) {
             if (!it->filled) ++g_m5_refill_left;
@@ -2445,31 +2447,40 @@ void M5PendingSweep()
 
 // A direct dispatch made the block from this frame's records of the table at rd_va: the extended copies of the same table
 // made earlier this frame with a provisional block get it (their upload buffer, read when the GPU runs their copy). g_m3_m.
-void M5Refill(uint64_t rd_va, uint64_t stride, const std::vector<uint8_t>& block)
+void M5Refill(ID3D12Resource* source, uint64_t rd_va, uint64_t prefix, uint32_t source_seq,
+    uint64_t stride, const std::vector<uint8_t>& block)
 {
     M5PendingSweep();
+    std::vector<uint8_t> payload;
+    const auto leases = M5CaptureLeases(block, stride);
     uint32_t n = 0;
     for (M5Pending& p : g_m5_pending) {
-        if (p.rd_va != rd_va || p.stride != stride || p.bytes != block.size() || p.idx >= g_m5_ring.size()) continue;
+        if (p.filled || p.frame != g_frame_id || p.rd_va != rd_va || p.source_seq != source_seq ||
+            p.prefix != prefix || p.stride != stride || p.bytes != block.size() || p.idx >= g_m5_ring.size()) continue;
         M5Ext& e = g_m5_ring[p.idx];
-        if (e.serial != p.serial || !e.up_ptr || e.up_cap < block.size()) continue; // (taken again since: never, within a frame)
-        memcpy(e.up_ptr, block.data(), block.size());
-        if (!p.filled) {
-            p.filled = true;
-            ++g_m5_refilled;
-            ++n;
+        if (e.serial != p.serial) continue;
+        if (payload.empty()) {
+            payload.resize(size_t(prefix) + block.size());
+            if (GuardedPrivateRead(source, rd_va, payload.data(), uint32_t(prefix)) != prefix) return;
+            memcpy(payload.data() + prefix, block.data(), block.size());
+        }
+        // Finalize owns a lock separate from M3, freezes once and signals the
+        // gate protecting this exact copy. A timeout forbids any subsequent write.
+        if (rtcritical::Finalize(p.publication, payload, leases)) {
+            p.filled = true; ++g_m5_refilled; ++n;
         }
     }
     static std::atomic<uint32_t> s_log{ 0 };
     if (n && s_log.fetch_add(1) < 6)
-        g_log.Line(true, "RTM5 refill f=%u: %u extended table(s) recorded earlier this frame with a provisional block got the frame's records (%zu records)",
-            g_frame_id, n, block.size() / size_t(stride));
+        g_log.Line(true, "RTM5 publish f=%u: %u immutable payload(s), copy generation %u, %zu records", g_frame_id, n, source_seq,
+            block.size() / size_t(stride));
 }
 
 // Extended copies made this frame, shared by the later dispatches of a recording reading the same table with the same block.
 struct M5ExtUse {
     const void* cl = nullptr;
     uint64_t    gen = 0, rd_va = 0, size = 0, block_hash = 0, va = 0, ext_size = 0;
+    uint32_t source_seq = 0;
 };
 std::vector<M5ExtUse> g_m5_uses;
 uint32_t              g_m5_uses_frame = UINT32_MAX;
@@ -2488,6 +2499,7 @@ uint64_t M5Extend(command_list* cmd_list, ID3D12GraphicsCommandList4* cl, const 
     struct SrcSeen {
         uint64_t        hit_va = 0, size = 0, rd_va = 0;
         ID3D12Resource* rd = nullptr;
+        uint32_t sequence = 0;
     };
     static std::vector<SrcSeen> s_src;
     static uint32_t             s_src_frame = UINT32_MAX;
@@ -2495,9 +2507,12 @@ uint64_t M5Extend(command_list* cmd_list, ID3D12GraphicsCommandList4* cl, const 
         s_src.clear();
         s_src_frame = g_frame_id;
     }
-    if (M3HitSource(cmd_list, resource{ 0 }, hit_va, hit_size, g_frame_id, &rd, &rd_va, &why, nullptr)) {
+    CopyRec source_copy{};
+    uint32_t source_seq = 0;
+    if (M3HitSource(cmd_list, resource{ 0 }, hit_va, hit_size, g_frame_id, &rd, &rd_va, &why, &source_copy)) {
+        source_seq = source_copy.seq;
         if (std::none_of(s_src.begin(), s_src.end(), [&](const SrcSeen& e) { return e.hit_va == hit_va && e.size == hit_size; }) && s_src.size() < 64)
-            s_src.push_back({ hit_va, hit_size, rd_va, rd });
+            s_src.push_back({ hit_va, hit_size, rd_va, rd, source_seq });
     } else {
         const auto it = std::find_if(s_src.begin(), s_src.end(), [&](const SrcSeen& e) { return e.hit_va == hit_va && e.size == hit_size; });
         if (it == s_src.end()) {
@@ -2506,6 +2521,7 @@ uint64_t M5Extend(command_list* cmd_list, ID3D12GraphicsCommandList4* cl, const 
         }
         rd = it->rd;
         rd_va = it->rd_va;
+        source_seq = it->sequence;
         ++g_m5_src_cached;
     }
     if (!g_m5_r0 || !g_m5_stride) {
@@ -2523,7 +2539,7 @@ uint64_t M5Extend(command_list* cmd_list, ID3D12GraphicsCommandList4* cl, const 
     }
     std::vector<uint8_t> blk;
     bool                 provisional = false;
-    M5BlockFor(cmd_list->get_device(), t, rd, rd_va, hit_size, hit_stride, &blk, null_block, &provisional);
+    M5BlockFor(t, rd_va, source_seq, hit_stride, &blk, null_block, &provisional);
     uint64_t h = 1469598103934665603ull;
     for (uint8_t b : blk) h = (h ^ b) * 1099511628211ull;
     if (g_m5_uses_frame != g_frame_id) {
@@ -2532,17 +2548,30 @@ uint64_t M5Extend(command_list* cmd_list, ID3D12GraphicsCommandList4* cl, const 
     }
     const uint64_t gen = CmdGen(cmd_list);
     for (const M5ExtUse& u : g_m5_uses)
-        if (u.cl == cmd_list && u.gen == gen && u.rd_va == rd_va && u.size == hit_size && u.block_hash == h) {
+        if (u.cl == cmd_list && u.gen == gen && u.rd_va == rd_va && u.size == hit_size && u.source_seq == source_seq && u.block_hash == h) {
             *ext_size = u.ext_size;
             return u.va;
         }
-    M5Ext* e = M5TakeExt(r0b + blk.size(), blk.size());
+    if (hit_size > (8ull << 20) || hit_size > UINT32_MAX - blk.size()) { *skip = "table snapshot is too large"; return 0; }
+    M5Ext* e = M5TakeExt(r0b + blk.size(), hit_size + blk.size());
     if (!e) {
         *skip = "no extended table buffer";
         return 0;
     }
     e->serial = ++g_m5_serial;
-    memcpy(e->up_ptr, blk.data(), blk.size());
+    e->owner = std::make_shared<rtcritical::Resources>();
+    e->owner->buffers = { e->res, e->up };
+    if (provisional) {
+        // The whole staging payload is a valid null-shader fallback, including
+        // base records. There can be no stale BLAS/material reads on timeout.
+        memset(e->up_ptr, 0, size_t(hit_size) + blk.size());
+        e->owner->publication = rtcritical::Pending(e->up.Get(), e->up_ptr, size_t(hit_size) + blk.size());
+        if (!e->owner->publication) { *skip = "could not create publication gate"; return 0; }
+    } else {
+        if (GuardedPrivateRead(rd, rd_va, e->up_ptr, uint32_t(hit_size)) != hit_size) { *skip = "table snapshot failed"; return 0; }
+        memcpy(e->up_ptr + hit_size, blk.data(), blk.size());
+        e->owner->descriptors = M5CaptureLeases(blk, hit_stride);
+    }
     if (provisional) {
         M5PendingSweep();
         M5Pending p;
@@ -2551,6 +2580,9 @@ uint64_t M5Extend(command_list* cmd_list, ID3D12GraphicsCommandList4* cl, const 
         p.rd_va = rd_va;
         p.stride = hit_stride;
         p.bytes = blk.size();
+        p.prefix = hit_size;
+        p.source_seq = source_seq;
+        p.publication = e->owner->publication;
         p.frame = g_frame_id;
         if (g_m5_pending.size() < 64) g_m5_pending.push_back(p);
         ++g_m5_prov;
@@ -2563,17 +2595,18 @@ uint64_t M5Extend(command_list* cmd_list, ID3D12GraphicsCommandList4* cl, const 
     br.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     M3Marker(cl, L"wwmi rt-m5: extended hit group table");
     cl->ResourceBarrier(1, &br);
-    cl->CopyBufferRegion(e->res.Get(), 0, rd, rd_va - rd->GetGPUVirtualAddress(), hit_size);
-    cl->CopyBufferRegion(e->res.Get(), r0b, e->up.Get(), 0, blk.size());
+    cl->CopyBufferRegion(e->res.Get(), 0, e->up.Get(), 0, hit_size);
+    cl->CopyBufferRegion(e->res.Get(), r0b, e->up.Get(), hit_size, blk.size());
     br.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     br.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     cl->ResourceBarrier(1, &br);
     e->read_state = true;
-    e->stamp = GpuStamp();
+    rtcritical::Record(reinterpret_cast<const void*>(cmd_list->get_native()), gen, e->owner);
     M5ExtUse u;
     u.cl = cmd_list;
     u.gen = gen;
     u.rd_va = rd_va;
+    u.source_seq = source_seq;
     u.size = hit_size;
     u.block_hash = h;
     u.va = e->res->GetGPUVirtualAddress();
@@ -3107,11 +3140,11 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
                     m5_bad.insert(mb);
                     recs.clear();
                 } else
-                    g_m5_last[game] = { rd_va, recs };
+                    M5Remember(game, rd_va, copy.seq, recs, hit_stride);
             }
             if (recs.empty()) { // not in this dispatch (or failed): its last records made from this same table (same shader ids)
                 const auto lt = g_m5_last.find(game);
-                if (lt != g_m5_last.end() && lt->second.first == rd_va && !(mb && m5_bad.count(mb))) recs = lt->second.second;
+                if (lt != g_m5_last.end() && lt->second.first == rd_va && lt->second.frame == frame && lt->second.source_seq == copy.seq && !(mb && m5_bad.count(mb))) recs = lt->second.second;
             }
             if (!recs.empty()) memcpy(at, recs.data(), (std::min)(recs.size(), size_t(kM5SlotRecs) * hit_stride));
         }
@@ -3220,7 +3253,7 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
     // dispatch: newest records of every slot)
     if (m5_ok && !m5_block.empty()) {
         // the frame's records of this table: into the extended copies of it recorded earlier with a provisional block
-        M5Refill(rd_va, hit_stride, m5_block);
+        M5Refill(rd, rd_va, hit_size, copy.seq, hit_stride, m5_block);
         bool any = t.m5_on;
         if (!backed && committed) {
             for (const Cand& c : cands) any = any || (!c.mb->m5.empty() && !m5_bad.count(c.mb));
@@ -3239,6 +3272,9 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
             t.m5_recs = uint32_t(m5_block.size() / hit_stride);
             t.m5_block = std::move(m5_block);
             t.m5_src = rd_va;
+            t.m5_block_frame = frame;
+            t.m5_source_seq = copy.seq;
+            t.m5_leases = M5CaptureLeases(t.m5_block, hit_stride);
         }
     }
     // M4: the committed records' vertex factory slots (txs: one RecTx per candidate / instance already ours, each now
@@ -3403,6 +3439,11 @@ void M3Summary()
         "target unresolved %llu | slot stamps noted %llu (%zu game->mod pairs)",
         M4Mode(), (unsigned long long)g_m4_tables, (unsigned long long)g_m4_slots, (unsigned long long)g_m4_tex_mod, (unsigned long long)g_m4_tex_swapped,
         (unsigned long long)g_m4_tex_lod, (unsigned long long)g_m4_tex_rsw, (unsigned long long)g_m4_tex_slot, (unsigned long long)g_m4_tex_norule, (unsigned long long)g_m4_tex_nosrv, (unsigned long long)slot_notes, slot_maps);
+    const auto safe = rtcritical::Statistics();
+    g_log.Line(true, "RTM5SAFE reserved_heaps=%llu allocations=%llu submissions=%llu completed=%llu published=%llu fallback=%llu late_refill_refused=%llu",
+        (unsigned long long)safe.reserved_heaps, (unsigned long long)safe.allocations, (unsigned long long)safe.submissions,
+        (unsigned long long)safe.completed, (unsigned long long)safe.published, (unsigned long long)safe.fallback,
+        (unsigned long long)safe.late_refills);
     M5SubDrawSummary();
     {
         std::string why;
@@ -3496,8 +3537,22 @@ void RtOnDeviceRemoved()
     }
 }
 
+void RtCriticalInit(device* dev)
+{
+    const bool ok = dev && rtcritical::InitDevice(reinterpret_cast<ID3D12Device*>(dev->get_native()));
+    ReshadeLog(ok ? reshade::log::level::info : reshade::log::level::error,
+        "wwmi-dx12 M5: exclusive descriptor reservation hook %s", ok ? "installed" : "unavailable (M5 won't borrow game heap space)");
+}
+void RtCriticalReset(command_list* list)
+{
+    if (list) rtcritical::Reset(reinterpret_cast<const void*>(list->get_native()));
+}
+void RtCriticalShutdown() { rtcritical::Shutdown(); }
+
 void RtNoteExecute(command_queue* queue, command_list* cmd_list)
 {
+    if (cmd_list) rtcritical::BeforeSubmit(queue ? reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()) : nullptr,
+        reinterpret_cast<const void*>(cmd_list->get_native()), CmdGen(cmd_list));
     if (!cmd_list || Mode() != 2 || !g_m3_any.load(std::memory_order_relaxed)) return;
     const uint64_t gen = CmdGen(cmd_list);
     // g_m3_m held throughout: a redirect checking and writing on another thread finishes before this list goes
@@ -3553,6 +3608,7 @@ void M3PresentTick()
 
 void RtPresentTick()
 {
+    rtcritical::Poll();
     if (Mode() == 2) {
         M3PresentTick();
         M5PollReadbacks();

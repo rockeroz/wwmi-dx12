@@ -142,6 +142,7 @@ exit /b 0</Command>
   <ItemGroup Label="RT module (M1 observe + M2 draw): msbuild /p:WwmiRT=observe" Condition="'$(WwmiRT)' == 'observe'">
     <ClCompile Include="reshade_addon\rt\rt_module.cpp" />
     <ClCompile Include="reshade_addon\rt\rt_skin.cpp" />
+    <ClCompile Include="reshade_addon\rt\rt_m5_critical.cpp" />
   </ItemGroup>
   <ItemGroup Label="Debug" Condition="'$(Configuration)' == 'Debug'">
     <ClCompile Include="reshade_addon\instrumentation\chain_trace.cpp" />
