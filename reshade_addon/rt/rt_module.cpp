@@ -2075,9 +2075,27 @@ struct M5Ext {
     uint64_t               cap = 0, up_cap = 0, stamp = 0;
     uint8_t*               up_ptr = nullptr;
     bool                   read_state = false; // res left in NON_PIXEL_SHADER_RESOURCE by its last use (else COMMON: new)
+    uint64_t               serial = 0;         // which use of it (each take a new one)
 };
 std::vector<M5Ext> g_m5_ring;
 uint32_t           g_m5_ring_next = 0;
+uint64_t           g_m5_serial = 0;
+// Extended copies made with a provisional block: before the frame's first direct dispatch (the indirect ones the game
+// records first), the block is made from each character's contribution of the last frame -- and the game lays its hit
+// group table out anew every frame (6770769 test: the records at the last contribution were another object's in every
+// frame, f6119..: the character's slot zeros, a null hit group, in those dispatches -- Qingxiao dark in the reflections).
+// The block is read from the copy's upload buffer when the GPU runs it, after this frame's rays are recorded (their TLAS's
+// build waits at our gate until then): the frame's first direct dispatch, whose block is made from the frame's records,
+// writes it into them (M5Refill). g_m3_m.
+struct M5Pending {
+    size_t   idx = 0; // in g_m5_ring
+    uint64_t serial = 0, rd_va = 0, stride = 0;
+    size_t   bytes = 0;
+    uint32_t frame = 0;
+    bool     filled = false;
+};
+std::vector<M5Pending> g_m5_pending;
+uint64_t               g_m5_prov = 0, g_m5_refilled = 0, g_m5_refill_left = 0;
 
 void M5Why(const char* why)
 {
@@ -2104,20 +2122,24 @@ D3D12_CPU_DESCRIPTOR_HANDLE M5NullSrv()
 
 // A game texture of an extra geometry's table: the set's own bind over it (by resource, else by texture identity), else
 // what the section's table gets (M4's order).
-bool M5ResolveTex(int mod, uint32_t g, ID3D12Resource* res, const M5Binds& set, D3D12_CPU_DESCRIPTOR_HANDLE* out)
+bool M5ResolveTex(int mod, uint32_t g, ID3D12Resource* res, const M5Binds& set, D3D12_CPU_DESCRIPTOR_HANDLE* out, const char** how)
 {
+    *how = "set";
     for (const auto& [game, src] : set)
         if (game == reinterpret_cast<uint64_t>(res) && src) {
             out->ptr = SIZE_T(src);
             return true;
         }
+    *how = "set-by-identity";
     if (const uint32_t h = TexIdentityNorm(TexHashOf(reinterpret_cast<uint64_t>(res))))
         for (const auto& [game, src] : set)
             if (src && TexIdentityNorm(TexHashOf(game)) == h) {
                 out->ptr = SIZE_T(src);
                 return true;
             }
+    *how = "section-stamp";
     if (SlotTexFor(mod, int(g), res, out)) return true;
+    *how = "rule";
     if (const uint32_t hash = TexHashOf(reinterpret_cast<uint64_t>(res))) {
         const wchar_t* own_ns = mod >= 0 && size_t(mod) < g_geomods.size() && !g_geomods[size_t(mod)].wcl_ns.empty()
             ? g_geomods[size_t(mod)].wcl_ns.c_str() : nullptr;
@@ -2138,7 +2160,10 @@ bool M5ResolveTex(int mod, uint32_t g, ID3D12Resource* res, const M5Binds& set, 
             return true;
         }
     }
-    return RasterSwapFor(mod, res, out);
+    *how = "raster-swap";
+    if (RasterSwapFor(mod, res, out)) return true;
+    *how = "game's";
+    return false;
 }
 
 // The material table of extra geometry ge (of mb): a copy of its section's table src_tab in our region of the same heap,
@@ -2185,6 +2210,7 @@ uint64_t M5Table(device* dev, uint64_t src_tab, const ModBlas& mb, uint32_t ge, 
     const SIZE_T cpu0 = heap->GetCPUDescriptorHandleForHeapStart().ptr;
     const SIZE_T heap_lo = cpu0, heap_hi = cpu0 + SIZE_T(hd.NumDescriptors) * inc;
     // the section's table as the game wrote it (from the CPU views it copied), our stamps where the core stamped
+    uint32_t nulls = 0, null_lo = UINT32_MAX; // slots given the null view (unknown / a view in the heap itself), the first
     for (uint32_t i = 0; i < kM5TableSlots; ++i) {
         D3D12_CPU_DESCRIPTOR_HANDLE src = null_srv;
         ResInfo                     ri{};
@@ -2193,8 +2219,13 @@ uint64_t M5Table(device* dev, uint64_t src_tab, const ModBlas& mb, uint32_t ge, 
             if (ri.swapped && ModLoader::TexEntryAt(ModLoader::TexIndexOf(ri.swapped), &stamp) && stamp.srv.ptr) src = stamp.srv;
             else if (ri.view_handle && (SIZE_T(ri.view_handle) < heap_lo || SIZE_T(ri.view_handle) >= heap_hi)) src = { SIZE_T(ri.view_handle) };
         }
+        if (src.ptr == null_srv.ptr) {
+            ++nulls;
+            null_lo = (std::min)(null_lo, i);
+        }
         g_d3d12_device->CopyDescriptorsSimple(1, { cpu0 + SIZE_T(dst + i) * inc }, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
+    std::string detail; // (logged for the first tables of each (mod, section, set))
     // the vertex factory views (the mod's, as M4 gives the section's table), then the textures
     const int       mod = mb.pose_mod[ge], slot = mb.pose_slot[ge];
     rtskin::VfViews v{};
@@ -2218,16 +2249,40 @@ uint64_t M5Table(device* dev, uint64_t src_tab, const ModBlas& mb, uint32_t ge, 
         else if (fmt == uint32_t(DXGI_FORMAT_R16G16B16A16_SNORM)) src = v.tan;
         else if (fmt == uint32_t(DXGI_FORMAT_R8G8B8A8_UNORM) || fmt == uint32_t(DXGI_FORMAT_B8G8R8A8_UNORM)) src = v.col;
         if (src.ptr) g_d3d12_device->CopyDescriptorsSimple(1, { cpu0 + SIZE_T(dst + k) * inc }, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        detail += " [" + std::to_string(k) + (src.ptr ? (src.ptr == v.uv.ptr ? " uv]" : src.ptr == v.tan.ptr ? " tan]" : " col]") : " vf kept]");
     }
+    const uint32_t vf_end = k;
     for (const uint32_t end = (std::min)(k + 24, kM5TableSlots); k < end; ++k) {
         ResInfo ri{};
         if (!g_heap_to_res.find({ ts.heap, ts.base + k }, ri) || !ri.view_handle) break;
         const resource_view_desc vd = dev->get_resource_view_desc(resource_view{ ri.view_handle });
         if (vd.type == resource_view_type::buffer || vd.type == resource_view_type::unknown) break;
-        if ((ri.swapped && ri.swapped != ri.res) || !ri.res) continue;
+        if ((ri.swapped && ri.swapped != ri.res) || !ri.res) {
+            detail += " [" + std::to_string(k) + " swapped]";
+            continue;
+        }
         D3D12_CPU_DESCRIPTOR_HANDLE t{};
-        if (M5ResolveTex(mod, ex.tmpl, ri.res, ex.binds, &t))
-            g_d3d12_device->CopyDescriptorsSimple(1, { cpu0 + SIZE_T(dst + k) * inc }, t, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        const char*                 how = "";
+        const bool                  got = M5ResolveTex(mod, ex.tmpl, ri.res, ex.binds, &t, &how);
+        if (got) g_d3d12_device->CopyDescriptorsSimple(1, { cpu0 + SIZE_T(dst + k) * inc }, t, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        if (detail.size() < 1200) {
+            char b[96];
+            snprintf(b, sizeof b, " [%u %p %s -> %s %llx]", k, (void*)ri.res, TexDesc(ri.res).c_str(), how, (unsigned long long)(got ? t.ptr : 0));
+            detail += b;
+        }
+    }
+    {
+        static std::map<std::tuple<int, uint32_t, uint64_t>, uint32_t> s_seen; // (mod, section, set) -> tables logged
+        if (s_seen.size() < 64 && s_seen[{ mod, ex.tmpl, ex.key }]++ < 2) {
+            std::string set;
+            for (const auto& [game, src] : ex.binds) {
+                char b[64];
+                snprintf(b, sizeof b, " %p->%llx", (void*)game, (unsigned long long)src);
+                set += b;
+            }
+            g_log.Line(true, "RTM5 table f=%u mod=%d section %u geometry %u: copy of %llx+%u at %u (%u null slot(s) from %u; vf %u slot(s)), set {%s }:%s",
+                g_frame_id, mod, ex.tmpl, ge, (unsigned long long)ts.heap, ts.base, dst, nulls, nulls ? null_lo : 0, vf_end, set.c_str(), detail.c_str());
+        }
     }
     ++g_m5_tables;
     const uint64_t gpu = heap->GetGPUDescriptorHandleForHeapStart().ptr + uint64_t(dst) * inc;
@@ -2343,14 +2398,16 @@ bool M5Armed()
 // the character's instance at its game contribution, then its extra geometries' -- an indirect dispatch recorded before
 // this frame's first direct one), else zeros -- a null hit group: no shader runs. g_m3_m held.
 void M5BlockFor(device* dev, const TlasRec* t, ID3D12Resource* rd, uint64_t rd_va, uint64_t hit_size, uint64_t stride, std::vector<uint8_t>* out,
-    bool* null_block)
+    bool* null_block, bool* provisional)
 {
     *null_block = false;
+    *provisional = false;
     const size_t full = size_t(kM5Slots) * kM5SlotRecs * stride;
     if (t && t->m5_src == rd_va && t->m5_stride == stride && t->m5_block.size() == full) {
         *out = t->m5_block;
         return;
     }
+    *provisional = true; // (not made by a direct dispatch of this table: M5Refill when one comes)
     out->assign(full, 0);
     bool any = false;
     for (const auto& [game, k] : g_m5_slot) {
@@ -2373,6 +2430,40 @@ void M5BlockFor(device* dev, const TlasRec* t, ID3D12Resource* rd, uint64_t rd_v
         any = true;
     }
     *null_block = !any;
+}
+
+// Provisional blocks of past frames: dropped (counted when no direct dispatch refilled them). g_m3_m held.
+void M5PendingSweep()
+{
+    for (auto it = g_m5_pending.begin(); it != g_m5_pending.end();)
+        if (it->frame != g_frame_id) {
+            if (!it->filled) ++g_m5_refill_left;
+            it = g_m5_pending.erase(it);
+        } else
+            ++it;
+}
+
+// A direct dispatch made the block from this frame's records of the table at rd_va: the extended copies of the same table
+// made earlier this frame with a provisional block get it (their upload buffer, read when the GPU runs their copy). g_m3_m.
+void M5Refill(uint64_t rd_va, uint64_t stride, const std::vector<uint8_t>& block)
+{
+    M5PendingSweep();
+    uint32_t n = 0;
+    for (M5Pending& p : g_m5_pending) {
+        if (p.rd_va != rd_va || p.stride != stride || p.bytes != block.size() || p.idx >= g_m5_ring.size()) continue;
+        M5Ext& e = g_m5_ring[p.idx];
+        if (e.serial != p.serial || !e.up_ptr || e.up_cap < block.size()) continue; // (taken again since: never, within a frame)
+        memcpy(e.up_ptr, block.data(), block.size());
+        if (!p.filled) {
+            p.filled = true;
+            ++g_m5_refilled;
+            ++n;
+        }
+    }
+    static std::atomic<uint32_t> s_log{ 0 };
+    if (n && s_log.fetch_add(1) < 6)
+        g_log.Line(true, "RTM5 refill f=%u: %u extended table(s) recorded earlier this frame with a provisional block got the frame's records (%zu records)",
+            g_frame_id, n, block.size() / size_t(stride));
 }
 
 // Extended copies made this frame, shared by the later dispatches of a recording reading the same table with the same block.
@@ -2431,7 +2522,8 @@ uint64_t M5Extend(command_list* cmd_list, ID3D12GraphicsCommandList4* cl, const 
         return 0;
     }
     std::vector<uint8_t> blk;
-    M5BlockFor(cmd_list->get_device(), t, rd, rd_va, hit_size, hit_stride, &blk, null_block);
+    bool                 provisional = false;
+    M5BlockFor(cmd_list->get_device(), t, rd, rd_va, hit_size, hit_stride, &blk, null_block, &provisional);
     uint64_t h = 1469598103934665603ull;
     for (uint8_t b : blk) h = (h ^ b) * 1099511628211ull;
     if (g_m5_uses_frame != g_frame_id) {
@@ -2449,7 +2541,20 @@ uint64_t M5Extend(command_list* cmd_list, ID3D12GraphicsCommandList4* cl, const 
         *skip = "no extended table buffer";
         return 0;
     }
+    e->serial = ++g_m5_serial;
     memcpy(e->up_ptr, blk.data(), blk.size());
+    if (provisional) {
+        M5PendingSweep();
+        M5Pending p;
+        p.idx = size_t(e - g_m5_ring.data());
+        p.serial = e->serial;
+        p.rd_va = rd_va;
+        p.stride = hit_stride;
+        p.bytes = blk.size();
+        p.frame = g_frame_id;
+        if (g_m5_pending.size() < 64) g_m5_pending.push_back(p);
+        ++g_m5_prov;
+    }
     D3D12_RESOURCE_BARRIER br{};
     br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     br.Transition.pResource = e->res.Get();
@@ -3114,6 +3219,8 @@ void M3Redirect(command_list* cmd_list, resource hit_res, uint64_t hit_off, uint
     // M5: instances now point at our block: every dispatch from here traces with our extended table (the block of this
     // dispatch: newest records of every slot)
     if (m5_ok && !m5_block.empty()) {
+        // the frame's records of this table: into the extended copies of it recorded earlier with a provisional block
+        M5Refill(rd_va, hit_stride, m5_block);
         bool any = t.m5_on;
         if (!backed && committed) {
             for (const Cand& c : cands) any = any || (!c.mb->m5.empty() && !m5_bad.count(c.mb));
@@ -3302,11 +3409,13 @@ void M3Summary()
         for (const auto& [wy, n] : g_m5_why) why += " | " + std::to_string(n) + " " + wy;
         g_log.Line(true,
             "RTM5SUM rt_m5=%d%s dispatches extended=%llu skipped=%llu table copies=%llu (source from the frame's earlier find %llu) | indirect ray dispatches=%llu (our table %llu, skipped %llu, "
-            "game's table %llu, no hit groups %llu) | blocks=%llu (failed %llu) tables=%llu (failed %llu) game tables reach %u%s",
+            "game's table %llu, no hit groups %llu) | blocks=%llu (failed %llu) tables=%llu (failed %llu) game tables reach %u | provisional blocks %llu "
+            "(refilled with the frame's records %llu, left as made %llu)%s",
             M5Mode(), g_m5_off.load() ? " (off: indirect rays)" : "", (unsigned long long)g_m5_ext, (unsigned long long)g_m5_skip,
             (unsigned long long)g_m5_copies, (unsigned long long)g_m5_src_cached, (unsigned long long)g_m5_ind_seen, (unsigned long long)g_m5_ind_patched,
             (unsigned long long)g_m5_ind_skipped, (unsigned long long)g_m5_ind_plain, (unsigned long long)g_m5_ind_nohit, (unsigned long long)g_m5_blocks,
-            (unsigned long long)g_m5_block_fail, (unsigned long long)g_m5_tables, (unsigned long long)g_m5_table_fail, g_m5_game_hi, why.c_str());
+            (unsigned long long)g_m5_block_fail, (unsigned long long)g_m5_tables, (unsigned long long)g_m5_table_fail, g_m5_game_hi,
+            (unsigned long long)g_m5_prov, (unsigned long long)g_m5_refilled, (unsigned long long)g_m5_refill_left, why.c_str());
     }
     std::string fw;
     for (const auto& [why, n] : g_m3_full_why) fw += " | " + std::to_string(n) + " " + why;
