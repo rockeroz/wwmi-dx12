@@ -10,7 +10,7 @@ TexEagerWorker g_tex_eager;
 
 bool TexEagerWorker::ReadyForDraw(int mod, const wchar_t* ns)
 {
-    if (!g_tex_deferred) return true;
+    if (!g_tex_deferred || mod < 0 || !ns || !*ns) return true;
     OnClaimed(mod, ns, "texture warmup before mod commands");
     return !Pending(mod);
 }

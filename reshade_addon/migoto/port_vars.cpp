@@ -287,8 +287,12 @@ void LoadDeferredNow(CustomResource* r)
     const bool this_load = it->second == g_generation;
     g_deferred_pending.erase(it);
     if (!g_loaded || !this_load || r->resource || r->view) return;
+    LARGE_INTEGER started{}, finished{}, frequency{};
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&started);
     ID3D11Resource* res = LoadDeferredTexture({ std::wstring(), r->filename, (unsigned)r->bind_flags, (unsigned)r->misc_flags,
         r->override_color_space == CustomColorSpace::SRGB });
+    QueryPerformanceCounter(&finished);
     if (!res) return;
     r->resource = res;
     r->device = g_dev.GetPassThroughOrigDevice1();
@@ -296,8 +300,9 @@ void LoadDeferredNow(CustomResource* r)
     MigotoPort::BumpSelectionInputs();
     const auto& names = CustomResourceNameIndex();
     const auto  n = names.find(r);
-    logger::write("TEXEAGER-NOW %ls: a copy or a compute bind read it before the background load had -- loaded now, as on DX11",
-        n != names.end() ? n->second.c_str() : r->filename.c_str());
+    logger::write("TEXEAGER-NOW %ls: a copy or a compute bind read it before background publication -- foreground load+staging %.1f ms",
+        n != names.end() ? n->second.c_str() : r->filename.c_str(),
+        frequency.QuadPart ? 1000.0 * double(finished.QuadPart - started.QuadPart) / double(frequency.QuadPart) : 0.0);
 }
 
 ID3D11Resource* LoadDeferredTexture(const DeferredTexture& t)

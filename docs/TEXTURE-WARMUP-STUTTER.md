@@ -30,6 +30,9 @@ Los archivos de los mods no se modifican.
 `TEXWARM` registra el inicio de la preparación y `TEXEAGER` su finalización. En
 modo diferido, la duración de publicación incluye esperar a obtener el bloqueo;
 se etiqueta así para no interpretarla como tiempo bloqueando el render.
+Si otra ruta aún requiere `TEXEAGER-NOW`, esa línea ahora mide por separado la
+carga y preparación síncrona del recurso. Esto permite comprobar si queda una
+dependencia fuera del grupo preparado, sin atribuirle el tiempo del trabajador.
 
 La prueba Windows `rt_tex_eager_test` usa el trabajador real con callbacks de
 carga controlados en CPU: comprueba que no se espera a I/O desde el dibujo,
