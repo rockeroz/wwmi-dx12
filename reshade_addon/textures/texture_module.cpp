@@ -42,6 +42,8 @@ class TexReadback {
 public:
     bool Schedule(ID3D12Device* dev, command_list* list, ID3D12GraphicsCommandList* cl, ID3D12Resource* src,
         ID3D12Resource* dst, const D3D12_RESOURCE_DESC& sd);
+    bool ScheduleUpload(ID3D12Device* dev, command_list* list, ID3D12GraphicsCommandList* cl, ID3D12Resource* src,
+        uint64_t src_off, uint64_t bytes, ID3D12Resource* dst, uint32_t sub, const uint32_t* cpu_crc);
     void OnExecute(command_queue* queue, command_list* list);
     void Drain();
     void Forget(ID3D12Resource* dst)
@@ -59,6 +61,9 @@ private:
         ID3D12Resource*        dst = nullptr;
         uint32_t               off = 0;
         uint32_t               rowPitch = 0;
+        uint32_t               sub = 0;         // an upload's mip
+        bool                   compare = false; // D16: cpu_crc is the processor's read of the same upload
+        uint32_t               cpu_crc = 0;
         ComPtr<ID3D12Resource> own;            // not in the shared buffer
         const void*            list = nullptr; // the game's list the copy is recorded on
         uint64_t               gen = 0;        // ...in this recording of it
@@ -68,6 +73,13 @@ private:
         ULONGLONG              exec_ms = 0;
         uint64_t               value = 0; // signalled on qf behind the submission; the copy has run once the fence reaches it
     };
+    struct Spare {
+        ComPtr<ID3D12Resource> buf;
+        uint64_t               bytes = 0;
+    };
+    bool        Reserve(ID3D12Device* dev, uint64_t total, bool once, Pending& p, ID3D12Resource** buf);
+    void        KeepSpare(ComPtr<ID3D12Resource> b);
+    static void Arrived(const Pending& p, const uint8_t* data);
     QueueFence* FenceOf(ID3D12CommandQueue* q);
     template <class Behind>
     unsigned SignalBehind(QueueFence* qf, Behind behind);
@@ -76,6 +88,8 @@ private:
     ComPtr<ID3D12Resource>              rb_;
     uint32_t                            cursor_ = 0; // the shared buffer is free from here; back to 0 once no copy into it is outstanding
     std::vector<Pending>                pending_;
+    std::vector<Spare>                  spare_;           // own buffers whose readback was hashed or dropped, for the next that does not fit
+    ULONGLONG                           own_used_ms_ = 0; // when an own buffer was last taken; the spares go after 10 s without one
     std::deque<QueueFence>              fences_; // one per queue: queues finish out of order
     std::atomic<uint32_t>               unsignalled_{ 0 }; // pending_ entries with no signal behind them yet
     std::unordered_set<ID3D12Resource*> tried_;
@@ -93,6 +107,15 @@ static std::atomic<uint32_t> g_ts_mipk_held{ 0 };     // ...held because mip0 wa
 static std::atomic<uint32_t> g_ts_held_resolved{ 0 }; // held entries resolved at mip0 (recorded or not a target)
 static std::atomic<uint32_t> g_ts_target_mip0{ 0 };   // mip0 identifications of a rule target
 static std::atomic<uint32_t> g_ts_rb_late{ 0 };       // readbacks whose fence went in a second after the submission, not behind a later one
+static std::atomic<uint32_t> g_ts_up_gpu{ 0 };        // buffer->texture uploads hashed from a GPU copy
+static std::atomic<uint32_t> g_ts_up_same{ 0 };       // ...whose hash matched the processor's read (D16)
+static std::atomic<uint32_t> g_ts_up_diff{ 0 };       // ...and did not
+static std::atomic<uint32_t> g_ts_rb_own{ 0 };        // readbacks that did not fit the shared buffer and created their own
+static std::atomic<uint64_t> g_ts_rb_own_us{ 0 };     // ...time spent creating them, on the game's threads
+static std::atomic<uint32_t> g_ts_rb_waits{ 0 };      // readbacks that waited 2 ms or more for the lock
+static std::atomic<uint32_t> g_ts_rb_reused{ 0 };     // readbacks that took a spare own buffer instead of creating one
+static std::atomic<uint32_t> g_up_slow_run{ 0 };      // consecutive upload reads slower than kUpSlowMBps
+static std::atomic<bool>     g_up_gpu{ false };       // the processor reads the game's upload memory too slowly: GPU copies from now on
 
 // BC formats: collapse unorm/srgb to the TYPELESS base (the resource format 3dmigoto hashes).
 uint32_t TexIdentityHash(uint32_t data_hash, uint32_t w, uint32_t h, uint32_t mips, uint32_t arr, uint32_t dxgi_fmt)
@@ -105,10 +128,22 @@ static int WclTexSelect(uint32_t hash)
 {
     return ModLoader::TexIndexOf(PortApi::SelectTextureOverride(hash));
 }
+static int Touched(int sel, unsigned mip)
+{
+    ModLoader::TexTouchAt(sel, mip);
+    return sel;
+}
+unsigned TexDrawnMip(uint32_t hash, uint32_t target)
+{
+    if (!g_tex_distance || !hash) return ModLoader::kTexMipUnknown;
+    if (hash == target) return 0;
+    const unsigned k = TexLodMipOf(hash);
+    return k ? k : ModLoader::kTexMipUnknown;
+}
 D3D12_CPU_DESCRIPTOR_HANDLE WclModSrvByResourceFq(const std::wstring& res_fq)
 {
     ModLoader::TexEntry e;
-    return ModLoader::TexEntryAt(ModLoader::TexIndexOf(PortApi::FindCustomResource(res_fq.c_str())), &e)
+    return ModLoader::TexEntryAt(Touched(ModLoader::TexIndexOf(PortApi::FindCustomResource(res_fq.c_str())), ModLoader::kTexMipUnknown), &e)
         ? e.srv
         : D3D12_CPU_DESCRIPTOR_HANDLE{ 0 };
 }
@@ -116,7 +151,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE RfxMapSrv(const std::wstring& res_fq, const wchar_t*
 {
     if (res_fq.empty()) return D3D12_CPU_DESCRIPTOR_HANDLE{ 0 };
     const uint32_t      sw = PortApi::SwitchOfResource(res_fq.c_str());
-    const int           sel = sw ? TexSelectIdxNs(sw, ns) : -1;
+    const int           sel = sw ? TexSelectIdxNs(sw, ns, ModLoader::kTexMipUnknown) : -1;
     ModLoader::TexEntry e;
     if (sel < 0 || !ModLoader::TexEntryAt(sel, &e)) return WclModSrvByResourceFq(res_fq);
     if (g_debug && DiagChanged("RFX-SWITCH", (int)(sw & 0x7fffffff), (unsigned long long)(unsigned)sel)) {
@@ -156,15 +191,15 @@ static void                     FlickerWatch(uint32_t hash, int sel)
 }
 
 // Resolve the selected mod TexResource index for a vanilla hash (honors $var/key conditionals). -1 = none.
-int TexSelectIdx(uint32_t hash)
+int TexSelectIdx(uint32_t hash, unsigned mip)
 {
     int                 wsel = WclTexSelect(hash);
     ModLoader::TexEntry e;
     const int           sel = (wsel >= 0 && ModLoader::TexEntryAt(wsel, &e)) ? wsel : -1; // else: no section, or vanilla
     FlickerWatch(hash, sel);
-    return sel;
+    return Touched(sel, mip);
 }
-int TexSelectIdxNs(uint32_t hash, const wchar_t* ns)
+int TexSelectIdxNs(uint32_t hash, const wchar_t* ns, unsigned mip)
 {
     struct Sel {
         uint32_t hash;
@@ -177,7 +212,7 @@ int TexSelectIdxNs(uint32_t hash, const wchar_t* ns)
     if (!PortApi::SelectionCacheOk()) {
         const int           wsel = ModLoader::TexIndexOf(PortApi::SelectTextureOverrideNs(hash, ns));
         ModLoader::TexEntry e;
-        return (wsel >= 0 && ModLoader::TexEntryAt(wsel, &e)) ? wsel : -1;
+        return Touched((wsel >= 0 && ModLoader::TexEntryAt(wsel, &e)) ? wsel : -1, mip);
     }
     thread_local std::unordered_map<uint64_t, Sel> t_sel;
     thread_local const wchar_t*                    t_ns = nullptr;
@@ -199,7 +234,7 @@ int TexSelectIdxNs(uint32_t hash, const wchar_t* ns)
     auto           it = t_sel.find(key);
     if (it != t_sel.end() && it->second.hash == hash && it->second.load_gen == load_gen && it->second.inputs_gen == inputs_gen &&
         it->second.tex_gen == tex_gen && it->second.churn == churn)
-        return it->second.sel;
+        return Touched(it->second.sel, mip);
     bool                cacheable = false;
     const int           wsel = ModLoader::TexIndexOf(PortApi::SelectTextureOverrideNs(hash, ns, &cacheable));
     ModLoader::TexEntry e;
@@ -208,7 +243,7 @@ int TexSelectIdxNs(uint32_t hash, const wchar_t* ns)
         t_sel[key] = Sel{ hash, sel, load_gen, inputs_gen, tex_gen, churn };
     else if (it != t_sel.end())
         t_sel.erase(it);
-    return sel;
+    return Touched(sel, mip);
 }
 uint32_t TexRuleHashFor(uint32_t hash)
 {
@@ -263,7 +298,7 @@ uint32_t ResolveBoundTextures(uint64_t heap, uint32_t base, uint32_t num, ID3D12
 D3D12_CPU_DESCRIPTOR_HANDLE TexReplacement(uint32_t hash)
 {
     ModLoader::TexEntry e;
-    return ModLoader::TexEntryAt(TexSelectIdx(hash), &e) ? e.srv : D3D12_CPU_DESCRIPTOR_HANDLE{ 0 };
+    return ModLoader::TexEntryAt(TexSelectIdx(hash, ModLoader::kTexMipUnknown), &e) ? e.srv : D3D12_CPU_DESCRIPTOR_HANDLE{ 0 };
 }
 
 // Resources whose placement found a rule but an empty selection -- see TexRetryMissed.
@@ -352,7 +387,7 @@ bool GlobalTexSwap(ID3D12Device* dev, uint64_t heap_handle, uint32_t slot, ID3D1
         return false;
     }
     ModLoader::TexEntry rep_e; // the SRV to stamp AND the resource it views
-    int                 sel = TexSelectIdx(rule_hash);
+    int                 sel = TexSelectIdx(rule_hash, TexDrawnMip(hash, rule_hash));
     if (sel < 0) {
         sel = SnapshotSelection(rule_hash);
         if (sel >= 0 && g_debug && DiagOnce("TEXSEL-SNAP", (int)rule_hash))
@@ -396,6 +431,7 @@ bool GlobalTexSwap(ID3D12Device* dev, uint64_t heap_handle, uint32_t slot, ID3D1
     BackupBeforeStamp(heap_handle, slot, rep.ptr);
     dev->CopyDescriptorsSimple(1, dst, rep, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     g_heap_to_res.set_swapped({ heap_handle, slot }, rep_e.res); // the frame dump publishes what the GPU reads
+    StampedStoreTexture(heap_handle, slot, rep_e.res);
     ++g_global_tex_count;
     TexTiming::NoteSwapped(rep_e.res, rule_hash);
     NotePlacement(rule_hash, heap_handle, slot, true);
@@ -448,13 +484,23 @@ void TexSnapshotSelections(const wchar_t* ns)
 {
     if (!ns || !*ns) return;
     std::vector<std::pair<uint32_t, int>> sel;
-    for (uint32_t r : TexRulesOfNs(ns)) sel.emplace_back(r, TexSelectIdx(r));
+    for (uint32_t r : TexRulesOfNs(ns)) sel.emplace_back(r, TexSelectIdx(r, ModLoader::kTexMipUnknown));
     std::unique_lock l(g_sel_snap_mtx);
     for (const auto& [r, s] : sel)
         if (s >= 0)
             g_sel_snap[r] = SelSnap{ s, g_frame_id };
         else
             g_sel_snap.erase(r);
+}
+
+void TexSnapshotsMove(const std::unordered_map<int, int>& index_to)
+{
+    if (index_to.empty()) return;
+    std::unique_lock l(g_sel_snap_mtx);
+    for (auto& [rule, snap] : g_sel_snap) {
+        const auto it = index_to.find(snap.sel);
+        if (it != index_to.end()) snap.sel = it->second;
+    }
 }
 
 static std::unordered_set<uint32_t> TexRulesOfNs(const wchar_t* ns)
@@ -1275,10 +1321,12 @@ void DrainTexReadback()
     if (g_debug) { // TEXSTREAM: the arrival paths, cumulative, every 600 frames
         static uint32_t tick = 0;
         if (++tick % 600 == 0)
-            logger::write("TEXSTREAM tex2tex=%u stream=%u streamBigUnknown=%u | buf mip0=%u mipK=%u mipKtarget=%u held=%u heldResolved=%u | targets=%u | readbackLate=%u",
+            logger::write("TEXSTREAM tex2tex=%u stream=%u streamBigUnknown=%u | buf mip0=%u mipK=%u mipKtarget=%u held=%u heldResolved=%u | targets=%u | readbackLate=%u | "
+                          "uploadsByGpuCopy=%u (same=%u differ=%u) | readbackOwnBuffers created=%u (%.1f ms) reused=%u lockWaits2ms=%u",
                 g_ts_tex2tex.load(), g_ts_stream.load(), g_ts_stream_nobig.load(), g_ts_buf_mip0.load(), g_ts_buf_mipk.load(),
                 g_ts_mipk_target.load(), g_ts_mipk_held.load(), g_ts_held_resolved.load(), g_ts_target_mip0.load(),
-                g_ts_rb_late.load());
+                g_ts_rb_late.load(), g_ts_up_gpu.load(), g_ts_up_same.load(), g_ts_up_diff.load(), g_ts_rb_own.load(),
+                g_ts_rb_own_us.load() / 1000.0, g_ts_rb_reused.load(), g_ts_rb_waits.load());
     }
     g_tex_readback.Drain();
 }
@@ -1288,57 +1336,137 @@ void TexReadbackOnExecute(command_queue* queue, command_list* list)
     g_tex_readback.OnExecute(queue, list);
 }
 
-bool TexReadback::Schedule(ID3D12Device* dev, command_list* list, ID3D12GraphicsCommandList* cl, ID3D12Resource* src,
-    ID3D12Resource* dst, const D3D12_RESOURCE_DESC& sd)
+bool TexReadback::Reserve(ID3D12Device* dev, uint64_t total, bool once, Pending& p, ID3D12Resource** buf)
 {
+    const auto      t_wait = std::chrono::steady_clock::now();
+    std::lock_guard l(mtx_);
+    {
+        const uint64_t waited_us =
+            (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_wait).count();
+        if (waited_us >= 2000) {
+            g_ts_rb_waits.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<int> logged{ 0 };
+            if (g_debug && logged.fetch_add(1) < 20)
+                logger::write("TEXRB-WAIT thread %u waited %.1f ms for the readback lock to record a %llu B readback",
+                    GetCurrentThreadId(), waited_us / 1000.0, (unsigned long long)total);
+        }
+    }
+    if (once && tried_.count(p.dst)) return false; // one-shot per resource
     if (!rb_) {
         CreateD3D12Buffer(dev, D3D12_HEAP_TYPE_READBACK, kBytes, D3D12_RESOURCE_STATE_COPY_DEST, &rb_);
         if (!rb_) return false;
     }
+    dev_ = dev;
+    const uint32_t aligned = (cursor_ + 511u) & ~511u;
+    if ((uint64_t)aligned + total <= kBytes) {
+        p.off = aligned;
+        cursor_ = aligned + (uint32_t)total;
+    } else {
+        size_t best = spare_.size();
+        for (size_t i = 0; i < spare_.size(); ++i)
+            if (spare_[i].bytes >= total && (best == spare_.size() || spare_[i].bytes < spare_[best].bytes)) best = i;
+        if (best != spare_.size()) {
+            p.own = std::move(spare_[best].buf);
+            spare_[best] = std::move(spare_.back());
+            spare_.pop_back();
+            g_ts_rb_reused.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            uint64_t bytes = 64u * 1024;
+            while (bytes < total) bytes <<= 1;
+            const auto t0 = std::chrono::steady_clock::now();
+            CreateD3D12Buffer(dev, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST, &p.own);
+            const uint64_t us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            g_ts_rb_own.fetch_add(1, std::memory_order_relaxed);
+            g_ts_rb_own_us.fetch_add(us, std::memory_order_relaxed);
+            static std::atomic<int> logged{ 0 };
+            if (g_debug && us >= 2000 && logged.fetch_add(1) < 20)
+                logger::write("TEXRB-OWN %llu B readback buffer created in %.1f ms on thread %u -- the shared one is full to %u of %u B with "
+                              "%zu readback(s) pending",
+                    (unsigned long long)bytes, us / 1000.0, GetCurrentThreadId(), cursor_, kBytes, pending_.size());
+        }
+        own_used_ms_ = GetTickCount64();
+        if (!p.own) return false;
+    }
+    *buf = p.own ? p.own.Get() : rb_.Get();
+    pending_.push_back(p);
+    unsignalled_.fetch_add(1, std::memory_order_relaxed);
+    if (once) tried_.insert(p.dst);
+    return true;
+}
+
+void TexReadback::KeepSpare(ComPtr<ID3D12Resource> b)
+{
+    if (!b) return;
+    const uint64_t bytes = b->GetDesc().Width;
+    spare_.push_back(Spare{ std::move(b), bytes });
+}
+
+bool TexReadback::Schedule(ID3D12Device* dev, command_list* list, ID3D12GraphicsCommandList* cl, ID3D12Resource* src,
+    ID3D12Resource* dst, const D3D12_RESOURCE_DESC& sd)
+{
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
     UINT                               rows = 0;
     UINT64                             rowSize = 0;
     UINT64                             total = 0;
     dev->GetCopyableFootprints(&sd, 0, 1, 0, &fp, &rows, &rowSize, &total);
-    uint32_t        base = 0;
+    Pending p;
+    p.dst = dst;
+    p.rowPitch = fp.Footprint.RowPitch;
+    p.list = list;
+    p.gen = CmdGen(list);
     ID3D12Resource* own_or_shared = nullptr;
-    {
-        std::lock_guard l(mtx_);
-        if (tried_.count(dst)) return false; // one-shot per resource
-        dev_ = dev;
-        ComPtr<ID3D12Resource> own;
-        const uint32_t         aligned = (cursor_ + 511u) & ~511u;
-        if ((uint64_t)aligned + total <= kBytes) {
-            base = aligned;
-            cursor_ = base + (uint32_t)total;
-        } else {
-            CreateD3D12Buffer(dev, D3D12_HEAP_TYPE_READBACK, total, D3D12_RESOURCE_STATE_COPY_DEST, &own);
-            if (!own) return false;
-        }
-        own_or_shared = own ? own.Get() : rb_.Get();
-        Pending p;
-        p.dst = dst;
-        p.off = base;
-        p.rowPitch = fp.Footprint.RowPitch;
-        p.own = own;
-        p.list = list;
-        p.gen = CmdGen(list);
-        pending_.push_back(std::move(p));
-        unsignalled_.fetch_add(1, std::memory_order_relaxed);
-        tried_.insert(dst);
-    }
+    if (!Reserve(dev, total, true, p, &own_or_shared)) return false;
     dst->AddRef(); // keep alive until Drain hashes it
     D3D12_TEXTURE_COPY_LOCATION d = {};
     d.pResource = own_or_shared;
     d.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     d.PlacedFootprint = fp;
-    d.PlacedFootprint.Offset = base;
+    d.PlacedFootprint.Offset = p.off;
     D3D12_TEXTURE_COPY_LOCATION s = {};
     s.pResource = src;
     s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     s.SubresourceIndex = 0;
     cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr); // src already copy-source-ready, no render pass: no barrier
     return true;
+}
+
+bool TexReadback::ScheduleUpload(ID3D12Device* dev, command_list* list, ID3D12GraphicsCommandList* cl, ID3D12Resource* src,
+    uint64_t src_off, uint64_t bytes, ID3D12Resource* dst, uint32_t sub, const uint32_t* cpu_crc)
+{
+    Pending p;
+    p.dst = dst;
+    p.sub = sub;
+    p.list = list;
+    p.gen = CmdGen(list);
+    if (cpu_crc) {
+        p.compare = true;
+        p.cpu_crc = *cpu_crc;
+    }
+    ID3D12Resource* buf = nullptr;
+    if (!Reserve(dev, bytes, false, p, &buf)) return false;
+    dst->AddRef();
+    cl->CopyBufferRegion(buf, p.off, src, src_off, bytes); // an upload heap is always copy-source-ready
+    return true;
+}
+
+void TexReadback::Arrived(const Pending& p, const uint8_t* data)
+{
+    if (p.compare) {
+        TexAssetLayout L;
+        if (TexAssetLayoutOf(p.dst->GetDesc(), p.sub, L)) {
+            const std::vector<uint8_t> tight = TightFromUpload(data, L.pitch, L);
+            const uint32_t             gpu_crc = PortApi::Crc32c(0, tight.data(), tight.size());
+            (gpu_crc == p.cpu_crc ? g_ts_up_same : g_ts_up_diff).fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<int> n{ 0 };
+            if (gpu_crc != p.cpu_crc && n.fetch_add(1) < 20)
+                logger::write("TEXUP-DIFF res=%p mip %u %ux%u: the GPU copy hashes %08x, the processor's read %08x",
+                    (void*)p.dst, p.sub, L.w, L.h, gpu_crc, p.cpu_crc);
+        }
+    }
+    if (p.sub)
+        TexMipIdentityFromUpload(p.dst, p.sub, data);
+    else
+        TexHashFromUpload(p.dst, data, p.rowPitch);
 }
 
 TexReadback::QueueFence* TexReadback::FenceOf(ID3D12CommandQueue* q)
@@ -1391,51 +1519,65 @@ void TexReadback::OnExecute(command_queue* queue, command_list* list)
 
 void TexReadback::Drain()
 {
-    std::vector<ID3D12Resource*> done;
+    std::vector<Pending>         arrived;
+    std::vector<ID3D12Resource*> dropped_dst;
+    uint32_t                     mapped_end = 0;
     {
         std::lock_guard l(mtx_);
         const ULONGLONG now = GetTickCount64();
         for (QueueFence& f : fences_)
             g_ts_rb_late.fetch_add(SignalBehind(&f, [&](const Pending& p) { return now - p.exec_ms >= 1000; }),
                 std::memory_order_relaxed);
-        void*  shared = nullptr;
         size_t keep = 0;
-        bool   shared_left = false;
         for (size_t i = 0; i < pending_.size(); ++i) {
             Pending&   p = pending_[i];
             const bool dropped = !p.exec_ms && CmdGen(p.list) != p.gen;
             const bool ran = p.value ? p.qf->fence->GetCompletedValue() >= p.value : (p.exec_ms && !p.qf && now - p.exec_ms >= 2000);
             if (!dropped && !ran) {
-                shared_left |= !p.own;
                 if (keep != i) pending_[keep] = std::move(p);
                 ++keep;
                 continue;
             }
             if (dropped) unsignalled_.fetch_sub(1, std::memory_order_relaxed);
-            if (ran && p.own) {
-                void* q = nullptr;
-                if (SUCCEEDED(p.own->Map(0, nullptr, &q)) && q) {
-                    TexHashFromUpload(p.dst, (const uint8_t*)q, p.rowPitch);
-                    D3D12_RANGE wr = { 0, 0 };
-                    p.own->Unmap(0, &wr);
-                }
-            } else if (ran) {
-                if (!shared) {
-                    D3D12_RANGE rr = { 0, cursor_ };
-                    if (FAILED(rb_->Map(0, &rr, &shared))) shared = nullptr;
-                }
-                if (shared) TexHashFromUpload(p.dst, (const uint8_t*)shared + p.off, p.rowPitch);
+            if (ran) {
+                arrived.push_back(std::move(p));
+            } else {
+                dropped_dst.push_back(p.dst);
+                KeepSpare(std::move(p.own));
             }
-            done.push_back(p.dst);
-        }
-        if (shared) {
-            D3D12_RANGE wr = { 0, 0 };
-            rb_->Unmap(0, &wr);
         }
         pending_.erase(pending_.begin() + keep, pending_.end());
-        if (!shared_left) cursor_ = 0;
+        mapped_end = cursor_;
     }
-    for (ID3D12Resource* r : done) r->Release();
+    void* shared = nullptr;
+    for (const Pending& p : arrived) {
+        if (p.own) {
+            void* q = nullptr;
+            if (SUCCEEDED(p.own->Map(0, nullptr, &q)) && q) {
+                Arrived(p, (const uint8_t*)q);
+                D3D12_RANGE wr = { 0, 0 };
+                p.own->Unmap(0, &wr);
+            }
+            continue;
+        }
+        if (!shared) {
+            D3D12_RANGE rr = { 0, mapped_end };
+            if (FAILED(rb_->Map(0, &rr, &shared))) shared = nullptr;
+        }
+        if (shared) Arrived(p, (const uint8_t*)shared + p.off);
+    }
+    if (shared) {
+        D3D12_RANGE wr = { 0, 0 };
+        rb_->Unmap(0, &wr);
+    }
+    {
+        std::lock_guard l(mtx_);
+        for (Pending& p : arrived) KeepSpare(std::move(p.own));
+        if (!spare_.empty() && GetTickCount64() - own_used_ms_ >= 10000) spare_.clear();
+        if (std::none_of(pending_.begin(), pending_.end(), [](const Pending& p) { return !p.own; })) cursor_ = 0;
+    }
+    for (const Pending& p : arrived) p.dst->Release();
+    for (ID3D12Resource* r : dropped_dst) r->Release();
 }
 bool on_copy_resource(command_list*, resource source, resource dest)
 {
@@ -1458,6 +1600,72 @@ bool on_copy_resource(command_list*, resource source, resource dest)
     DiagTexPath("copy_resource", reinterpret_cast<ID3D12Resource*>(dest.handle),
         reinterpret_cast<ID3D12Resource*>(source.handle), 0);
     return false;
+}
+
+static constexpr uint32_t kUpProbeBytes = 16u * 1024;
+static constexpr double   kUpSlowMBps = 256.0;
+static std::atomic<uint32_t> g_up_probe_sink{ 0 };
+
+static bool UploadReadSlow(const uint8_t* p, uint64_t span)
+{
+    static const double us_per_tick = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return 1e6 / (double)f.QuadPart;
+    }();
+    const size_t   n0 = (size_t)std::min<uint64_t>(span, kUpProbeBytes);
+    size_t         n = n0;
+    const uint8_t* s = p;
+    __m128i        acc = _mm_setzero_si128();
+    LARGE_INTEGER  a;
+    LARGE_INTEGER  b;
+    {
+        PROF(PROF_CB_Copy);
+        QueryPerformanceCounter(&a);
+        for (; n && ((uintptr_t)s & 15); --n, ++s) acc = _mm_xor_si128(acc, _mm_cvtsi32_si128(*s));
+        for (; n >= 16; n -= 16, s += 16) acc = _mm_xor_si128(acc, _mm_stream_load_si128((__m128i*)s));
+        QueryPerformanceCounter(&b);
+    }
+    g_up_probe_sink.fetch_xor((uint32_t)_mm_cvtsi128_si32(acc), std::memory_order_relaxed);
+    const size_t read = n0 - n;
+    const double us = (double)(b.QuadPart - a.QuadPart) * us_per_tick;
+    const double mbps = us > 0 ? (double)read / us : 1e9;
+    const bool   slow = mbps < kUpSlowMBps;
+#ifdef WWMI_DEBUG
+    {
+        static std::atomic<int> logged{ 0 };
+        if (g_debug && (slow || logged.load(std::memory_order_relaxed) < 6) && logged.fetch_add(1) < 24)
+            logger::write("TEXUP-PROBE %zu B of the game's upload memory in %.1f us: %.0f MB/s%s", read, us, mbps,
+                slow ? " -- slow" : "");
+    }
+#endif
+    if (!slow) {
+        g_up_slow_run.store(0, std::memory_order_relaxed);
+        return false;
+    }
+    if (g_up_slow_run.fetch_add(1, std::memory_order_relaxed) + 1 >= 3 && !g_up_gpu.exchange(true))
+        logger::write("TEXUP: the processor reads the game's upload memory at %.1f MB/s (Resizable BAR puts it in video memory) -- "
+                      "texture uploads are hashed from a GPU copy from now on",
+            mbps);
+    return true;
+}
+
+static bool HashUploadOnGpu(command_list* cl, ID3D12Resource* src, uint64_t off, uint64_t span, ID3D12Resource* dst, uint32_t sub,
+    const uint8_t* compare_from, const TexAssetLayout& L)
+{
+    if (sub && (!g_texovr_ready || !g_texlod_cache)) return true;
+    auto* dev = reinterpret_cast<ID3D12Device*>(cl->get_device()->get_native());
+    auto* d3dcl = reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native());
+    if (!dev || !d3dcl) return false;
+    uint32_t cpu_crc = 0;
+    if (compare_from) {
+        const std::vector<uint8_t> tight = TightFromUpload(compare_from, L.pitch, L);
+        cpu_crc = PortApi::Crc32c(0, tight.data(), tight.size());
+    }
+    if (!g_tex_readback.ScheduleUpload(dev, cl, d3dcl, src, off, span, dst, sub, compare_from ? &cpu_crc : nullptr)) return false;
+    RemovalPin::Ours(d3dcl, "tex-upload-readback");
+    g_ts_up_gpu.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 bool on_copy_buffer_to_texture(command_list* cl, resource source, uint64_t source_offset, uint32_t /*row_length*/, uint32_t /*slice_height*/, resource dest, uint32_t dest_subresource, const subresource_box* dst_box)
@@ -1490,6 +1698,13 @@ bool on_copy_buffer_to_texture(command_list* cl, resource source, uint64_t sourc
         const uint32_t h0 = TexHashOf(reinterpret_cast<uint64_t>(dst));
         if (h0 && !TexRuleHashFor(h0) && !TexCrawlOn()) return false;
     }
+    const uint64_t         span = (uint64_t)L.pitch * (L.rows - 1) + L.tight_row;
+    std::atomic<uint32_t>& arrivals = dest_subresource == 0 ? g_ts_buf_mip0 : g_ts_buf_mipk;
+    if (!g_tex_upload_gpu && g_up_gpu.load(std::memory_order_relaxed) &&
+        HashUploadOnGpu(cl, srcRes, source_offset, span, dst, dest_subresource, nullptr, L)) {
+        arrivals.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     void*   ptr = nullptr;
     HRESULT map_hr;
     {
@@ -1497,11 +1712,15 @@ bool on_copy_buffer_to_texture(command_list* cl, resource source, uint64_t sourc
         map_hr = srcRes->Map(0, nullptr, &ptr);
     }
     if (SUCCEEDED(map_hr) && ptr) {
-        (dest_subresource == 0 ? g_ts_buf_mip0 : g_ts_buf_mipk).fetch_add(1, std::memory_order_relaxed);
-        if (dest_subresource == 0)
-            TexHashFromUpload(dst, (const uint8_t*)ptr + source_offset, 0 /*256-aligned*/);
-        else
-            TexMipIdentityFromUpload(dst, dest_subresource, (const uint8_t*)ptr + source_offset);
+        arrivals.fetch_add(1, std::memory_order_relaxed);
+        const uint8_t* up = (const uint8_t*)ptr + source_offset;
+        const bool     gpu = g_tex_upload_gpu || UploadReadSlow(up, span);
+        if (!gpu || !HashUploadOnGpu(cl, srcRes, source_offset, span, dst, dest_subresource, g_tex_upload_gpu ? up : nullptr, L)) {
+            if (dest_subresource == 0)
+                TexHashFromUpload(dst, up, 0 /*256-aligned*/);
+            else
+                TexMipIdentityFromUpload(dst, dest_subresource, up);
+        }
         PROF(PROF_CB_Map);
         srcRes->Unmap(0, nullptr);
     }

@@ -5,6 +5,9 @@
 #include <cstddef>
 #include <cstdio>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 class FrameAnalysisContext;
@@ -20,6 +23,7 @@ void SetFrameContext(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Com
     DXGI_FORMAT rt_format, DXGI_FORMAT ds_format,
     ID3D12Resource* back_buffer, D3D12_RESOURCE_STATES back_buffer_state,
     void (*restore_game_state)(void*), void*           restore_user = nullptr);
+void SetGameWindow(void* hwnd);
 
 class DrawListScope {
 public:
@@ -169,9 +173,11 @@ void ForEachBufferResize(void (*cb)(unsigned hash, unsigned stride, unsigned cou
                              void* user),
     void* user);
 
-unsigned ModDeclaredShapeKeyHash(const wchar_t* ns);
-
-unsigned ModDeclaredShapeKeySectionHash(const wchar_t* ns, const wchar_t* which);
+struct ShapeKeySet {
+    unsigned cb;
+    unsigned scale;
+};
+std::vector<ShapeKeySet> ModDeclaredShapeKeySets(const wchar_t* ns);
 
 bool TextureOverrideDeclaresHash(unsigned hash);
 
@@ -255,22 +261,53 @@ ID3D12Resource* SelectTextureOverride(uint32_t texture_hash, bool* cacheable = n
 ID3D12Resource* SelectTextureOverrideNs(uint32_t texture_hash, const wchar_t* ns, bool* cacheable = nullptr);
 bool            TextureOverrideInNs(uint32_t texture_hash, const wchar_t* ns);
 uint32_t        SwitchOfResource(const wchar_t* res_fq);
-// Every .dds [Resource*] of this namespace not yet loaded; and load one now, as its first assignment would.
-void ForEachUnsubstantiatedTexture(const wchar_t* ns, void (*cb)(const wchar_t* fq_name, const wchar_t* filename, void* user),
-    void*                                         user);
-bool SubstantiateTexture(const wchar_t* fq_name);
 struct DeferredTexture {
     std::wstring fq_name;
     std::wstring filename;
     unsigned     bind_flags;
     unsigned     misc_flags;
     bool         force_srgb;
+    unsigned     maxsize = 0; // the loader's: mips larger than this are skipped; 0 = all
 };
-void            BeginDeferredTextures(const wchar_t* ns, std::vector<DeferredTexture>& out);
+// The first time a draw's slot asks for a .dds [Resource] not yet loaded, `sink` is offered it, on the drawing thread
+// under the engine lock. Taken: the slot gets null until PublishDeferredTexture. Not taken, or no sink: it loads
+// there, as on DX11.
+void            SetTextureDeferral(bool (*sink)(const DeferredTexture& t, void* user), void* user);
 ID3D11Resource* LoadDeferredTexture(const DeferredTexture& t);
 bool            DeferredTexturePending(const DeferredTexture& t, unsigned generation);
 // Accepts ownership only on success. A null resource completes a failed load.
 bool            PublishDeferredTexture(const wchar_t* fq_name, ID3D11Resource* res, unsigned generation);
+// This thread's section run bound a slot to a texture still loading in the background, whatever its namespace: its
+// null is "not yet". Cleared as a section run starts.
+void ClearBoundLoading();
+bool BoundLoading();
+// Every .dds [Resource*] of this namespace that holds a loaded 2D texture: how to load it again, and it (a reference
+// held for the caller).
+struct LoadedTexture {
+    DeferredTexture load;
+    ID3D11Resource* res;
+    ID3D12Resource* dx12;
+};
+inline std::wstring NamespaceOfResource(const std::wstring& fq_name) // Resource\<namespace>\<name>
+{
+    const size_t a = fq_name.find(L'\\');
+    const size_t b = fq_name.rfind(L'\\');
+    return a == std::wstring::npos || b <= a ? std::wstring() : fq_name.substr(a + 1, b - a - 1);
+}
+void LoadedTexturesOf(const wchar_t* ns, std::vector<LoadedTexture>& out);
+void LoadedTexturesAll(std::vector<LoadedTexture>& out); // ... of every namespace
+// An empty texture made as LoadDeferredTexture would make `like`'s, with one level of this size and format.
+ID3D11Resource* CreateEmptyTexture(const DeferredTexture& like, unsigned width, unsigned height, DXGI_FORMAT format);
+// The [Resource] holds `fresh` instead of `was`, if it still holds `was`; the caller's reference on `fresh` moves in.
+bool SwapTextureResource(const wchar_t* fq_name, ID3D11Resource* was, ID3D11Resource* fresh);
+// ... or nothing, as before its first load: the next draw that asks for it loads it again.
+bool EvictTexture(const wchar_t* fq_name, ID3D11Resource* was);
+// After a batch of those: every other [Resource] that took an old texture by `= ref` holds its new one, and every view
+// a resource copy cached for an old one is dropped -- a copy runs again only when its mod draws, so for a mod off
+// screen the view kept the old texture alive. A null new: evicted, views only.
+void ReleaseOldTextures(const std::unordered_map<ID3D11Resource*, ID3D11Resource*>& old_to_new);
+// Of these ([Resource] name, its texture), the textures another [Resource] holds by `= ref`: evicting one frees nothing.
+std::unordered_set<ID3D11Resource*> HeldByRef(const std::vector<std::pair<std::wstring, ID3D11Resource*>>& textures);
 
 void TextureOverrideSection(uint32_t texture_hash, wchar_t* out, size_t out_chars);
 

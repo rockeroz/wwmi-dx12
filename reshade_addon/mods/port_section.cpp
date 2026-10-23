@@ -66,6 +66,7 @@ bool PortRunSection(const std::wstring& fq_section, PortHooks& hk,
         if (!_s.exchange(true)) logger::write("PORTDRAW stage %d: %s", (n), (msg)); \
     } while (0)
     PORT_STAGE(1, "entered PortRunSection");
+    PortApi::ClearBoundLoading();
 
     struct Ctx {
         std::wstring             fq; // the section being executed, for the K8 trace

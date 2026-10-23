@@ -840,6 +840,7 @@ void STDMETHODCALLTYPE Dx12Context::CopyResource(ID3D11Resource* pDst, ID3D11Res
                 (unsigned long long)s->dx12->GetDesc().Width,
                 n, s_copy_nocl.load(std::memory_order_relaxed));
     }
+    FlushPendingUploads(b.cl);
     bool cs = false;
     if (d->dim == D3D11_RESOURCE_DIMENSION_BUFFER && s->dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
         GpuBracket   _gt(b.cl, GT_ShimCopyCs);
@@ -932,6 +933,7 @@ void STDMETHODCALLTYPE Dx12Context::CopySubresourceRegion(ID3D11Resource* pDst, 
         NotImplOnce("CopySubresourceRegion with a resource that is not one of our wrappers");
         return;
     }
+    FlushPendingUploads(b.cl);
     TransitionResource(b.cl, pSrc, D3D12_RESOURCE_STATE_COPY_SOURCE);
     TransitionResource(b.cl, pDst, D3D12_RESOURCE_STATE_COPY_DEST);
 
@@ -1028,6 +1030,7 @@ void STDMETHODCALLTYPE Dx12Context::ResolveSubresource(ID3D11Resource* pDst, UIN
         NotImplOnce("ResolveSubresource with a resource that is not one of our wrappers");
         return;
     }
+    FlushPendingUploads(b.cl);
     TransitionResource(b.cl, pSrc, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
     TransitionResource(b.cl, pDst, D3D12_RESOURCE_STATE_RESOLVE_DEST);
     b.cl->ResolveSubresource(d->dx12, DstSubresource, s->dx12, SrcSubresource, Format);
@@ -1042,6 +1045,7 @@ void STDMETHODCALLTYPE Dx12Context::ClearRenderTargetView(ID3D11RenderTargetView
         NotImplOnce("ClearRenderTargetView (no command list or not ours)");
         return;
     }
+    FlushPendingUploads(b.cl);
     TransitionResource(b.cl, v->res, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const FLOAT black[4] = { 0, 0, 0, 0 };
     b.cl->ClearRenderTargetView(v->cpu, ColorRGBA ? ColorRGBA : black, 0, nullptr);
@@ -1056,6 +1060,7 @@ void STDMETHODCALLTYPE Dx12Context::ClearDepthStencilView(ID3D11DepthStencilView
         NotImplOnce("ClearDepthStencilView (no command list or not ours)");
         return;
     }
+    FlushPendingUploads(b.cl);
     TransitionResource(b.cl, v->res, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     D3D12_CLEAR_FLAGS f = (D3D12_CLEAR_FLAGS)0;
     if (ClearFlags & D3D11_CLEAR_DEPTH) f |= D3D12_CLEAR_FLAG_DEPTH;
@@ -1072,6 +1077,7 @@ bool PrepareUavClear(ID3D11UnorderedAccessView* uav, WrapView** out_view,
     const Dx12Bridge& b = GetDx12Bridge();
     WrapView*         v = AsWrapView(uav);
     if (!b.cl || !b.device || !v || !v->wres || !v->wres->dx12) return false;
+    FlushPendingUploads(b.cl);
 
     D3D12_CPU_DESCRIPTOR_HANDLE src = v->cpu;
     *scratch_slot = UINT_MAX;

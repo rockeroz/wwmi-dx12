@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <unordered_set>
 #include <reshade.hpp>
 #include "../hooks/cmd_state.h" // CmdState
 #include "../mods/wwmi_mod.h"   // WwmiMod::Component
@@ -118,6 +119,10 @@ bool RtNoteIndirectRays(reshade::api::command_list* cmd_list, reshade::api::reso
 // A raster draw of mod component (mod, comp) stamped its texture over the game's texture `game` (section_ps_stamp.cpp):
 // M4 puts the same texture in that section's ray tracing material table.
 void RtNoteSlotTexture(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRIPTOR_HANDLE src, ID3D12Resource* mod_res);
+// The texture budget (tex_replace.cpp) is about to let go of these mod textures, or just did: no RT material table may
+// be given their views again. A stamp of a mod off screen in raster stays usable kSlotTexAge frames, and the
+// character can still be in the rays (reflections) meanwhile. The raster draw notes the new view on its next draw.
+void RtForgetModTextures(const std::unordered_set<ID3D12Resource*>& mod_res);
 // ...and a game texture it reads unstamped (diagnostic: RTM4 tex tells these from textures the raster never reads).
 void RtNoteKeptTexture(int mod, int comp, ID3D12Resource* game, ID3D12Resource* swapped);
 // The index count of the sub-draw whose binds are noted next on this thread (a component's material table can hold one

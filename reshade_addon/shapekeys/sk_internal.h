@@ -62,8 +62,9 @@ int SubmitIndexOf(uint32_t frame, const void* list);
 // Lists seen by on_execute_command_list, for the SHAPEKEY-ORDER line. Counted only under g_debug.
 extern std::atomic<unsigned long long> g_sub_seen;
 
-unsigned SkModCbHash(int i);
-unsigned SkModScaleHash(int i);
+bool     SkModDeclaresCb(int i, unsigned cb);
+unsigned SkModScaleFor(int i, unsigned cb);
+unsigned SkModCbFor(int i, unsigned u0hash);
 
 struct SkClearNote {
     const void* cl = nullptr;

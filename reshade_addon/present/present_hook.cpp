@@ -14,6 +14,9 @@
 #include "../instrumentation/perf_monitor.h"
 #include "../hud/uid_hide.h"
 #include "../rt/rt_hooks.h" // RtPresentTick
+#include "../textures/tex_replace.h"
+#include "../textures/tex_budget.h"
+#include "../textures/tex_encode.h"
 
 static bool GameKeyDown(int vk)
 {
@@ -31,6 +34,18 @@ void on_present_body(command_queue* queue, swapchain* sc)
 {
     HotPath::FrameEnd();
     g_perf.FrameEnd();
+#ifdef WWMI_DEBUG
+    {
+        static LARGE_INTEGER s_freq{};
+        static LARGE_INTEGER s_last{};
+        LARGE_INTEGER        now;
+        QueryPerformanceCounter(&now);
+        if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
+        const double ms = s_last.QuadPart ? (double)(now.QuadPart - s_last.QuadPart) * 1000.0 / (double)s_freq.QuadPart : 0.0;
+        if (ms >= 100.0) logger::write("FRAME-SLOW f=%u: %.0f ms since the previous present", (unsigned)g_frame_id, ms);
+        s_last = now;
+    }
+#endif
     PROF(PROF_Present);
     const uint32_t me = GetCurrentThreadId();
     g_presenter_tid.store(me, std::memory_order_relaxed);
@@ -152,6 +167,10 @@ static void FrameStep(command_queue* queue, swapchain* sc, bool at_present)
     StartRemovalWatchdog(sc);
     g_buffer_reloc.Sweep(sc->get_device());
     ModTexturesTick();
+    g_tex_replace.Tick((ID3D12CommandQueue*)queue->get_native());
+    g_tex_budget.Tick();
+    g_tex_encode.Tick((ID3D12CommandQueue*)queue->get_native());
+    g_tex_encoder.Tick();
     if (g_wwmi_geom) {
         static int s_gl = 0;
         uint32_t   gc = g_wwmi_geom_count.load();

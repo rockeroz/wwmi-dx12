@@ -156,6 +156,7 @@ bool CopyBufferCs(ID3D12GraphicsCommandList* cl, struct WrapResource* dst, UINT6
 void     QueueUpload(ID3D11Resource* dst, const void* data, size_t bytes, uint64_t seq = 0);
 void     QueueTextureUpload(ID3D11Resource* dst, const D3D11_SUBRESOURCE_DATA* data, UINT subresources, uint64_t seq = 0);
 void     FlushPendingUploads(ID3D12GraphicsCommandList* cl);
+bool     UploadPendingFor(ID3D11Resource* res); // its copy is not recorded on a command list yet
 uint64_t NextUploadSeq();
 bool     ListHoldsUpload(ID3D12GraphicsCommandList* cl, const struct WrapResource* wr);
 

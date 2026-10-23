@@ -1,5 +1,6 @@
 #pragma once
 #include <d3d12.h>
+#include <intrin.h>
 #include <atomic>
 #include <mutex>
 #include <cstdint>
@@ -42,13 +43,16 @@ struct FlatHeapMap {
         uint32_t                     frame = 0;    // g_frame_id when written
         uint8_t                      src_kind = 0; // ResInfo::wrote_src
     };
+    static constexpr uint32_t kMarkShift = 6; // a mark bit per block of 64 slots
     struct Entry {
-        std::atomic<uint64_t> id{ 0 };        // heap handle; 0 = free, kDead = heap destroyed, array not yet freed
-        std::atomic<Slot*>    arr{ nullptr }; // its flat slot array; null for a heap that holds no views of ours (samplers, RTV, DSV)
-        std::atomic<uint32_t> sz{ 0 };        // its length (NumDescriptors); 0 with a null array
-        std::atomic<uint8_t>  vis{ 0 };       // 1 = shader-visible
-        std::atomic<uint64_t> lo{ 0 };        // its CPU descriptor handle start
+        std::atomic<uint64_t>               id{ 0 };          // heap handle; 0 = free, kDead = heap destroyed, array not yet freed
+        std::atomic<Slot*>                  arr{ nullptr };   // its flat slot array; null for a heap that holds no views of ours (samplers, RTV, DSV)
+        std::atomic<std::atomic<uint64_t>*> marks{ nullptr }; // with arr: a set bit = its block may hold a stamped slot
+        std::atomic<uint32_t>               sz{ 0 };          // its length (NumDescriptors); 0 with a null array
+        std::atomic<uint8_t>                vis{ 0 };         // 1 = shader-visible
+        std::atomic<uint64_t>               lo{ 0 };          // its CPU descriptor handle start
     };
+    static uint32_t MarkWords(uint32_t n) { return (n + (64u << kMarkShift) - 1) / (64u << kMarkShift); }
     struct Block {
         Entry               e[32];
         std::atomic<Block*> next{ nullptr };
@@ -60,9 +64,10 @@ struct FlatHeapMap {
     std::mutex                      add_mtx;                // adding / retiring a heap (rare)
     std::atomic<void (*)(uint64_t)> retire_hook{ nullptr }; // told when a heap is retired (outside add_mtx)
     struct Grave {
-        Entry*   e;
-        Slot*    arr;
-        uint64_t t;
+        Entry*                 e;
+        Slot*                  arr;
+        std::atomic<uint64_t>* marks;
+        uint64_t               t;
     };
     std::vector<Grave> graves; // under add_mtx
 
@@ -97,6 +102,7 @@ struct FlatHeapMap {
                 continue;
             }
             delete[] graves[i].arr;
+            delete[] graves[i].marks;
             graves[i].e->id.store(0, std::memory_order_release);
             graves[i] = graves.back();
             graves.pop_back();
@@ -112,7 +118,7 @@ struct FlatHeapMap {
             Slot* arr = e->arr.load(std::memory_order_relaxed);
             e->id.store(kDead, std::memory_order_release); // lookups miss from here on
             destroyed.fetch_add(1, std::memory_order_relaxed);
-            graves.push_back({ e, arr, GetTickCount64() });
+            graves.push_back({ e, arr, e->marks.load(std::memory_order_relaxed), GetTickCount64() });
             bury_due(GetTickCount64());
         }
         if (auto h = retire_hook.load(std::memory_order_acquire)) h(heap);
@@ -134,8 +140,13 @@ struct FlatHeapMap {
                     rejected.fetch_add(1, std::memory_order_relaxed);
                     return nullptr;
                 }
-                Slot* arr = n ? new (std::nothrow) Slot[n]() : nullptr;
-                if (n && !arr) return nullptr;
+                Slot*                  arr = n ? new (std::nothrow) Slot[n]() : nullptr;
+                std::atomic<uint64_t>* marks = n ? new (std::nothrow) std::atomic<uint64_t>[MarkWords(n)]() : nullptr;
+                if (n && (!arr || !marks)) {
+                    delete[] arr;
+                    delete[] marks;
+                    return nullptr;
+                }
                 Entry* f = scan([](Entry& x) { return x.id.load(std::memory_order_relaxed) == 0; });
                 if (!f) {
                     Block* b = &head;
@@ -149,6 +160,7 @@ struct FlatHeapMap {
                 f->lo.store(reinterpret_cast<ID3D12DescriptorHeap*>(heap)->GetCPUDescriptorHandleForHeapStart().ptr,
                     std::memory_order_relaxed);
                 f->arr.store(arr, std::memory_order_relaxed);
+                f->marks.store(marks, std::memory_order_relaxed);
                 f->id.store(heap, std::memory_order_release); // publish LAST
                 published.fetch_add(1, std::memory_order_acq_rel);
                 e = f;
@@ -203,12 +215,54 @@ struct FlatHeapMap {
         if (p) p->seq.store(0, std::memory_order_release);
     }
     void erase(const HeapKey& k) { erase_at(slot(k.heap, k.offset, false)); }
+    // After a slot's swapped is set: its block marked, after the store, so a walk that unmarks it before looking sees it.
+    static void mark(Entry* e, uint32_t offset)
+    {
+        std::atomic<uint64_t>* m = e ? e->marks.load(std::memory_order_relaxed) : nullptr;
+        if (m) m[offset >> (kMarkShift + 6)].fetch_or(1ull << ((offset >> kMarkShift) & 63), std::memory_order_release);
+    }
     void set_swapped(const HeapKey& k, ID3D12Resource* r)
     {
-        Slot* p = slot(k.heap, k.offset, false);
+        Entry* e = entry_of(k.heap);
+        Slot*  p = at(e, k.offset);
         if (!p) return;
         p->miss_frame = 0; // a stamp supersedes an earlier miss on the slot
         p->swapped.store(r, std::memory_order_release);
+        if (r) mark(e, k.offset);
+    }
+    // f(heap, cpu_start, shader_visible, offset, slot) for every slot holding a stamp, found through the marks: a
+    // block is unmarked before it is looked at and marked again if a stamp is left in it.
+    template <class F>
+    void for_each_stamped(F f)
+    {
+        scan([&](Entry& e) {
+            const uint64_t h = e.id.load(std::memory_order_acquire);
+            if (h <= kDead) return false;
+            Slot*                  arr = e.arr.load(std::memory_order_relaxed);
+            std::atomic<uint64_t>* marks = e.marks.load(std::memory_order_relaxed);
+            const uint32_t         n = e.sz.load(std::memory_order_relaxed);
+            if (!arr || !marks) return false;
+            const uint64_t lo = e.lo.load(std::memory_order_relaxed);
+            const bool     vis = e.vis.load(std::memory_order_relaxed) != 0;
+            for (uint32_t w = 0, words = MarkWords(n); w < words; ++w) {
+                for (uint64_t bits = marks[w].load(std::memory_order_acquire); bits; bits &= bits - 1) {
+                    unsigned long b = 0;
+                    _BitScanForward64(&b, bits);
+                    const uint64_t bit = 1ull << b;
+                    marks[w].fetch_and(~bit, std::memory_order_acq_rel);
+                    const uint32_t first = ((w << 6) + (uint32_t)b) << kMarkShift;
+                    const uint32_t last = (std::min)(first + (1u << kMarkShift), n);
+                    bool           left = false;
+                    for (uint32_t o = first; o < last; ++o) {
+                        if (!arr[o].swapped.load(std::memory_order_acquire)) continue;
+                        f(h, lo, vis, o, &arr[o]);
+                        left = left || arr[o].swapped.load(std::memory_order_acquire);
+                    }
+                    if (left) marks[w].fetch_or(bit, std::memory_order_release);
+                }
+            }
+            return false;
+        });
     }
     void set_miss(const HeapKey& k, uint32_t frame)
     {

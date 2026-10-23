@@ -35,7 +35,7 @@ Si otra ruta aún requiere `TEXEAGER-NOW`, esa línea ahora mide por separado la
 carga y preparación síncrona del recurso. Esto permite comprobar si queda una
 dependencia fuera del grupo preparado, sin atribuirle el tiempo del trabajador.
 
-La prueba Windows `rt_tex_eager_test` usa el trabajador real con callbacks de
+La prueba Windows `rt_tex_eager_test` (sustituida por `rt_tex_defer_test`, ver abajo) usaba el trabajador real con callbacks de
 carga controlados en CPU: comprueba que no se espera a I/O desde el dibujo,
 que el sondeo repetido no duplica tareas, que los errores finalizan, que una
 recarga no pierde el estado pendiente nuevo y que se liberan recursos obsoletos.
@@ -45,3 +45,31 @@ Para comparar, cambiar varias veces entre los mismos personajes y conservar
 `wwmi_dx12_addon.log` y `rt_observe.log`. Revisar tanto la primera aparición como
 los cambios posteriores. Las compilaciones de pipelines del juego y otros
 costes de primera aparición no se declaran resueltos por este cambio.
+
+## Cambio al integrar 2026.10.4
+
+Upstream eliminó `tex_eager` y lo sustituyó por `TexDeferWorker` (`tex_defer.*`): cada textura se carga en segundo
+plano la primera vez que un dibujo la pide, no todo el namespace en el primer reclamo. Por eso las texturas de
+outfits sin usar no ocupan VRAM, y el presupuesto de texturas (`tex_budget`/`tex_replace`) puede bajarlas o
+descargarlas cuando no están en pantalla.
+
+Lo que se conservó de esta rama:
+
+- `PublishDeferredTexture(..., generation)` y `DeferredTexturePending`: el trabajador nuevo publica contra la
+  generación que pidió la carga, publica `null` en un fallo (sin reintento síncrono) y no carga una textura que una
+  copia ya cargó en primer plano.
+- `ModTexturesReady` sigue reteniendo el dibujo del juego mientras una textura del mod se carga, ahora con
+  `g_tex_defer.Pending(mod)`. Como las cargas se piden al ejecutar la sección, la primera ejecución del mod pasa
+  (con las texturas del juego en los slots que aún cargan) y los dibujos siguientes esperan hasta que todo lo pedido
+  se publique. Una textura descargada por el presupuesto vuelve a pasar por esta espera al reaparecer.
+- `TEXEAGER-NOW` se llama ahora `TEXDEFER-NOW` y mantiene la medición del tiempo de carga síncrona.
+
+`RtForgetModTextures` (llamado desde `tex_replace` al bajar, descargar o liberar una textura de mod) borra los
+stamps de RT que apuntan a ella, para que `M4Apply` no copie a una tabla de materiales RT el descriptor de una
+textura liberada. Además `SlotTexFor`/`RasterSwapFor` marcan como usada una textura que los rayos leen, para que
+el presupuesto no la cuente como fuera de vista mientras el personaje aparece solo en reflejos.
+
+La prueba Windows `rt_tex_defer_test` usa el `TexDeferWorker` real con callbacks de carga controlados en CPU:
+comprueba que la carga no corre en el hilo de dibujo, que el mod queda pendiente desde que se pide, que una
+textura ya cargada no se vuelve a cargar, que los fallos terminan, que una carga de una generación anterior no se
+publica y que no quedan recursos vivos.

@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <reshade.hpp>
@@ -54,3 +55,28 @@ struct UnstampTally {
 };
 UnstampTally UnstampAll(void (*hold)(uint64_t res));
 void         SetAddonDisabled(bool dis);
+
+// A mod texture replaced by another: what the slots stamped with it get instead.
+struct StampMove {
+    ID3D12Resource*             to;
+    D3D12_CPU_DESCRIPTOR_HANDLE to_srv;
+    D3D12_CPU_DESCRIPTOR_HANDLE from_srv;
+};
+struct StampTally {
+    unsigned moved_cpu_only = 0;
+    unsigned moved_visible = 0;
+    unsigned restored = 0; // the game's descriptor back
+    unsigned nulled = 0;   // a null SRV: nothing of the game's to put back
+    unsigned raced = 0;    // the game wrote the slot between the look and the write
+    unsigned backups = 0;  // unstamp backups now naming the new SRV
+};
+// Every slot stamped with a key of `moves` holds its `to` instead; the unstamp backups follow.
+StampTally MoveStamps(const std::unordered_map<ID3D12Resource*, StampMove>& moves);
+// Mod textures whose last reference dropped, before the GPU fence frees them: no slot may keep one. Called after
+// they left the texture store, so a stamp after the walk sees that (StampedStoreTexture).
+StampTally UnstampDying(const std::unordered_set<ID3D12Resource*>& dying);
+// Drawing threads, right after stamping a texture taken from the store into a slot: if the store let go of it
+// meanwhile, the slot is given back as UnstampDying would have.
+void StampedStoreTexture(uint64_t heap, uint32_t offset, ID3D12Resource* res);
+// A null view of a DXIL resource kind (0 = 2D), in a CPU-only heap of its own.
+D3D12_CPU_DESCRIPTOR_HANDLE NullSrvDescriptor(ID3D12Device* dev, uint8_t kind);

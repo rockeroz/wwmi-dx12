@@ -11,6 +11,9 @@
 #include "../textures/texture_module.h"
 #include "../textures/tex_lod.h"       // TexLodSetResemblance (A13), TexLodSetCache (A14)
 #include "../textures/tex_crawl.h"     // the gallery crawl (A15)
+#include "../textures/tex_replace.h"   // the replace test (C8-C10)
+#include "../textures/tex_encode.h"    // the encode test (C11)
+#include "../textures/tex_gc.h"        // the video memory reading under A19
 #include "../hooks/resource_tracker.h" // SetAddonDisabled (A1)
 #include "../../src/mod_loader.h"
 #include "../instrumentation/morph_dump.h"
@@ -73,17 +76,29 @@ bool NButton(const char* id, const char* label)
     ImGui::PopTextWrapPos();
     return pressed;
 }
-static bool NSliderInt(const char* id, const char* label, int* v, int lo, int hi)
+static bool NSliderInt(const char* id, const char* label, int* v, int lo, int hi, const char* fmt = "%d")
 {
     char buf[352];
     IdLabel(buf, sizeof(buf), id, label);
-    return ImGui::SliderInt(buf, v, lo, hi);
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextUnformatted(buf);
+    ImGui::PopTextWrapPos();
+    ImGui::PushID(id);
+    const bool changed = ImGui::SliderInt("##v", v, lo, hi, fmt);
+    ImGui::PopID();
+    return changed;
 }
 static bool NSliderFloat(const char* id, const char* label, float* v, float lo, float hi, const char* fmt = "%.3f")
 {
     char buf[352];
     IdLabel(buf, sizeof(buf), id, label);
-    return ImGui::SliderFloat(buf, v, lo, hi, fmt);
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextUnformatted(buf);
+    ImGui::PopTextWrapPos();
+    ImGui::PushID(id);
+    const bool changed = ImGui::SliderFloat("##v", v, lo, hi, fmt);
+    ImGui::PopID();
+    return changed;
 }
 static bool NInputInt(const char* id, const char* label, int* v)
 {
@@ -498,6 +513,37 @@ void DrawOverlay(effect_runtime*)
     ImGui::TextDisabled("  on = no stutter when a modded character first shows; its own textures appear a moment later.\n"
                         "  off = the mod's textures from the first frame; the game pauses briefly while they load.\n"
                         "  Applies to characters that show after the change.");
+    if (NSliderInt("A19", "Mod texture budget", &g_tex_mod_budget, 0, kTexBudgetSteps - 1, TexBudgetName(g_tex_mod_budget)) &&
+        !g_addon_ini_path.empty())
+        WritePrivateProfileStringW(L"wwmi-dx12", L"tex_mod_budget", std::to_wstring(g_tex_mod_budget).c_str(),
+            g_addon_ini_path.c_str());
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("  How much video memory mod textures may take. Auto keeps them within what the game leaves free: "
+                        "while they fit nothing changes; when memory runs short, or a texture on screen needs room to come "
+                        "back sharp, textures not on screen go to a lower size, the least used first, and out if that is not "
+                        "enough. A size caps each mod as well. Original never changes a texture.");
+    {
+        const TexCollector::Reading& r = g_tex_gc.Now();
+        if (r.valid) {
+            ImGui::TextDisabled("  Video memory: %.1f of %.1f GB in use", (double)r.used / 1073741824.0,
+                (double)r.budget / 1073741824.0);
+            ImGui::TextDisabled("  Mod textures: %.1f of %.1f GB allowed", (double)r.mods / 1073741824.0,
+                (double)r.room / 1073741824.0);
+            if (g_tex_gc.Tight())
+                ImGui::TextColored({ 1, 1, 0, 1 }, TexCollects(g_tex_mod_budget) ?
+                    "  Short of video memory: mod textures not on screen are let go first." :
+                    "  Short of video memory: Auto would let go of mod textures not on screen.");
+        }
+    }
+    ImGui::PopTextWrapPos();
+    if (NCheckbox("A20", "Mod textures follow the game's distance sizes (experimental)", &g_tex_distance) &&
+        !g_addon_ini_path.empty())
+        WritePrivateProfileStringW(L"wwmi-dx12", L"tex_distance", g_tex_distance ? L"1" : L"0", g_addon_ini_path.c_str());
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("  on = where the game draws a character's own texture a size or more down, as it does further from "
+                        "the camera, the mod's texture goes down as many sizes, and back up when the game's comes back. "
+                        "Saves video memory. With Auto or a size on A19.");
+    ImGui::PopTextWrapPos();
     if (NCheckbox("A16", "Mod buffers (meshes, shape keys) in video memory", &MigotoPort::g_buffers_in_vram) && !g_addon_ini_path.empty())
         WritePrivateProfileStringW(L"wwmi-dx12", L"buffers_in_vram", MigotoPort::g_buffers_in_vram ? L"1" : L"0",
             g_addon_ini_path.c_str());
@@ -703,6 +749,35 @@ void DrawOverlay(effect_runtime*)
         ImGui::TextColored(sc > 0 ? ImVec4(0, 1, 0, 1) : ImVec4(0.6f, 0.6f, 0.6f, 1), "  ps-tN stamps: %u", sc);
     }
     if (NButton("C5", "Texture target audit -> log (TEXAUDIT: per mod, targets never seen / never stamped)")) TexTargetAudit();
+    if (NButton("C8", "Replace test: load every texture of the mods on screen again and swap it in while they draw (TEXREPL) -- nothing on screen should change"))
+        g_tex_replace.Request(TexReplacer::Pass::Same);
+    if (NButton("C9", "Replace test: swap every texture of the mods on screen that has mips for a half-size copy; pressed again, back to full size (TEXREPL) -- slightly soft, then sharp"))
+        g_tex_replace.Request(g_tex_replace.Halved() ? TexReplacer::Pass::Full : TexReplacer::Pass::Half);
+    if (g_tex_replace.Halved()) ImGui::TextDisabled("  some textures are at half size: C9 brings them back");
+    {
+        bool stress = g_tex_replace.Stress();
+        if (NCheckbox("C10", "Replace test, repeated: C8 every 2 seconds", &stress)) g_tex_replace.SetStress(stress);
+    }
+    if (g_tex_replace.Busy()) ImGui::TextColored({ 1, 1, 0, 1 }, "  replacing textures...");
+    if (NButton("C11", "Encode test: make a half-size BC7 copy of every single-mip BC7 texture of the mods on screen on the graphics card, and log how long it took and how far it is from a plain half-size average (TEXENC) -- nothing on screen changes"))
+        g_tex_encode.Request();
+    if (g_tex_encode.Busy()) ImGui::TextColored({ 1, 1, 0, 1 }, "  encoding textures...");
+    {
+        int watch = (int)g_tex_watch_ms;
+        if (NSliderInt("C12", "Auto: how long a lowered texture is drawn, with nothing loading, before it comes back sharp (ms)",
+                &watch, 500, 5000)) {
+            g_tex_watch_ms = (unsigned)watch;
+            if (!g_addon_ini_path.empty())
+                WritePrivateProfileStringW(L"wwmi-dx12", L"tex_watch_ms", std::to_wstring(g_tex_watch_ms).c_str(), g_addon_ini_path.c_str());
+        }
+        int cap = (int)g_tex_vram_cap_mb;
+        if (NSliderInt("C13", "Auto: take the video memory budget as at most this (MB; 0 = what Windows gives), to try a smaller card",
+                &cap, 0, 16384)) {
+            g_tex_vram_cap_mb = (unsigned)cap;
+            if (!g_addon_ini_path.empty())
+                WritePrivateProfileStringW(L"wwmi-dx12", L"tex_vram_cap_mb", std::to_wstring(g_tex_vram_cap_mb).c_str(), g_addon_ini_path.c_str());
+        }
+    }
     {
         uint32_t rc = g_rabbitfx_tex_count.load();
         ImGui::TextColored(rc > 0 ? ImVec4(0, 1, 0, 1) : ImVec4(0.6f, 0.6f, 0.6f, 1), "  slot binds: %u", rc);
@@ -752,6 +827,7 @@ void DrawOverlay(effect_runtime*)
     NCheckbox("D12", "A/B: IGNORE learned LOD aliases -- still recorded (g_texlod_alias_off)", &g_texlod_alias_off);
     NCheckbox("D13", "Mip-exact aliases: a target's mips hashed as the residents they would be (g_mip_exact)", &g_mip_exact);
     NCheckbox("D15", "Dump degenerate LOD textures as they load or are found: <hash>.dds in DX12_Dumps\\degenerates, once each", &g_dump_degenerates);
+    NCheckbox("D16", "Hash every texture upload from a GPU copy, as with Resizable BAR, and check it against the processor's read (TEXSTREAM same/differ)", &g_tex_upload_gpu);
     {
         uint32_t tc = g_tex_inject_count.load();
         if (tc > 0)

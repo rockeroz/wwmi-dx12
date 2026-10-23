@@ -1,13 +1,14 @@
 #include "perf_monitor.h"
 #include <algorithm>
-#include <dxgi1_4.h>
-#include <psapi.h>
 #include <windows.h>
+#include <psapi.h>
 #include "diag.h"
+#include "vram_meter.h"
 #include "../addon_state.h"
 #include "../build_stamp.h"
 #include "../config.h"
 #include "../migoto/port_toggles.h"
+#include "../textures/tex_gc.h"
 #include "../../src/mod_loader.h"
 
 PerfMonitor g_perf;
@@ -283,35 +284,13 @@ void PerfMonitor::SampleMemory(int64_t now, int64_t freq)
     if (mem_last_ && now - mem_last_ < freq) return;
     mem_last_ = now;
 
-    static IDXGIAdapter3* s_adapter = nullptr;
-    static ID3D12Device*  s_adapter_for = nullptr;
-    if (g_d3d12_device && s_adapter_for != g_d3d12_device) {
-        if (s_adapter) {
-            s_adapter->Release();
-            s_adapter = nullptr;
-        }
-        s_adapter_for = g_d3d12_device;
-        IDXGIFactory4* fac = nullptr;
-        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&fac))) && fac) {
-            IDXGIAdapter1* a1 = nullptr;
-            if (SUCCEEDED(fac->EnumAdapterByLuid(g_d3d12_device->GetAdapterLuid(), IID_PPV_ARGS(&a1))) && a1) {
-                a1->QueryInterface(IID_PPV_ARGS(&s_adapter));
-                a1->Release();
-            }
-            fac->Release();
-        }
-    }
-    PerfMemory m;
-    if (s_adapter) {
-        DXGI_QUERY_VIDEO_MEMORY_INFO vi{};
-        if (SUCCEEDED(s_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vi))) {
-            m.vram_budget = vi.Budget;
-            m.vram_used = vi.CurrentUsage;
-        }
-        if (SUCCEEDED(s_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &vi))) {
-            m.shared_budget = vi.Budget;
-            m.shared_used = vi.CurrentUsage;
-        }
+    PerfMemory  m;
+    VramReading v;
+    if (g_vram.Read(&v)) {
+        m.vram_budget = v.budget;
+        m.vram_used = v.used;
+        m.shared_budget = v.shared_budget;
+        m.shared_used = v.shared_used;
     }
     PROCESS_MEMORY_COUNTERS_EX pmc{};
     pmc.cb = sizeof(pmc);
@@ -469,7 +448,17 @@ void PerfMonitor::WriteReport(FILE* f, double seconds) const
     std::fprintf(f, "  A12 Mod textures in the background: %s\n", OnOff(g_tex_deferred));
     std::fprintf(f, "  A13 Look-alike texture matches: %s\n", OnOff(g_texlod_resemblance));
     std::fprintf(f, "  A14 Texture match cache: %s\n", OnOff(g_texlod_cache));
-    std::fprintf(f, "  A16 Mod buffers in video memory: %s\n\n", OnOff(MigotoPort::g_buffers_in_vram));
+    std::fprintf(f, "  A16 Mod buffers in video memory: %s\n", OnOff(MigotoPort::g_buffers_in_vram));
+    std::fprintf(f, "  A19 Mod texture budget: %s\n", TexBudgetName(g_tex_mod_budget));
+    std::fprintf(f, "  A20 Mod textures follow the game's distance sizes: %s\n", OnOff(g_tex_distance));
+    {
+        const TexCollector::Reading& vr = g_tex_gc.Now();
+        if (vr.valid)
+            std::fprintf(f, "      video memory %.0f of %.0f MB in use, the game's %.0f MB, mod textures %.0f of %.0f MB allowed%s\n",
+                (double)vr.used / 1048576.0, (double)vr.budget / 1048576.0, (double)vr.game_now / 1048576.0, (double)vr.mods / 1048576.0,
+                (double)vr.room / 1048576.0, g_tex_gc.Tight() ? " (short)" : "");
+    }
+    std::fprintf(f, "\n");
 
     PortApi::GpuWorkTotals g1;
     PortApi::GetGpuWorkTotals(&g1);

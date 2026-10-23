@@ -99,6 +99,24 @@ inline bool                     g_present_on_game_queue = false;
 inline bool                     g_present_flush_immediate_first = true;
 inline bool                     g_ibhash_gpu_skip = false;
 inline bool                     g_tex_deferred = true; // mod textures load off the engine lock, vanilla until in (A12)
+inline int                      g_tex_mod_budget = 1;  // A19: 0 Original, 1 Auto, 2..5 Auto within 1024/512/256/128 MB per mod
+inline bool                     g_tex_distance = false; // A20: mod textures go down as far as the game draws its own (experimental)
+inline unsigned                 g_tex_watch_ms = 2000; // C12: drawn this long, nothing loading, before a lowered texture comes back
+inline unsigned                 g_tex_vram_cap_mb = 0; // C13: the video memory budget taken as at most this; 0 = Windows'
+inline constexpr int            kTexBudgetSteps = 6;
+inline const char* TexBudgetName(int step)
+{
+    static const char* const names[] = { "Original", "Auto", "1024 MB", "512 MB", "256 MB", "128 MB" };
+    return step >= 0 && step < kTexBudgetSteps ? names[step] : names[0];
+}
+inline unsigned TexBudgetMb(int step) // 0 = no per-mod ceiling
+{
+    return step >= 2 && step < kTexBudgetSteps ? 1024u >> (step - 2) : 0u;
+}
+inline bool TexCollects(int step) // the collector (tex_gc) runs
+{
+    return step >= 1 && step < kTexBudgetSteps;
+}
 inline std::atomic<uint64_t>    g_freeze_binds{ 0 };
 inline std::atomic<uint64_t>    g_x32_mid_total{ 0 };
 inline std::atomic<uint64_t>    g_x32_mid_skipped_total{ 0 };
@@ -131,6 +149,7 @@ inline bool                  g_texlod_alias_off = false;
 inline bool                  g_texlod_resemblance = true;  // A13 / ini lod_resemblance: look-alike LOD matches applied (always learned)
 inline bool                  g_texlod_cache = true;        // A14 / ini lod_cache: LOD matches learned, kept and used; off: none read, learned or written
 inline bool                  g_mip_exact = true;
+inline bool                  g_tex_upload_gpu = false;   // D16: every texture upload hashed from a GPU copy, checked against the processor's read
 inline bool                  g_dump_degenerates = false; // D15: each degenerate LOD low as <dump dir>\degenerates\<hash>.dds
 inline bool                  g_rabbitfx_tex = true;
 inline bool                  g_rabbitfx_tex_main = true;    // C4S: bind only into shaders that declare t0, t1 and t2

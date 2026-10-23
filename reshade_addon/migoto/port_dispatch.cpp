@@ -843,7 +843,7 @@ bool PureExpr(const CommandListEvaluatable* e, std::vector<const float*>& vars)
     return false;
 }
 
-bool PureSelectList(CommandList* cl, std::vector<CustomResource*>& srcs, std::vector<const float*>& vars)
+bool PureSelectList(CommandList* cl, std::vector<CustomResource*>& srcs, std::vector<const float*>& vars, int runs)
 {
     if (!cl) return true;
     if (cl->ResolveCommandList() != cl) return false;
@@ -851,8 +851,15 @@ bool PureSelectList(CommandList* cl, std::vector<CustomResource*>& srcs, std::ve
         CommandListCommand* c = MigotoPort::UnwrapObserved(cmd.get());
         if (auto* ic = dynamic_cast<IfCommand*>(c)) {
             if (!ic->expression.evaluatable || !PureExpr(ic->expression.evaluatable.get(), vars)) return false;
-            if (!PureSelectList(ic->true_commands_pre.get(), srcs, vars) || !PureSelectList(ic->true_commands_post.get(), srcs, vars) ||
-                !PureSelectList(ic->false_commands_pre.get(), srcs, vars) || !PureSelectList(ic->false_commands_post.get(), srcs, vars))
+            if (!PureSelectList(ic->true_commands_pre.get(), srcs, vars, runs) || !PureSelectList(ic->true_commands_post.get(), srcs, vars, runs) ||
+                !PureSelectList(ic->false_commands_pre.get(), srcs, vars, runs) || !PureSelectList(ic->false_commands_post.get(), srcs, vars, runs))
+                return false;
+            continue;
+        }
+        if (auto* re = dynamic_cast<RunExplicitCommandList*>(c)) {
+            if (runs >= 8 || !re->command_list_section) return false;
+            if (!PureSelectList(&re->command_list_section->command_list, srcs, vars, runs + 1) ||
+                !PureSelectList(&re->command_list_section->post_command_list, srcs, vars, runs + 1))
                 return false;
             continue;
         }
@@ -923,7 +930,7 @@ SelEntry& SelEntryOf(TextureOverride* to)
     if (it != s_sel.end()) return it->second;
     SelEntry                  e;
     std::vector<const float*> vars;
-    e.pure = PureSelectList(&to->command_list, e.srcs, vars) && PureSelectList(&to->post_command_list, e.srcs, vars);
+    e.pure = PureSelectList(&to->command_list, e.srcs, vars, 0) && PureSelectList(&to->post_command_list, e.srcs, vars, 0);
     if (!e.pure) {
         e.srcs.clear();
         SelectionWrites(&to->command_list, e.writes, e.param_writes, 0);

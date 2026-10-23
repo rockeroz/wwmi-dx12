@@ -27,6 +27,7 @@ constexpr float SSIM_MARGIN = 0.03f; // a look-alike under several targets swaps
 
 struct Entry {
     bool                  exact = false;
+    uint32_t              mip = 0; // an exact low's: the target's mip it is; 0 = not known
     std::vector<uint32_t> highs;
 };
 struct Slot {
@@ -265,13 +266,14 @@ void publish(uint32_t low)
     auto*       e = new Entry;
     const Link* best = nullptr;
     e->exact = exact(r);
+    if (e->exact) e->mip = r.links.front().mip;
     if (!e->exact) best = clear_best(r);
     if (best)
         e->highs.push_back(best->high);
     else
         for (const Link& k : r.links) e->highs.push_back(k.high);
     const Entry* was = entry_of(low);
-    if (was && was->exact == e->exact && was->highs == e->highs) {
+    if (was && was->exact == e->exact && was->mip == e->mip && was->highs == e->highs) {
         delete e;
         return;
     }
@@ -846,6 +848,11 @@ uint32_t TexLodLookup(uint32_t hash)
 uint32_t TexLodKnown(uint32_t hash)
 {
     return exact_high(entry_of(hash)); // ungated by the A/B: membership and dedupe, never a swap
+}
+unsigned TexLodMipOf(uint32_t hash)
+{
+    const Entry* e = entry_of(hash);
+    return e && e->exact ? e->mip : 0;
 }
 bool TexLodLinked(uint32_t hash)
 {

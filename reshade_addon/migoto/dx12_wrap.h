@@ -89,6 +89,9 @@ protected:
 void WrapResourceBorn();
 void WrapResourceDied();
 void RetireDx12Resource(ID3D12Resource* res);
+void SetRetireObserver(void (*fn)(ID3D12Resource* res)); // told of each, on the thread whose release it was
+void SetTextureUseObserver(void (*fn)(ID3D12Resource* res)); // a 2D texture bound for one of our draws or dispatches
+void NoteTextureUse(ID3D11Resource* res);                     // ... or a texture a mod's list assigns to a slot
 void RetireReadback(ID3D12Resource* res);
 void DisownBuffer(ID3D12Resource* res);
 

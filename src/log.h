@@ -1,5 +1,6 @@
 #pragma once
 #include <windows.h>
+#include <chrono>
 #include <cstdio>
 #include <ctime>
 #include <locale.h>
@@ -32,5 +33,10 @@ void report(_Printf_format_string_ const char* fmt, ...); // level 1, never rate
 
 void set_unlimited(bool on);
 bool unlimited();
+
+inline double ms_since(std::chrono::steady_clock::time_point t0) // for a line that says how long something took
+{
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
 
 } // namespace logger

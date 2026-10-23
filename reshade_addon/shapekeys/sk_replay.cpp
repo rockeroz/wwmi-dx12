@@ -142,11 +142,11 @@ static std::vector<SkPendingList> SkTakeOwnLists(const std::wstring& ns, int mod
 }
 
 // u0 from the mod's own declared hash when the dispatch left no live binding.
-static void SkOwnBufFallback(const std::wstring& ns, int mod_id, ID3D12Resource*& u0_res, unsigned& u0_bytes)
+static void SkOwnBufFallback(const std::wstring& ns, int mod_id, unsigned u0hash, ID3D12Resource*& u0_res, unsigned& u0_bytes)
 {
     {
         PROF(PROF_SK_OwnBuf);
-        const unsigned want = PortApi::ModDeclaredShapeKeyHash(ns.c_str());
+        const unsigned want = SkModCbFor(mod_id, u0hash);
         if (want) {
             ID3D12Resource* own = nullptr;
             unsigned        own_bytes = 0;
@@ -548,7 +548,7 @@ void RunShapeKeyPasses(const std::wstring& ns, int mod_id, ID3D12Resource* inst,
     if (g_sk_u0_clear) dr.u0_clear = SkZeroBinding(ns, inst, TargetClass::UnorderedAccessView, 0, cmd_list, "U0CLEAR");
     if (g_sk_u1_clear) dr.u1_clear = SkZeroBinding(ns, inst, TargetClass::UnorderedAccessView, 1, cmd_list, "U1CLEAR");
 
-    SkOwnBufFallback(ns, mod_id, u0_res, u0_bytes);
+    SkOwnBufFallback(ns, mod_id, lists.front().u0hash, u0_res, u0_bytes);
 
     SkRepublishBindings(ns, inst, mod_id, u0_res, u0_bytes);
 

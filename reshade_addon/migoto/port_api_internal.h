@@ -38,6 +38,10 @@ void RunSkelCopyUpdates();
 // A .dds the background loader has not published yet, loaded now: a copy or a compute bind is about to read it
 // (port_vars.cpp).
 void LoadDeferredNow(CustomResource* r);
+// ... and one a draw's slot is about to ask for, offered to the deferral sink if not loaded yet (port_vars.cpp).
+void DeferTexture(CustomResource* r);
+// ... and whether the background loader still has it.
+bool DeferredPending(CustomResource* r);
 
 // Every variable's value, the ini params and each custom shader's runs this frame, put back after a run that is to
 // leave none of its writes (port_vars.cpp). Caller holds the engine lock across both.

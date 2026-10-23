@@ -16,7 +16,9 @@
 #include "rabbitfx/pso_blend.h"           // RfxPatchWorkerStop
 #include "textures/texture_module.h"      // g_tex_lod_worker
 #include "textures/tex_crawl.h"
-#include "textures/tex_eager.h"
+#include "textures/tex_defer.h"
+#include "textures/tex_gc.h"
+#include "textures/tex_replace.h"
 #include "migoto/dx12_wrap.h" // BackBufferForget
 #include "migoto/port_toggles.h" // g_buffers_in_vram
 #include "instrumentation/removal_pin.h"
@@ -78,7 +80,9 @@ static void on_destroy_device(device*)
     TexCrawlFlushIfQuiet(0);
     TexLodOnExit();
     TexLookOnExit();
-    g_tex_eager.Stop();
+    g_tex_defer.Stop();
+    g_tex_gc.Stop();
+    g_tex_replace.Stop();
     PortApi::SaveSettingsOnExit();
 }
 
@@ -569,8 +573,17 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     g_texlod_resemblance = GetPrivateProfileIntW(L"wwmi-dx12", L"lod_resemblance", 1, ini_path.c_str()) != 0;
     g_texlod_cache = GetPrivateProfileIntW(L"wwmi-dx12", L"lod_cache", 1, ini_path.c_str()) != 0;
     MigotoPort::g_buffers_in_vram = GetPrivateProfileIntW(L"wwmi-dx12", L"buffers_in_vram", 1, ini_path.c_str()) != 0;
-    ::logger::write("Config: decensor=%d hide_uid=%d lod_resemblance=%d lod_cache=%d buffers_in_vram=%d", (int)g_decensor, (int)g_hide_uid,
-        (int)g_texlod_resemblance, (int)g_texlod_cache, (int)MigotoPort::g_buffers_in_vram);
+    const int budget_step = (int)GetPrivateProfileIntW(L"wwmi-dx12", L"tex_mod_budget", 1, ini_path.c_str());
+    g_tex_mod_budget = budget_step >= 0 && budget_step < kTexBudgetSteps ? budget_step : 1;
+    g_tex_distance = GetPrivateProfileIntW(L"wwmi-dx12", L"tex_distance", 0, ini_path.c_str()) != 0;
+#ifdef WWMI_DEBUG
+    g_tex_watch_ms = GetPrivateProfileIntW(L"wwmi-dx12", L"tex_watch_ms", 2000, ini_path.c_str());
+    g_tex_vram_cap_mb = GetPrivateProfileIntW(L"wwmi-dx12", L"tex_vram_cap_mb", 0, ini_path.c_str());
+#endif
+    ::logger::write("Config: decensor=%d hide_uid=%d lod_resemblance=%d lod_cache=%d buffers_in_vram=%d tex_mod_budget=%s tex_distance=%d",
+        (int)g_decensor, (int)g_hide_uid, (int)g_texlod_resemblance, (int)g_texlod_cache, (int)MigotoPort::g_buffers_in_vram,
+        TexBudgetName(g_tex_mod_budget), (int)g_tex_distance);
+    g_tex_defer.Start();
     if (g_dx12_debug_layer) {
         ID3D12Debug*  dbg = nullptr;
         const HRESULT hrd = D3D12GetDebugInterface(IID_PPV_ARGS(&dbg));
@@ -646,7 +659,9 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE)
     TexCrawlFlushIfQuiet(0);
     TexLodOnExit();
     TexLookOnExit();
-    g_tex_eager.Stop();
+    g_tex_defer.Stop();
+    g_tex_gc.Stop();
+    g_tex_replace.Stop();
     CrashHandler::Uninstall(); // the process's previous filter comes back before this code is unmapped
     reshade::unregister_addon(addon_module);
 }

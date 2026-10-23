@@ -6,74 +6,12 @@
 #include "../mods/layout_registry.h"
 #include "../hooks/pipeline_hooks.h" // PipelineSrvRegs -- what the bound shaders read (PSV0)
 #include "draw_parts.h"
-#include "../textures/tex_eager.h" // a mod's textures still loading: its null is "not yet", not "unbind"
+#include "../textures/tex_defer.h" // a mod's textures still loading: its null is "not yet", not "unbind"
 #include "../rabbitfx/rabbitfx_bind.h"
 #include "../rt/rt_hooks.h" // RtNoteSlotTexture
 #include <algorithm>
+#include <shared_mutex>
 #include <unordered_map>
-
-static D3D12_CPU_DESCRIPTOR_HANDLE NullSrvDescriptor(ID3D12Device* dev, uint8_t kind)
-{
-    static std::mutex                  s_mtx;
-    static ID3D12DescriptorHeap*       s_heap = nullptr;
-    static D3D12_CPU_DESCRIPTOR_HANDLE s_h[8] = {}; // index = slot below
-    static UINT                        s_inc = 0;
-    // DXIL kind -> our slot -> D3D12 view dimension
-    static const D3D12_SRV_DIMENSION dims[8] = {
-        D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURE1D, D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
-        D3D12_SRV_DIMENSION_TEXTURE3D, D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_SRV_DIMENSION_TEXTURE1DARRAY,
-        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, D3D12_SRV_DIMENSION_TEXTURE2DMS
-    };
-    unsigned slot = 0;
-    switch (kind) {
-    case 1: slot = 1; break;
-    case 3: slot = 2; break;
-    case 4: slot = 3; break;
-    case 5: slot = 4; break;
-    case 6: slot = 5; break;
-    case 7: slot = 6; break;
-    case 8: slot = 7; break;
-    default: slot = 0; break;
-    }
-    std::lock_guard<std::mutex> l(s_mtx);
-    if (!dev) return D3D12_CPU_DESCRIPTOR_HANDLE{ 0 };
-    if (!s_heap) {
-        D3D12_DESCRIPTOR_HEAP_DESC d{};
-        d.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        d.NumDescriptors = 8;
-        if (FAILED(dev->CreateDescriptorHeap(&d, IID_PPV_ARGS(&s_heap)))) return D3D12_CPU_DESCRIPTOR_HANDLE{ 0 };
-        s_inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    }
-    if (!s_h[slot].ptr) {
-        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
-        sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        sd.ViewDimension = dims[slot];
-        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        switch (dims[slot]) {
-        case D3D12_SRV_DIMENSION_TEXTURE1D: sd.Texture1D.MipLevels = 1; break;
-        case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
-            sd.Texture1DArray.MipLevels = 1;
-            sd.Texture1DArray.ArraySize = 1;
-            break;
-        case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
-            sd.Texture2DArray.MipLevels = 1;
-            sd.Texture2DArray.ArraySize = 1;
-            break;
-        case D3D12_SRV_DIMENSION_TEXTURE3D: sd.Texture3D.MipLevels = 1; break;
-        case D3D12_SRV_DIMENSION_TEXTURECUBE: sd.TextureCube.MipLevels = 1; break;
-        case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
-            sd.TextureCubeArray.MipLevels = 1;
-            sd.TextureCubeArray.NumCubes = 1;
-            break;
-        case D3D12_SRV_DIMENSION_TEXTURE2DMS: break;
-        default: sd.Texture2D.MipLevels = 1; break;
-        }
-        D3D12_CPU_DESCRIPTOR_HANDLE h{ s_heap->GetCPUDescriptorHandleForHeapStart().ptr + (SIZE_T)slot * s_inc };
-        dev->CreateShaderResourceView(nullptr, &sd, h);
-        s_h[slot] = h;
-    }
-    return s_h[slot];
-}
 
 struct StampedSlot {
     uint64_t src = 0;
@@ -89,6 +27,41 @@ static void StampedForThisFrame()
     if (g_stamped_frame == g_frame_id) return;
     g_stamped.clear();
     g_stamped_frame = g_frame_id;
+}
+
+struct GameSide {
+    uint64_t side = 0; // the largest the game's own texture there had
+    unsigned gen = 0;  // ... in this ini load
+};
+static std::shared_mutex                      g_game_side_mtx;
+static std::unordered_map<uint64_t, GameSide> g_game_side; // (mod, component, ps register)
+
+// A20: how many mips below the largest it has had there the game draws the texture it bound at `at`.
+static unsigned GameMip(int dm, int comp, unsigned reg, const HeapKey& at)
+{
+    ResInfo ri{};
+    if (!g_heap_to_res.find(at, ri) || !ri.res) return ModLoader::kTexMipUnknown;
+    const D3D12_RESOURCE_DESC d = ri.res->GetDesc();
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return ModLoader::kTexMipUnknown;
+    const uint64_t side = (std::max)(d.Width, (UINT64)d.Height);
+    const uint64_t key = (uint64_t)(uint32_t)CompKey(dm, comp) * MigotoPort::kMaxSRV + reg;
+    const unsigned gen = PortApi::LoadGeneration();
+    uint64_t       most = 0;
+    {
+        std::shared_lock l(g_game_side_mtx);
+        const auto       it = g_game_side.find(key);
+        if (it != g_game_side.end() && it->second.gen == gen) most = it->second.side;
+    }
+    if (side > most) {
+        std::unique_lock l(g_game_side_mtx);
+        GameSide&        m = g_game_side[key];
+        if (m.gen != gen) m = GameSide{ 0, gen };
+        m.side = (std::max)(m.side, side);
+        return 0;
+    }
+    unsigned k = 0;
+    while ((side << (k + 1)) <= most) ++k;
+    return k;
 }
 
 static void PlanStamps(SectionPsStamps& out, device* dev, const RootParam* root, const RegBind* t_ps, uint64_t pso,
@@ -116,13 +89,18 @@ static void PlanStamps(SectionPsStamps& out, device* dev, const RootParam* root,
         }
         D3D12_CPU_DESCRIPTOR_HANDLE src{ 0 };
         ID3D12Resource*             res = nullptr;
+        bool                        stored = false;
+        int                         index = -1;
         if (ID3D11ShaderResourceView* v = st.srv[si][r]) {
             MigotoPort::WrapView* wv = MigotoPort::AsWrapView(v);
             if (!wv || wv->kind != 't' || !wv->cpu.ptr) continue; // a dump publication, or not a view of ours
             src = wv->cpu;
             res = wv->wres ? wv->wres->dx12 : nullptr;
+            index = ModLoader::TexIndexOf(res);
+            ModLoader::TexTouch(index);
+            stored = index >= 0;
         } else {
-            if (!g_ps_slot_stamp_nulls || g_tex_eager.Pending(dm)) continue;
+            if (!g_ps_slot_stamp_nulls || g_tex_defer.Pending(dm) || PortApi::BoundLoading()) continue;
             src = NullSrvDescriptor(g_d3d12_device, ps_regs.parsed ? ps_regs.kind[r] : 0);
             if (!src.ptr) continue;
         }
@@ -137,6 +115,7 @@ static void PlanStamps(SectionPsStamps& out, device* dev, const RootParam* root,
         if (!ts) continue;
         const uint32_t slot = ts.base + b.offset;
         if (slot >= ts.Heap()->GetDesc().NumDescriptors) continue;
+        if (stored && g_tex_distance) ModLoader::TexTouchAt(index, GameMip(dm, comp, r, { ts.heap, slot }));
         if (res) { // RT M4: the game texture this stamp replaces, for the section's ray tracing material table
             ResInfo gri{};
             if (g_heap_to_res.find({ ts.heap, slot }, gri) && gri.res && gri.res != res) RtNoteSlotTexture(dm, comp, gri.res, src, res);
@@ -149,6 +128,7 @@ static void PlanStamps(SectionPsStamps& out, device* dev, const RootParam* root,
         s.slot = slot;
         s.src = src;
         s.res = res;
+        s.stored = stored;
         out.slots.push_back(s);
     }
 }
@@ -222,6 +202,7 @@ void SectionPsStamps::StampInPlace() const
         const D3D12_CPU_DESCRIPTOR_HANDLE dst{ heap->GetCPUDescriptorHandleForHeapStart().ptr + (SIZE_T)s.slot * inc };
         g_d3d12_device->CopyDescriptorsSimple(1, dst, s.src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         if (s.res) g_heap_to_res.set_swapped({ s.heap, s.slot }, s.res); // the frame dump publishes what the GPU reads
+        if (s.stored) StampedStoreTexture(s.heap, s.slot, s.res);
         g_stamped[{ s.heap, s.slot }] = StampedSlot{ s.src.ptr, g_frame_id };
         g_ps_slot_stamp_count.fetch_add(1, std::memory_order_relaxed);
         if (g_debug && DiagChanged("PS-SLOT-STAMP", CompKey(dm, comp) * 128 + (int)s.reg, (unsigned long long)s.src.ptr))

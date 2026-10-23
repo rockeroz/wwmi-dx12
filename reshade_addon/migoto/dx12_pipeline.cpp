@@ -39,6 +39,8 @@ namespace MigotoPort {
 
 bool (*g_query_reloc)(unsigned long long, unsigned long long*, unsigned long long*) = nullptr;
 
+static std::atomic<void (*)(ID3D12Resource* res)> g_texture_use_observer{ nullptr };
+
 namespace {
 
 std::mutex& Mtx()
@@ -362,9 +364,10 @@ RootSigEntry* GetRootSig(const std::vector<RootBind>& want, bool compute)
     auto it = H().rootsigs.find(key);
     if (it != H().rootsigs.end()) return it->second.rs ? &it->second : nullptr;
     RootSigEntry& e = H().rootsigs[key];
+    const auto    t0 = std::chrono::steady_clock::now();
     if (!BuildRootSig(want, compute, e)) return nullptr;
-    logger::write("PORT: root signature built -- %zu tables, %s", want.size(),
-        compute ? "compute" : "graphics");
+    logger::write("PORT: root signature built -- %zu tables, %s, in %.1f ms", want.size(),
+        compute ? "compute" : "graphics", logger::ms_since(t0));
     return &e;
 }
 
@@ -1643,6 +1646,8 @@ bool BindDescriptors(ID3D12GraphicsCommandList* cl, const RootSigEntry& rse, boo
             WrapView*                 wv = AsWrapView(v);
             if (wv && wv->wres && HasDescriptor(wv, 't', b.reg)) {
                 Transition(cl, wv->wres, compute ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                if (wv->wres->dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+                    if (auto fn = g_texture_use_observer.load(std::memory_order_relaxed)) fn(wv->wres->dx12);
                 H().dev->CopyDescriptorsSimple(1, dst, wv->cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             } else {
                 WriteNullDescriptor('t', dst, b.sit, b.dim);
@@ -1820,6 +1825,7 @@ ID3D12PipelineState* GetGraphicsPso(ID3D12RootSignature* rs, DXGI_FORMAT rt_fmt[
     if (il && !il->elems.empty()) pd.InputLayout = { il->elems.data(), (UINT)il->elems.size() };
 
     ID3D12PipelineState* pso = nullptr;
+    const auto           t0 = std::chrono::steady_clock::now();
     HRESULT              hr = H().dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
     if (FAILED(hr)) {
         logger::write("PORT: graphics PSO FAILED hr=%08lX (vs=%zu ps=%zu gs=%zu rt=%u fmt=%d ds=%d)",
@@ -1829,9 +1835,9 @@ ID3D12PipelineState* GetGraphicsPso(ID3D12RootSignature* rs, DXGI_FORMAT rt_fmt[
         return nullptr;
     }
     H().psos[key] = pso;
-    logger::write("PORT: graphics PSO built (vs%s%s%s, %u RT fmt=%d ds=%d)",
+    logger::write("PORT: graphics PSO built (vs%s%s%s, %u RT fmt=%d ds=%d) in %.1f ms",
         ps ? "+ps" : "", gs ? "+gs" : "", (hs || ds) ? "+tess" : "",
-        num_rt, (int)rt_fmt[0], (int)ds_fmt);
+        num_rt, (int)rt_fmt[0], (int)ds_fmt, logger::ms_since(t0));
     return pso;
 }
 
@@ -1854,6 +1860,7 @@ ID3D12PipelineState* GetComputePso(ID3D12RootSignature* rs)
     cd.pRootSignature = rs;
     cd.CS = { cs->code.data(), cs->code.size() };
     ID3D12PipelineState* pso = nullptr;
+    const auto           t0 = std::chrono::steady_clock::now();
     HRESULT              hr = H().dev->CreateComputePipelineState(&cd, IID_PPV_ARGS(&pso));
     if (FAILED(hr)) {
         logger::write("PORT: compute PSO FAILED hr=%08lX (%zu bytes)", (unsigned long)hr, cs->code.size());
@@ -1861,8 +1868,8 @@ ID3D12PipelineState* GetComputePso(ID3D12RootSignature* rs)
         return nullptr;
     }
     H().psos[key] = pso;
-    logger::write("PORT: compute PSO built (%zu bytes, %zu bound registers)", cs->code.size(),
-        cs->regs.size());
+    logger::write("PORT: compute PSO built (%zu bytes, %zu bound registers) in %.1f ms", cs->code.size(),
+        cs->regs.size(), logger::ms_since(t0));
     return pso;
 }
 
@@ -1922,7 +1929,7 @@ static bool DispatchBail(const char* gate, const void* cs, UINT x, UINT y, UINT 
     return IssueBail(false, gate, cs, x, y, z);
 }
 
-static bool UploadPendingFor(ID3D11Resource* res)
+bool UploadPendingFor(ID3D11Resource* res)
 {
     std::lock_guard<std::mutex> l(Mtx());
     for (const PendingUpload& u : Uploads())
@@ -2332,12 +2339,30 @@ unsigned long long DispatchCalls()
     return g_dispatch_calls.load();
 }
 
-static std::mutex              g_retire_mtx;
-static std::vector<RetiredBuf> g_retired_res; // wrapper resources whose last reference dropped
+static std::mutex                                 g_retire_mtx;
+static std::vector<RetiredBuf>                    g_retired_res; // wrapper resources whose last reference dropped
+static std::atomic<void (*)(ID3D12Resource* res)> g_retire_observer{ nullptr };
+
+void SetRetireObserver(void (*fn)(ID3D12Resource* res))
+{
+    g_retire_observer.store(fn, std::memory_order_release);
+}
+
+void SetTextureUseObserver(void (*fn)(ID3D12Resource* res))
+{
+    g_texture_use_observer.store(fn, std::memory_order_release);
+}
+
+void NoteTextureUse(ID3D11Resource* res)
+{
+    if (auto fn = g_texture_use_observer.load(std::memory_order_relaxed))
+        if (WrapResource* wr = res ? AsWrapResource(res) : nullptr) fn(wr->dx12);
+}
 
 void RetireDx12Resource(ID3D12Resource* res)
 {
     if (!res) return;
+    if (auto fn = g_retire_observer.load(std::memory_order_acquire)) fn(res);
     std::lock_guard<std::mutex> l(g_retire_mtx);
     g_retired_res.push_back({ res, GpuStamp() });
 }

@@ -266,7 +266,7 @@ static void SkU0Claim(SkU0Ident& ck, unsigned cand_hash, unsigned cand_bytes)
         for (int dmo = 0; dmo < (int)g_geomods.size(); ++dmo) {
             if (!ModGeomEnabled(dmo)) continue;
             if (!ModOnScreen(dmo)) continue;
-            if (SkModCbHash(dmo) != cand_hash) continue;
+            if (!SkModDeclaresCb(dmo, cand_hash)) continue;
             if (ck.claims == 0) ck.owner = dmo;
             ++ck.claims;
         }
@@ -285,7 +285,7 @@ static void SkU0Claim(SkU0Ident& ck, unsigned cand_hash, unsigned cand_bytes)
                 for (int dmo = 0; dmo < (int)g_geomods.size(); ++dmo) {
                     if (!ModGeomEnabled(dmo)) continue;
                     if (!ModOnScreen(dmo)) continue;
-                    if (SkModCbHash(dmo) != cand_hash) continue; // same test as the count above
+                    if (!SkModDeclaresCb(dmo, cand_hash)) continue; // same test as the count above
                     if (!who.empty()) who += L", ";
                     who += g_geomods[dmo].wcl_ns;
                 }
@@ -314,11 +314,11 @@ static void SkU0ResolveU1(command_list* cmd_list, SkU0Ident& ck, ID3D12Resource*
 {
     if (ck.declared && ck.owner >= 0 && ck.owner < (int)g_geomods.size()) {
         owner_ns = g_geomods[ck.owner].wcl_ns;
-        want_scale = SkModScaleHash(ck.owner); // resolved at ini load
+        want_scale = SkModScaleFor(ck.owner, cand_hash); // resolved at ini load
     } else {
         for (int dmx = 0; dmx < (int)g_geomods.size(); ++dmx) {
-            if (SkModCbHash(dmx) != cand_hash) continue;
-            want_scale = SkModScaleHash(dmx);
+            if (!SkModDeclaresCb(dmx, cand_hash)) continue;
+            want_scale = SkModScaleFor(dmx, cand_hash);
             owner_ns = g_geomods[dmx].wcl_ns;
             break;
         }

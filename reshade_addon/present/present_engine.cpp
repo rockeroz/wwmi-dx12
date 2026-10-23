@@ -241,6 +241,7 @@ void EngineFrameTick(command_queue* queue, swapchain* sc, bool bind_back_buffer)
         {
             auto* dev12 = (ID3D12Device*)sc->get_device()->get_native();
             auto* q12 = (ID3D12CommandQueue*)queue->get_native();
+            PortApi::SetGameWindow(sc->get_hwnd());
             PortApi::SetFrameContext(dev12, nullptr, q12, (unsigned)rw, (unsigned)rh,
                 DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
                 bb12, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);

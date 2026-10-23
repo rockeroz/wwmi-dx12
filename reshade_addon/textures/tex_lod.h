@@ -13,6 +13,7 @@ void TexLodSetCache(bool on);
 
 uint32_t TexLodLookup(uint32_t hash);
 uint32_t TexLodKnown(uint32_t hash);
+unsigned TexLodMipOf(uint32_t hash); // a proven low: which mip of its target it is; 0 = not a proven low, or not known
 bool     TexLodLinked(uint32_t hash); // any link, exact or a look-alike
 bool     TexLodDegenerate(uint32_t hash);
 bool     TexLodLearnVisual(uint32_t low, uint32_t high, float ssim); // a tex_look match: a look-alike link

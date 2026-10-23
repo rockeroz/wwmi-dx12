@@ -9,12 +9,16 @@
 #include <DDSTextureLoader.h>
 #include "../../src/log.h"
 
+#include <atomic>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace PortApi {
 
 static std::unordered_map<const CustomResource*, unsigned> g_deferred_pending; // under the engine lock: -> the load it was deferred in
+static std::atomic<bool (*)(const DeferredTexture&, void*)> g_defer_sink{ nullptr };
+static std::atomic<void*>                                    g_defer_user{ nullptr };
 
 void ForEachVariable(void (*cb)(const wchar_t* fq_name, float value, bool persist, void* user), void* user)
 {
@@ -136,6 +140,7 @@ ID3D12Resource* FindCustomResource(const wchar_t* fq_name)
     auto it = customResources.find(fq_name);
     if (it == customResources.end()) return nullptr;
 
+    DeferTexture(&it->second);
     it->second.Substantiate(g_dev.GetPassThroughOrigDevice1(),
         (D3D11_BIND_FLAG)0, (D3D11_RESOURCE_MISC_FLAG)0);
     MigotoPort::WrapResource* wr = MigotoPort::AsWrapResource(it->second.resource);
@@ -239,43 +244,40 @@ void* AcquireBufferObject(const wchar_t* fq_name)
     return it->second.resource;
 }
 
-void ForEachUnsubstantiatedTexture(const wchar_t* ns, void (*cb)(const wchar_t* fq_name, const wchar_t* filename, void* user),
-    void*                                         user)
+void SetTextureDeferral(bool (*sink)(const DeferredTexture& t, void* user), void* user)
 {
-    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
-    if (!g_loaded || !ns || !*ns || !cb) return;
-    const std::wstring prefix = std::wstring(L"resource\\") + ns + L"\\";
-    for (auto& kv : customResources) {
-        const CustomResource& r = kv.second;
-        if (r.substantiated || r.resource || r.view) continue;
-        const std::wstring& fn = r.filename;
-        if (fn.size() < 4 || _wcsicmp(fn.c_str() + fn.size() - 4, L".dds") != 0) continue;
-        if (_wcsnicmp(kv.first.c_str(), prefix.c_str(), prefix.size()) != 0) continue;
-        cb(kv.first.c_str(), fn.c_str(), user);
-    }
+    if (sink) g_defer_user.store(user, std::memory_order_release);
+    g_defer_sink.store(sink, std::memory_order_release);
 }
 
-void BeginDeferredTextures(const wchar_t* ns, std::vector<DeferredTexture>& out)
+void DeferTexture(CustomResource* r)
+{
+    const auto sink = g_defer_sink.load(std::memory_order_acquire);
+    if (!sink || !r || r->substantiated || r->resource || r->view) return;
+    const std::wstring& fn = r->filename;
+    if (fn.size() < 4 || _wcsicmp(fn.c_str() + fn.size() - 4, L".dds") != 0) return;
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (!g_loaded || r->substantiated || r->resource || r->view) return;
+    const auto& names = CustomResourceNameIndex();
+    const auto  n = names.find(r);
+    if (n == names.end()) return;
+    D3D11_BIND_FLAG bind = (D3D11_BIND_FLAG)(r->bind_flags | D3D11_BIND_SHADER_RESOURCE); // the flag its assignment would add
+    if (r->override_bind_flags != CustomResourceBindFlags::INVALID) bind = (D3D11_BIND_FLAG)r->override_bind_flags;
+    D3D11_RESOURCE_MISC_FLAG misc = r->misc_flags;
+    if (r->override_misc_flags != ResourceMiscFlags::INVALID) misc = (D3D11_RESOURCE_MISC_FLAG)r->override_misc_flags;
+    if (!sink({ n->second, fn, (unsigned)bind, (unsigned)misc, r->override_color_space == CustomColorSpace::SRGB },
+            g_defer_user.load(std::memory_order_acquire)))
+        return;
+    r->substantiated = true; // Substantiate's first act, so the draw loads nothing itself
+    r->bind_flags = bind;
+    r->misc_flags = misc;
+    g_deferred_pending[r] = g_generation;
+}
+
+bool DeferredPending(CustomResource* r)
 {
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
-    if (!g_loaded || !ns || !*ns) return;
-    const std::wstring prefix = std::wstring(L"resource\\") + ns + L"\\";
-    for (auto& kv : customResources) {
-        CustomResource& r = kv.second;
-        if (r.substantiated || r.resource || r.view) continue;
-        const std::wstring& fn = r.filename;
-        if (fn.size() < 4 || _wcsicmp(fn.c_str() + fn.size() - 4, L".dds") != 0) continue;
-        if (_wcsnicmp(kv.first.c_str(), prefix.c_str(), prefix.size()) != 0) continue;
-        r.substantiated = true;                                                      // Substantiate's first act, so no draw loads it
-        r.bind_flags = (D3D11_BIND_FLAG)(r.bind_flags | D3D11_BIND_SHADER_RESOURCE); // the flag its assignment would add
-        if (r.override_bind_flags != CustomResourceBindFlags::INVALID)
-            r.bind_flags = (D3D11_BIND_FLAG)r.override_bind_flags;
-        if (r.override_misc_flags != ResourceMiscFlags::INVALID)
-            r.misc_flags = (D3D11_RESOURCE_MISC_FLAG)r.override_misc_flags;
-        out.push_back({ kv.first, fn, (unsigned)r.bind_flags, (unsigned)r.misc_flags,
-            r.override_color_space == CustomColorSpace::SRGB });
-        g_deferred_pending[&r] = g_generation;
-    }
+    return r && g_deferred_pending.count(r) != 0;
 }
 
 void LoadDeferredNow(CustomResource* r)
@@ -300,7 +302,7 @@ void LoadDeferredNow(CustomResource* r)
     MigotoPort::BumpSelectionInputs();
     const auto& names = CustomResourceNameIndex();
     const auto  n = names.find(r);
-    logger::write("TEXEAGER-NOW %ls: a copy or a compute bind read it before background publication -- foreground load+staging %.1f ms",
+    logger::write("TEXDEFER-NOW %ls: a copy or a compute bind read it before the background load had -- foreground load+staging %.1f ms",
         n != names.end() ? n->second.c_str() : r->filename.c_str(),
         frequency.QuadPart ? 1000.0 * double(finished.QuadPart - started.QuadPart) / double(frequency.QuadPart) : 0.0);
 }
@@ -309,9 +311,15 @@ ID3D11Resource* LoadDeferredTexture(const DeferredTexture& t)
 {
     EnsureCOM();
     ID3D11Resource* res = nullptr;
-    const HRESULT   hr = DirectX::CreateDDSTextureFromFileEx(g_dev.GetPassThroughOrigDevice1(), t.filename.c_str(), 0,
+    HRESULT         hr = DirectX::CreateDDSTextureFromFileEx(g_dev.GetPassThroughOrigDevice1(), t.filename.c_str(), t.maxsize,
         D3D11_USAGE_DEFAULT, t.bind_flags, 0, t.misc_flags, t.force_srgb,
         &res, nullptr, nullptr);
+    if (FAILED(hr) && t.maxsize) {
+        logger::write("PORT: %ls did not load at %u px or less (0x%08x) -- loaded in full", t.filename.c_str(), t.maxsize, (unsigned)hr);
+        hr = DirectX::CreateDDSTextureFromFileEx(g_dev.GetPassThroughOrigDevice1(), t.filename.c_str(), 0,
+            D3D11_USAGE_DEFAULT, t.bind_flags, 0, t.misc_flags, t.force_srgb,
+            &res, nullptr, nullptr);
+    }
     if (FAILED(hr)) logger::write("PORT: failed to load custom texture resource %ls: 0x%08x", t.filename.c_str(), (unsigned)hr);
     return SUCCEEDED(hr) ? res : nullptr;
 }
@@ -344,14 +352,173 @@ bool PublishDeferredTexture(const wchar_t* fq_name, ID3D11Resource* res, unsigne
     return true;
 }
 
-bool SubstantiateTexture(const wchar_t* fq_name)
+// This ini load's .dds [Resource]s, under the engine lock.
+static const std::vector<std::pair<const std::wstring*, CustomResource*>>& DdsResources()
+{
+    static std::vector<std::pair<const std::wstring*, CustomResource*>> s_list;
+    static unsigned                                                     s_gen = ~0u;
+    if (s_gen != g_generation) {
+        s_gen = g_generation;
+        s_list.clear();
+        for (auto& kv : customResources) {
+            const std::wstring& fn = kv.second.filename;
+            if (fn.size() >= 4 && _wcsicmp(fn.c_str() + fn.size() - 4, L".dds") == 0 && _wcsnicmp(kv.first.c_str(), L"resource\\", 9) == 0)
+                s_list.push_back({ &kv.first, &kv.second });
+        }
+    }
+    return s_list;
+}
+
+static void LoadedTexturesWithPrefix(const std::wstring& prefix, std::vector<LoadedTexture>& out)
 {
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
-    if (!g_loaded || !fq_name) return false;
+    if (!g_loaded) return;
+    for (const auto& [fq, rp] : DdsResources()) {
+        CustomResource& r = *rp;
+        if (!r.resource || _wcsnicmp(fq->c_str(), prefix.c_str(), prefix.size()) != 0) continue;
+        MigotoPort::WrapResource* wr = MigotoPort::AsWrapResource(r.resource);
+        if (!wr || !wr->dx12 || wr->dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D) continue;
+        r.resource->AddRef();
+        out.push_back({ { *fq, r.filename, (unsigned)r.bind_flags, (unsigned)r.misc_flags,
+                            r.override_color_space == CustomColorSpace::SRGB },
+            r.resource, wr->dx12 });
+    }
+}
+
+void LoadedTexturesOf(const wchar_t* ns, std::vector<LoadedTexture>& out)
+{
+    if (!ns || !*ns) return;
+    LoadedTexturesWithPrefix(std::wstring(L"resource\\") + ns + L"\\", out);
+}
+
+void LoadedTexturesAll(std::vector<LoadedTexture>& out)
+{
+    LoadedTexturesWithPrefix(L"resource\\", out);
+}
+
+ID3D11Resource* CreateEmptyTexture(const DeferredTexture& like, unsigned width, unsigned height, DXGI_FORMAT format)
+{
+    D3D11_TEXTURE2D_DESC d{};
+    d.Width = width;
+    d.Height = height;
+    d.MipLevels = 1;
+    d.ArraySize = 1;
+    d.Format = format;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = like.bind_flags | D3D11_BIND_SHADER_RESOURCE;
+    d.MiscFlags = like.misc_flags & ~(D3D11_RESOURCE_MISC_TEXTURECUBE | D3D11_RESOURCE_MISC_GENERATE_MIPS);
+    ID3D11Texture2D* tex = nullptr;
+    const HRESULT    hr = g_dev.GetPassThroughOrigDevice1()->CreateTexture2D(&d, nullptr, &tex);
+    if (FAILED(hr)) {
+        logger::write("PORT: no %ux%u texture for a smaller copy of %ls: 0x%08x", width, height, like.filename.c_str(), (unsigned)hr);
+        return nullptr;
+    }
+    return tex;
+}
+
+bool SwapTextureResource(const wchar_t* fq_name, ID3D11Resource* was, ID3D11Resource* fresh)
+{
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (!g_loaded || !fq_name || !was || !fresh) return false;
     auto it = customResources.find(fq_name);
-    if (it == customResources.end() || it->second.substantiated) return false;
-    it->second.Substantiate(g_dev.GetPassThroughOrigDevice1(), D3D11_BIND_SHADER_RESOURCE, (D3D11_RESOURCE_MISC_FLAG)0);
-    return it->second.resource != nullptr;
+    if (it == customResources.end() || it->second.resource != was) return false;
+    CustomResource& r = it->second;
+    r.resource = fresh;
+    was->Release();
+    if (r.view) {
+        r.view->Release();
+        r.view = nullptr;
+    }
+    r.is_null = false;
+    MigotoPort::BumpSelectionInputs();
+    return true;
+}
+
+// This ini load's resource copies, unwrapped and out of the optimiser's batches, under the engine lock.
+static const std::vector<ResourceCopyOperation*>& ResourceCopies()
+{
+    static std::vector<ResourceCopyOperation*> s_ops;
+    static unsigned                            s_gen = ~0u;
+    if (s_gen != g_generation) {
+        s_gen = g_generation;
+        s_ops.clear();
+        for (CommandList* cl : registered_command_lists)
+            for (const auto& c : cl->commands) {
+                CommandListCommand* cmd = MigotoPort::UnwrapObserved(c.get());
+                if (auto* op = dynamic_cast<ResourceCopyOperation*>(cmd))
+                    s_ops.push_back(op);
+                else if (auto* batch = dynamic_cast<ShaderResourceBatch*>(cmd))
+                    for (const auto& o : batch->operations) s_ops.push_back(o.get());
+            }
+    }
+    return s_ops;
+}
+
+void ReleaseOldTextures(const std::unordered_map<ID3D11Resource*, ID3D11Resource*>& old_to_new)
+{
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (!g_loaded || old_to_new.empty()) return;
+    for (auto& kv : customResources) {
+        CustomResource& r = kv.second;
+        const auto      it = r.resource ? old_to_new.find(r.resource) : old_to_new.end();
+        if (it == old_to_new.end() || !it->second) continue;
+        it->second->AddRef();
+        r.resource->Release();
+        r.resource = it->second;
+        if (r.view) {
+            r.view->Release();
+            r.view = nullptr;
+        }
+    }
+    for (ResourceCopyOperation* op : ResourceCopies()) {
+        if (!op->cached_view) continue;
+        ID3D11Resource* res = nullptr;
+        op->cached_view->GetResource(&res);
+        if (!res) continue;
+        const bool old = old_to_new.count(res) != 0;
+        res->Release();
+        if (!old) continue;
+        op->cached_view->Release();
+        op->cached_view = nullptr;
+    }
+}
+
+std::unordered_set<ID3D11Resource*> HeldByRef(const std::vector<std::pair<std::wstring, ID3D11Resource*>>& textures)
+{
+    std::unordered_set<ID3D11Resource*> held;
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (!g_loaded || textures.empty()) return held;
+    std::unordered_map<ID3D11Resource*, const CustomResource*> own_of;
+    for (const auto& [fq, res] : textures) {
+        const auto it = customResources.find(fq);
+        if (it != customResources.end()) own_of[res] = &it->second;
+    }
+    for (const auto& kv : customResources) {
+        const auto it = kv.second.resource ? own_of.find(kv.second.resource) : own_of.end();
+        if (it != own_of.end() && it->second != &kv.second) held.insert(it->first);
+    }
+    return held;
+}
+
+bool EvictTexture(const wchar_t* fq_name, ID3D11Resource* was)
+{
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (!g_loaded || !fq_name || !was) return false;
+    auto it = customResources.find(fq_name);
+    if (it == customResources.end() || it->second.resource != was) return false;
+    CustomResource& r = it->second;
+    r.resource = nullptr;
+    was->Release();
+    if (r.view) {
+        r.view->Release();
+        r.view = nullptr;
+    }
+    r.is_null = true;
+    r.substantiated = false;
+    g_deferred_pending.erase(&r);
+    MigotoPort::BumpSelectionInputs();
+    return true;
 }
 
 void ForEachCustomResource(void (*cb)(const wchar_t*, const wchar_t*, int, bool, ID3D12Resource*, void*),

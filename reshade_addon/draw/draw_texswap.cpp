@@ -10,7 +10,7 @@
 #include "draw_parts.h"
 #include "read_slots.h"
 #include "../instrumentation/tex_timing.h"
-#include "../textures/tex_eager.h"
+#include "../textures/tex_defer.h" // ModTexturesReady: a mod's textures still loading in the background
 #include <bitset>
 #include <optional>
 
@@ -87,11 +87,14 @@ const ReadSlots& DrawReadSlots(reshade::api::command_list* cmd_list)
     return m.rs;
 }
 
-// A mod a claimed draw runs: detected (`$object_detected`) and its textures wanted now.
+// Keep the game's draw while any texture of this mod is still loading in the background, so no mod command list
+// (texture copies included) runs against a texture that is not in yet. Since 2026.10.4 textures load on first draw
+// (TexDeferWorker), not as a whole namespace at the first claim: the first run of a mod's commands is what asks for
+// them, so that run goes through and the draws after it wait here until every texture it asked for is published.
 bool ModTexturesReady(int mod_id)
 {
-    if (mod_id < 0 || mod_id >= (int)g_geomods.size()) return true;
-    return g_tex_eager.ReadyForDraw(mod_id, g_geomods[mod_id].wcl_ns.c_str());
+    if (mod_id < 0 || mod_id >= (int)g_geomods.size() || g_geomods[mod_id].wcl_ns.empty()) return true;
+    return !g_tex_defer.Pending(mod_id);
 }
 
 bool ClaimedTexturesReady(const MergedComp& mc)
@@ -132,7 +135,6 @@ static void NoteClaimedMod(int mod_id)
         PortApi::SetVarSlot(ds.slot, 1.f);
     }
     TexTiming::NoteClaimed(mod_id, det_ns.c_str());
-    g_tex_eager.OnClaimed(mod_id, det_ns.c_str(), "first claimed draw");
 }
 
 void StampClaimedTextures(const DrawArgs& da, DrawClaim& dc)
@@ -204,7 +206,7 @@ void StampClaimedTextures(const DrawArgs& da, DrawClaim& dc)
                 ID3D12Resource* res = local_res[s];
                 if (!res) continue;
                 if (rs.known[p] && !rs.want[p].test(s)) continue;
-                const int sel = local_hash[s] ? TexSelectIdxNs(local_hash[s], own_ns) : -1;
+                const int sel = local_hash[s] ? TexSelectIdxNs(local_hash[s], own_ns, 0) : -1;
                 if (g_texflip_arm.load(std::memory_order_relaxed) > 0) {
                     struct Seen {
                         ID3D12Resource* res;
@@ -312,7 +314,7 @@ void StampClaimedTextures(const DrawArgs& da, DrawClaim& dc)
                 if (rep.ptr == 0) {
                     const uint32_t      tgt = TexLodTargetOf(hash);
                     ModLoader::TexEntry alias_entry;
-                    if (tgt && ModLoader::TexEntryAt(TexSelectIdxNs(tgt, own_ns), &alias_entry)) {
+                    if (tgt && ModLoader::TexEntryAt(TexSelectIdxNs(tgt, own_ns, TexDrawnMip(hash, tgt)), &alias_entry)) {
                         rep = alias_entry.srv;
                         rep_res = alias_entry.res;
                         swap_rule = tgt;
@@ -329,6 +331,7 @@ void StampClaimedTextures(const DrawArgs& da, DrawClaim& dc)
                     D3D12_CPU_DESCRIPTOR_HANDLE dst = { heap->GetCPUDescriptorHandleForHeapStart().ptr + (SIZE_T)slot * inc };
                     dev->CopyDescriptorsSimple(1, dst, rep, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
                     g_heap_to_res.set_swapped({ ts.heap, slot }, rep_res); // the frame dump publishes what the GPU reads
+                    StampedStoreTexture(ts.heap, slot, rep_res);
                     ++g_tex_inject_count;
                     TexTiming::NoteSwapped(rep_res, swap_rule);
                 }

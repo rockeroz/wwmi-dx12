@@ -1779,6 +1779,7 @@ bool RasterSwapFor(int mod, ID3D12Resource* game, D3D12_CPU_DESCRIPTOR_HANDLE* o
     ModLoader::TexEntry e;
     if (!ModLoader::TexEntryAt(ModLoader::TexIndexOf(mr), &e) || !e.srv.ptr || e.res != mr) return false;
     *out = e.srv;
+    ModLoader::TexTouchRes(mr); // in use by the rays: the texture budget does not count it unseen
     return true;
 }
 bool RasterKept(int mod, ID3D12Resource* game)
@@ -1871,9 +1872,11 @@ bool SlotTexFor(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRIPTOR_HA
         const auto     ih = h ? g_slot_tex_h.find({ mod, h }) : g_slot_tex_h.end();
         if (ih == g_slot_tex_h.end() || ih->second.gen != gen || g_frame_id - ih->second.frame > kSlotTexAge || !ih->second.src.ptr) return false;
         *out = ih->second.src;
+        ModLoader::TexTouchRes(ih->second.res); // in use by the rays: the texture budget does not count it unseen
         return true;
     }
     *out = best->src;
+    ModLoader::TexTouchRes(best->res);
     return true;
 }
 int      M4Mode()
@@ -1988,7 +1991,7 @@ void M4Apply(device* dev, const ModBlas& mb, const RecTx& tx, uint64_t stride, u
                 const wchar_t* own_ns = dm >= 0 && size_t(dm) < g_geomods.size() && !g_geomods[size_t(dm)].wcl_ns.empty()
                     ? g_geomods[size_t(dm)].wcl_ns.c_str() : nullptr;
                 ModLoader::TexEntry e;
-                if (ModLoader::TexEntryAt(TexSelectIdxNs(hash, own_ns), &e) && e.srv.ptr) {
+                if (ModLoader::TexEntryAt(TexSelectIdxNs(hash, own_ns, 0), &e) && e.srv.ptr) {
                     put(e.srv, tex_sw, " RULE]");
                     continue;
                 }
@@ -1999,7 +2002,7 @@ void M4Apply(device* dev, const ModBlas& mb, const RecTx& tx, uint64_t stride, u
                         continue;
                     }
                 }
-                if (const uint32_t tgt = TexLodTargetOf(hash); tgt && ModLoader::TexEntryAt(TexSelectIdxNs(tgt, own_ns), &e) && e.srv.ptr) {
+                if (const uint32_t tgt = TexLodTargetOf(hash); tgt && ModLoader::TexEntryAt(TexSelectIdxNs(tgt, own_ns, TexDrawnMip(hash, tgt)), &e) && e.srv.ptr) {
                     ++tex_lod;
                     put(e.srv, tex_sw, " RULE-LOWER-MIP]");
                     continue;
@@ -2173,7 +2176,7 @@ bool M5ResolveTex(int mod, uint32_t g, ID3D12Resource* res, const M5Binds& set, 
         const wchar_t* own_ns = mod >= 0 && size_t(mod) < g_geomods.size() && !g_geomods[size_t(mod)].wcl_ns.empty()
             ? g_geomods[size_t(mod)].wcl_ns.c_str() : nullptr;
         ModLoader::TexEntry e;
-        if (ModLoader::TexEntryAt(TexSelectIdxNs(hash, own_ns), &e) && e.srv.ptr) {
+        if (ModLoader::TexEntryAt(TexSelectIdxNs(hash, own_ns, 0), &e) && e.srv.ptr) {
             *out = e.srv;
             return true;
         }
@@ -2184,7 +2187,7 @@ bool M5ResolveTex(int mod, uint32_t g, ID3D12Resource* res, const M5Binds& set, 
                 return true;
             }
         }
-        if (const uint32_t tgt = TexLodTargetOf(hash); tgt && ModLoader::TexEntryAt(TexSelectIdxNs(tgt, own_ns), &e) && e.srv.ptr) {
+        if (const uint32_t tgt = TexLodTargetOf(hash); tgt && ModLoader::TexEntryAt(TexSelectIdxNs(tgt, own_ns, TexDrawnMip(hash, tgt)), &e) && e.srv.ptr) {
             *out = e.srv;
             return true;
         }
@@ -4659,6 +4662,26 @@ void RtNoteSlotTexture(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRI
             g_log.Line(true, "RTM4 slot stamp mod=%d comp=%d: game texture %p (%s, identity %08x) -> mod view %llx (%s)", mod, comp, (void*)game,
                 TexDesc(game).c_str(), e.hash, (unsigned long long)src.ptr, TexDesc(mod_res).c_str());
     }
+}
+
+void RtForgetModTextures(const std::unordered_set<ID3D12Resource*>& mod_res)
+{
+    if (mod_res.empty()) return;
+    size_t          stamps = 0, swaps = 0;
+    std::lock_guard l(g_slot_tex_m);
+    for (auto it = g_slot_tex.begin(); it != g_slot_tex.end();)
+        if (it->second.res && mod_res.count(it->second.res)) it = g_slot_tex.erase(it), ++stamps;
+        else ++it;
+    for (auto it = g_slot_tex_h.begin(); it != g_slot_tex_h.end();)
+        if (it->second.res && mod_res.count(it->second.res)) it = g_slot_tex_h.erase(it), ++stamps;
+        else ++it;
+    for (auto it = g_raster_swap.begin(); it != g_raster_swap.end();)
+        if (mod_res.count(it->second.first)) it = g_raster_swap.erase(it), ++swaps;
+        else ++it;
+    if (stamps || swaps)
+        g_log.Line(true, "RTM4 texture budget let go of %zu mod texture(s): %zu slot stamp(s) and %zu raster swap(s) "
+                         "forgotten, their RT material slots keep the game's texture until the raster draws them again",
+            mod_res.size(), stamps, swaps);
 }
 
 // A raster draw of mod component (mod, comp) reads the game's texture `game` as bound (section_ps_stamp.cpp).

@@ -123,7 +123,9 @@ uint32_t TexIdentityHash(uint32_t data_hash, uint32_t w, uint32_t h, uint32_t mi
 void     TexMipIdentityFromUpload(ID3D12Resource* dest, uint32_t sub, const uint8_t* src);
 void     TexMipIdentityForget(uint64_t res); // on destroy: whatever was held for it
 
-int      TexSelectIdx(uint32_t hash);
+int      TexSelectIdx(uint32_t hash, unsigned mip);
+// How many mips down the game draws `hash` against the mod target `target` (A20): 0 for the target itself, else its proven low's mip; unknown otherwise.
+unsigned TexDrawnMip(uint32_t hash, uint32_t target);
 uint32_t TexRuleHashFor(uint32_t hash);
 // The mod target `hash` is a lower mip or (A13) a look-alike of, from the texture cache, else 0.
 uint32_t TexLodTargetOf(uint32_t hash);
@@ -131,7 +133,7 @@ uint32_t ResolveBoundTextures(uint64_t heap, uint32_t base, uint32_t num, ID3D12
     uint32_t cap, const std::bitset<512>* want = nullptr);
 // Resolve a matched texture hash to a mod SRV via its rule's conditional assigns (last match wins).
 D3D12_CPU_DESCRIPTOR_HANDLE TexReplacement(uint32_t hash);
-int                         TexSelectIdxNs(uint32_t hash, const wchar_t* ns);
+int                         TexSelectIdxNs(uint32_t hash, const wchar_t* ns, unsigned mip);
 // Resolve a fully-qualified mod resource name ("ns\resourcename") -> its loaded mod-texture SRV ({0} if unknown).
 D3D12_CPU_DESCRIPTOR_HANDLE WclModSrvByResourceFq(const std::wstring& res_fq);
 D3D12_CPU_DESCRIPTOR_HANDLE RfxMapSrv(const std::wstring& res_fq, const wchar_t* ns);
@@ -140,6 +142,7 @@ bool        GlobalTexSwap(ID3D12Device* dev, uint64_t heap_handle, uint32_t slot
 const char* GlobalTexSwapDecline();
 void        TexPlacementReport();
 void        TexSnapshotSelections(const wchar_t* ns);
+void        TexSnapshotsMove(const std::unordered_map<int, int>& index_to); // store indices of replaced textures
 void        TexRetryMissed(const char* why, bool quiet_if_none = false);
 // Holds a resource for the next TexRetryMissed: one of its slots was given back to the game.
 void TexHoldForRetry(uint64_t res);

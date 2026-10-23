@@ -11,13 +11,9 @@
 //  PUBLISHED THROUGH AN ATOMIC POINTER, superseded tables never freed: a reload is a keypress, the table
 //  is a few hundred bytes, and a recording thread may still be reading the old one.
 // ---------------------------------------------------------------------------
-struct SkModHashes {
-    unsigned cb;
-    unsigned scale;
-};
 struct SkModHashTable {
-    unsigned                 gen;
-    std::vector<SkModHashes> h;
+    unsigned                                       gen;
+    std::vector<std::vector<PortApi::ShapeKeySet>> sets; // per mod
 };
 static std::atomic<const SkModHashTable*> g_sk_mod_hashes{ nullptr };
 
@@ -26,34 +22,57 @@ void SkRefreshModHashes()
 {
     const unsigned        gen = PortApi::LoadGeneration();
     const SkModHashTable* cur = g_sk_mod_hashes.load(std::memory_order_acquire);
-    if (cur && cur->gen == gen && cur->h.size() == g_geomods.size()) return;
+    if (cur && cur->gen == gen && cur->sets.size() == g_geomods.size()) return;
 
     auto* t = new SkModHashTable();
     t->gen = gen;
-    t->h.resize(g_geomods.size());
-    int with_cb = 0;
+    t->sets.resize(g_geomods.size());
+    int    with_cb = 0;
+    size_t n_sets = 0;
     for (size_t i = 0; i < g_geomods.size(); ++i) {
-        const wchar_t* ns = g_geomods[i].wcl_ns.c_str();
-        t->h[i].cb = PortApi::ModDeclaredShapeKeyHash(ns);
-        t->h[i].scale = PortApi::ModDeclaredShapeKeySectionHash(ns, L"scale");
-        if (t->h[i].cb) ++with_cb;
+        t->sets[i] = PortApi::ModDeclaredShapeKeySets(g_geomods[i].wcl_ns.c_str());
+        if (!t->sets[i].empty()) ++with_cb;
+        n_sets += t->sets[i].size();
     }
     g_sk_mod_hashes.store(t, std::memory_order_release);
-    logger::write("SKMODHASH: resolved %zu mod(s) at ini generation %u -- %d declare a shapekey callback.",
-        g_geomods.size(), gen, with_cb);
+    logger::write("SKMODHASH: resolved %zu mod(s) at ini generation %u -- %d declare a shapekey callback, "
+                  "%zu shapekey set(s) in all.",
+        g_geomods.size(), gen, with_cb, n_sets);
 }
 
-// THE HASH THIS MOD'S OWN ShapeKey*Callback DECLARES, or 0 when it ships none (not a u0 candidate).
-unsigned SkModCbHash(int i)
+static const std::vector<PortApi::ShapeKeySet>* SkModSets(int i)
 {
     const SkModHashTable* t = g_sk_mod_hashes.load(std::memory_order_acquire);
-    return (t && i >= 0 && (size_t)i < t->h.size()) ? t->h[i].cb : 0u;
+    return (t && i >= 0 && (size_t)i < t->sets.size()) ? &t->sets[i] : nullptr;
 }
-// ...and its ShapeKeyScale hash, which is how cs-u1 is identified. See ModDeclaredShapeKeySectionHash.
-unsigned SkModScaleHash(int i)
+
+// THE SET WHOSE ShapeKey*Callback DECLARES `cb`, or nullptr: a u0 of that hash is not this mod's.
+static const PortApi::ShapeKeySet* SkSetOf(const std::vector<PortApi::ShapeKeySet>* sets, unsigned cb)
 {
-    const SkModHashTable* t = g_sk_mod_hashes.load(std::memory_order_acquire);
-    return (t && i >= 0 && (size_t)i < t->h.size()) ? t->h[i].scale : 0u;
+    if (!sets || !cb) return nullptr;
+    for (const PortApi::ShapeKeySet& s : *sets)
+        if (s.cb == cb) return &s;
+    return nullptr;
+}
+
+bool SkModDeclaresCb(int i, unsigned cb)
+{
+    return SkSetOf(SkModSets(i), cb) != nullptr;
+}
+
+// ...and the ShapeKeyScale paired with it, which is how cs-u1 is identified.
+unsigned SkModScaleFor(int i, unsigned cb)
+{
+    const PortApi::ShapeKeySet* s = SkSetOf(SkModSets(i), cb);
+    return s ? s->scale : 0u;
+}
+
+// The callback hash of mod i that `u0hash` names; its only one when it declares a single set; else 0.
+unsigned SkModCbFor(int i, unsigned u0hash)
+{
+    const std::vector<PortApi::ShapeKeySet>* sets = SkModSets(i);
+    if (SkSetOf(sets, u0hash)) return u0hash;
+    return (sets && sets->size() == 1) ? (*sets)[0].cb : 0u;
 }
 
 // ---------------------------------------------------------------------------

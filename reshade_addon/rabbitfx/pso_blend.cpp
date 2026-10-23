@@ -380,7 +380,9 @@ ID3D12PipelineState* GetBlendVariant(reshade::api::device* dev, uint64_t src_pso
     if (dps) SwapPixelShader(subs, dps, dps_desc);
 
     reshade::api::pipeline out = { 0 };
+    const auto             t0 = std::chrono::steady_clock::now();
     bool                   ok = dev->create_pipeline(layout, (uint32_t)subs.size(), subs.data(), &out);
+    const double           ms = logger::ms_since(t0);
     ID3D12PipelineState*   variant = ok ? reinterpret_cast<ID3D12PipelineState*>(out.handle) : nullptr;
     {
         std::lock_guard lv(g_blend_variant_mtx);
@@ -391,9 +393,10 @@ ID3D12PipelineState* GetBlendVariant(reshade::api::device* dev, uint64_t src_pso
         }
         g_blend_variant[key] = PsoVariant{ src_pso, variant };
     }
-    logger::trace("CUSTOMBLEND variant src=%llx blend='%s' alpha='%s' iniFactor=%.2f,%.2f,%.2f,%.2f (factor dynamic) decensored=%d -> %s",
+    logger::write("CUSTOMBLEND variant src=%llx blend='%s' alpha='%s' iniFactor=%.2f,%.2f,%.2f,%.2f (factor dynamic) decensored=%d -> %s, "
+                  "built on the drawing thread in %.1f ms",
         src_pso, blend_mode.c_str(), alpha_mode.empty() ? "(=color)" : alpha_mode.c_str(), bf[0], bf[1], bf[2], bf[3], (int)(dps != nullptr),
-        variant ? "OK" : "FAILED(create)");
+        variant ? "OK" : "FAILED(create)", ms);
     return variant;
 }
 
@@ -440,6 +443,7 @@ ID3D12PipelineState* GetInputLayoutVariant(reshade::api::device* dev, uint64_t s
         why = "the PSO's input layout is not the one the override was made from";
     std::vector<input_element> ie;
     ID3D12PipelineState*       variant = nullptr;
+    double                     ms = 0.0;
     if (!why) {
         const auto* src = static_cast<const input_element*>(subs[il].data);
         ie.assign(src, src + count);
@@ -453,10 +457,12 @@ ID3D12PipelineState* GetInputLayoutVariant(reshade::api::device* dev, uint64_t s
         shader_desc dps_desc{};
         if (dps) SwapPixelShader(subs, dps, dps_desc);
         reshade::api::pipeline out = { 0 };
+        const auto             t0 = std::chrono::steady_clock::now();
         if (dev->create_pipeline(layout, (uint32_t)subs.size(), subs.data(), &out))
             variant = reinterpret_cast<ID3D12PipelineState*>(out.handle);
         else
             why = "create_pipeline failed";
+        ms = logger::ms_since(t0);
     }
     {
         std::lock_guard l(g_layout_variant_mtx);
@@ -476,9 +482,9 @@ ID3D12PipelineState* GetInputLayoutVariant(reshade::api::device* dev, uint64_t s
         if (w < 0) break;
         n += (size_t)w;
     }
-    logger::write("ILAYOUT variant src=%llx elems=%u ps=%s ->%s%s:%s", (unsigned long long)src_pso, count,
-        !dps ? "game" : rfx ? (decensor ? "rabbitfx+decensored" : "rabbitfx") : "decensored",
-        variant ? " OK" : " NONE, drawn with the game's layout -- ", variant ? "" : why, desc);
+    logger::write("ILAYOUT variant src=%llx elems=%u ps=%s ->%s%s, built on the drawing thread in %.1f ms:%s",
+        (unsigned long long)src_pso, count, !dps ? "game" : rfx ? (decensor ? "rabbitfx+decensored" : "rabbitfx") : "decensored",
+        variant ? " OK" : " NONE, drawn with the game's layout -- ", variant ? "" : why, ms, desc);
     return variant;
 }
 

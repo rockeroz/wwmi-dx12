@@ -158,6 +158,16 @@ void SetFrameContext(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Com
     }
 }
 
+void SetGameWindow(void* hwnd)
+{
+    static std::atomic<void*> s_set{ nullptr };
+    if (!hwnd || s_set.load(std::memory_order_relaxed) == hwnd) return;
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    G->hWnd = (HWND)hwnd;
+    s_set.store(hwnd, std::memory_order_relaxed);
+    logger::write("PORT: game window %p -- cursor_x/y and window_width/height are taken from its client area", hwnd);
+}
+
 unsigned BridgeStackDepth()
 {
     return MigotoPort::BridgeDepth();

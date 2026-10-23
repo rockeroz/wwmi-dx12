@@ -4,6 +4,7 @@
 #include "port_keygate.h"
 #include "port_api.h"
 #include "port_api_internal.h" // LoadDeferredNow
+#include "dx12_wrap.h"         // NoteTextureUse
 #include "prof_core.h"
 #include "CommandList.h" // the parsed command types the typed observer reads (theirs, unmodified)
 #include "input.h"
@@ -37,6 +38,7 @@ std::mutex& Mtx()
 bool (*g_gate)(const wchar_t*) = nullptr;
 std::atomic<size_t> g_gated{ 0 };
 std::atomic<size_t> g_wrapped_quiet{ 0 };
+thread_local bool   t_bound_loading = false; // PortApi::BoundLoading
 
 } // namespace
 
@@ -405,6 +407,8 @@ public:
     unsigned                            sel_watch_gen = 0;
     CustomResource*                     sel_res = nullptr;
     CustomResource*                     file_src = nullptr; // a file texture this copies somewhere a draw does not sample it
+    CustomResource*                     slot_src = nullptr; // ... or into a draw's slot
+    ResourceCopyOperation*              this_copy = nullptr;
     bool                                is_if = false;
     bool                                is_run = false;
     CmdCost* cost = nullptr;
@@ -434,11 +438,15 @@ public:
                 rc->src.custom_resource_pool;
             if (!sel_always && rc->dst.type == ResourceCopyTargetType::CUSTOM_RESOURCE && !rc->dst.pool_dynamic_index_expression)
                 sel_res = const_cast<ResourceCopyTarget&>(rc->dst).GetCustomResource(nullptr);
+            if (rc->dst.type == ResourceCopyTargetType::THIS_RESOURCE) this_copy = const_cast<ResourceCopyOperation*>(rc);
             const bool draw_slot = (rc->dst.type == ResourceCopyTargetType::SHADER_RESOURCE && rc->dst.shader_type != L'c') ||
                 rc->dst.type == ResourceCopyTargetType::THIS_RESOURCE;
-            if (!draw_slot && rc->src.type == ResourceCopyTargetType::CUSTOM_RESOURCE && !rc->src.custom_resource_pool) {
+            if (rc->src.type == ResourceCopyTargetType::CUSTOM_RESOURCE && !rc->src.custom_resource_pool) {
                 CustomResource* src = const_cast<ResourceCopyTarget&>(rc->src).GetCustomResource(nullptr);
-                if (src && !src->filename.empty()) file_src = src;
+                if (src && !src->filename.empty() && draw_slot)
+                    slot_src = src;
+                else if (src && !src->filename.empty())
+                    file_src = src;
             }
         }
         relevant = ClassifyCommand(inner.get(), nullptr, cached);
@@ -483,8 +491,27 @@ public:
             trace->push_back(this);
             t_trace = nullptr;
         }
-        if (file_src) PortApi::LoadDeferredNow(file_src);
+        if (file_src) {
+            PortApi::LoadDeferredNow(file_src);
+            NoteTextureUse(file_src->resource);
+        }
+        if (slot_src) {
+            if (!slot_src->substantiated)
+                PortApi::DeferTexture(slot_src);
+            else
+                NoteTextureUse(slot_src->resource);
+            if (!slot_src->resource && PortApi::DeferredPending(slot_src)) t_bound_loading = true;
+        }
+        ResourceCopyOperation* const held = this_copy && state->resource && !state->this_target ? this_copy : nullptr;
+        DeferredBinding              bound;
+        if (held) held->deferred = &bound;
         if (!is_run || !g_run_explicit_hook || !g_run_explicit_hook(inner.get(), state)) inner->run(state);
+        if (held) {
+            held->deferred = nullptr;
+            if (bound.assigned) *state->resource = bound.resource;
+            if (bound.resource) bound.resource->Release();
+            if (bound.view) bound.view->Release();
+        }
         if (trace) t_trace = trace;
         t_cur_ini_line = outer;
         if (sel_always)
@@ -591,6 +618,16 @@ size_t OverrideNamespaceCount()
 } // namespace MigotoPort
 
 namespace PortApi {
+
+void ClearBoundLoading()
+{
+    MigotoPort::t_bound_loading = false;
+}
+
+bool BoundLoading()
+{
+    return MigotoPort::t_bound_loading;
+}
 
 void CommandCostMark()
 {

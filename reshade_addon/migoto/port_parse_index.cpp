@@ -9,6 +9,7 @@
 #include "port_keygate.h"
 #include "../../src/log.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cfloat>
 #include <cstdio>
@@ -54,18 +55,15 @@ struct SkNsLess { // THEIR relation (IniHandler.cpp WStringInsensitiveLess), not
 struct SkIndex {
     static const uint32_t kNoNs = 0xFFFFFFFFu;
     struct Row {
-        unsigned     hash;
-        uint32_t     ns_id; // index into `ns`; kNoNs for a section with no namespace
-        uint8_t      kind;
-        std::wstring leaf; // verbatim; only the generic `which` query looks inside it
+        unsigned hash;
+        uint32_t ns_id; // index into `ns`; kNoNs for a section with no namespace
     };
-    std::vector<std::wstring>                           ns;
-    std::map<std::wstring, uint32_t, SkNsLess>          ns_by_name;
-    std::vector<Row>                                    rows;
-    std::unordered_map<unsigned, std::vector<uint32_t>> by_hash; // hash -> row indices
-    std::unordered_set<unsigned>                        callback_hashes;
-    std::unordered_map<uint32_t, unsigned>              cb_hash_by_ns;   // ns_id -> its callback hash
-    std::unordered_map<uint64_t, unsigned>              hash_by_ns_kind; // (ns_id<<8)|kind -> hash
+    std::vector<std::wstring>                              ns;
+    std::map<std::wstring, uint32_t, SkNsLess>             ns_by_name;
+    std::vector<Row>                                       rows;
+    std::unordered_map<unsigned, std::vector<uint32_t>>    by_hash;    // hash -> row indices
+    std::unordered_set<unsigned>                           callback_hashes;
+    std::unordered_map<uint32_t, std::vector<ShapeKeySet>> sets_by_ns; // ns_id -> one per callback hash
 
     uint32_t FindNs(const wchar_t* want) const
     {
@@ -84,18 +82,36 @@ struct SkIndex {
 };
 static std::atomic<const SkIndex*> g_sk_index{ nullptr };
 
-static uint8_t SkClassifyLeaf(const wchar_t* leaf)
+static uint8_t SkClassifyLeaf(const std::wstring& leaf, std::wstring* suffix)
 {
-    if (!_wcsicmp(leaf, L"ShapeKeyLoaderCallback")) return kSkLoaderCb;
-    if (!_wcsicmp(leaf, L"ShapeKeyMultiplierCallback")) return kSkMultiplierCb;
-    if (!_wcsicmp(leaf, L"ShapeKeyOffsets")) return kSkOffsets;
-    if (!_wcsicmp(leaf, L"ShapeKeyScale")) return kSkScale;
+    static const struct {
+        const wchar_t* name;
+        uint8_t        kind;
+    } kLeaves[] = {
+        { L"ShapeKeyLoaderCallback", kSkLoaderCb },
+        { L"ShapeKeyMultiplierCallback", kSkMultiplierCb },
+        { L"ShapeKeyOffsets", kSkOffsets },
+        { L"ShapeKeyScale", kSkScale },
+    };
+    for (const auto& l : kLeaves) {
+        const size_t n = wcslen(l.name);
+        if (leaf.size() < n || _wcsnicmp(leaf.c_str(), l.name, n) != 0) continue;
+        *suffix = leaf.substr(n);
+        return l.kind;
+    }
     return kSkOther;
 }
 
 static void RebuildShapeKeyIndex()
 {
-    auto* ix = new SkIndex();
+    struct SkNamed {
+        uint32_t     ns_id;
+        std::wstring suffix;
+        unsigned     hash;
+    };
+    std::vector<SkNamed> callbacks;
+    std::vector<SkNamed> scales;
+    auto*                ix = new SkIndex();
     for (auto& kv : G->mTextureOverrideMap) {
         for (TextureOverride& to : kv.second) {
             SkIndex::Row r;
@@ -104,26 +120,39 @@ static void RebuildShapeKeyIndex()
             std::wstring nsw;
             if (get_section_namespace(to.ini_section.c_str(), &nsw) && !nsw.empty())
                 r.ns_id = ix->InternNs(nsw);
-            const size_t bs = to.ini_section.find_last_of(L'\\');
-            r.leaf = (bs == std::wstring::npos) ? to.ini_section : to.ini_section.substr(bs + 1);
-            r.kind = SkClassifyLeaf(r.leaf.c_str());
+            const size_t       bs = to.ini_section.find_last_of(L'\\');
+            const std::wstring leaf = (bs == std::wstring::npos) ? to.ini_section : to.ini_section.substr(bs + 1);
+            std::wstring       suffix;
+            const uint8_t      kind = SkClassifyLeaf(leaf, &suffix);
 
             ix->by_hash[r.hash].push_back((uint32_t)ix->rows.size());
-            if (r.kind == kSkLoaderCb || r.kind == kSkMultiplierCb) {
+            if (kind == kSkLoaderCb || kind == kSkMultiplierCb) {
                 ix->callback_hashes.insert(r.hash);
-                // Both callbacks carry the same hash, so whichever lands first is the same answer.
-                if (r.ns_id != SkIndex::kNoNs) ix->cb_hash_by_ns.emplace(r.ns_id, r.hash);
+                if (r.ns_id != SkIndex::kNoNs) callbacks.push_back({ r.ns_id, std::move(suffix), r.hash });
+            } else if (kind == kSkScale && r.ns_id != SkIndex::kNoNs) {
+                scales.push_back({ r.ns_id, std::move(suffix), r.hash });
             }
-            if (r.ns_id != SkIndex::kNoNs && r.kind != kSkOther)
-                ix->hash_by_ns_kind.emplace(((uint64_t)r.ns_id << 8) | r.kind, r.hash);
-            ix->rows.push_back(std::move(r));
+            ix->rows.push_back(r);
         }
+    }
+    size_t n_sets = 0;
+    for (const SkNamed& c : callbacks) {
+        std::vector<ShapeKeySet>& sets = ix->sets_by_ns[c.ns_id];
+        if (std::any_of(sets.begin(), sets.end(), [&](const ShapeKeySet& s) { return s.cb == c.hash; })) continue;
+        unsigned scale = 0;
+        for (const SkNamed& s : scales)
+            if (s.ns_id == c.ns_id && !_wcsicmp(s.suffix.c_str(), c.suffix.c_str())) {
+                scale = s.hash;
+                break;
+            }
+        sets.push_back({ c.hash, scale });
+        ++n_sets;
     }
     g_sk_index.store(ix, std::memory_order_release);
     logger::write("PORT: shapekey section index rebuilt: %zu sections, %zu namespaces, %zu hashes, "
-                  "%zu callback hashes",
+                  "%zu callback hashes, %zu shapekey sets in %zu namespaces",
         ix->rows.size(), ix->ns.size(), ix->by_hash.size(),
-        ix->callback_hashes.size());
+        ix->callback_hashes.size(), n_sets, ix->sets_by_ns.size());
 }
 
 bool TextureOverrideHashKnown(uint32_t h)
@@ -231,47 +260,15 @@ bool ShapeKeyCallbackDeclaresHash(unsigned hash)
     return ix && ix->callback_hashes.find(hash) != ix->callback_hashes.end();
 }
 
-unsigned ModDeclaredShapeKeyHash(const wchar_t* ns)
+std::vector<ShapeKeySet> ModDeclaredShapeKeySets(const wchar_t* ns)
 {
-    if (!g_loaded || !ns || !*ns) return 0;
+    if (!g_loaded || !ns || !*ns) return {};
     const SkIndex* ix = g_sk_index.load(std::memory_order_acquire);
-    if (!ix) return 0;
+    if (!ix) return {};
     const uint32_t id = ix->FindNs(ns);
-    if (id == SkIndex::kNoNs) return 0;
-    auto it = ix->cb_hash_by_ns.find(id);
-    return (it == ix->cb_hash_by_ns.end()) ? 0u : it->second;
-}
-
-unsigned ModDeclaredShapeKeySectionHash(const wchar_t* ns, const wchar_t* which)
-{
-    if (!g_loaded || !ns || !*ns || !which || !*which) return 0;
-    const SkIndex* ix = g_sk_index.load(std::memory_order_acquire);
-    if (!ix) return 0;
-    const uint32_t id = ix->FindNs(ns);
-    if (id == SkIndex::kNoNs) return 0;
-
-    // The two names the library actually uses resolve to a leaf kind, so this is one map lookup.
-    uint8_t kind = kSkOther;
-    if (!_wcsicmp(which, L"scale"))
-        kind = kSkScale;
-    else if (!_wcsicmp(which, L"offsets"))
-        kind = kSkOffsets;
-    if (kind != kSkOther) {
-        auto it = ix->hash_by_ns_kind.find(((uint64_t)id << 8) | kind);
-        return (it == ix->hash_by_ns_kind.end()) ? 0u : it->second;
-    }
-
-    std::wstring sub = which;
-    for (wchar_t& c : sub) c = towlower(c);
-    for (const SkIndex::Row& r : ix->rows) {
-        if (r.ns_id != id) continue;
-        if (r.kind == kSkLoaderCb || r.kind == kSkMultiplierCb) continue;
-        std::wstring leaf = r.leaf;
-        for (wchar_t& c : leaf) c = towlower(c);
-        if (leaf.find(L"shapekey") != std::wstring::npos && leaf.find(sub) != std::wstring::npos)
-            return r.hash;
-    }
-    return 0;
+    if (id == SkIndex::kNoNs) return {};
+    auto it = ix->sets_by_ns.find(id);
+    return (it == ix->sets_by_ns.end()) ? std::vector<ShapeKeySet>() : it->second;
 }
 
 void ForEachBufferResize(void (*cb)(unsigned hash, unsigned stride, unsigned count, const wchar_t* section,

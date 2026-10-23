@@ -110,6 +110,8 @@ with a `wwmi-dx12` window showing "Active mods" above 0.
 | Decensor | saved to `wwmi_dx12.ini` |
 | Hide UID | hides your player number (bottom right, Esc menu, Friends list); off by default, saved to `wwmi_dx12.ini` |
 | Load mod textures in the background | on (default): no stutter, textures pop in a moment later. Off: textures from the first frame, after a short pause |
+| Mod texture budget | Auto (default): mod textures stay within the video memory the game leaves free; when it runs short, those not on screen go to a lower size, then out, and come back when shown again. A size (1024, 512, 256 or 128 MB) also caps each mod, for cards with little video memory. Original never changes a texture. Saved to `wwmi_dx12.ini` |
+| Mod textures follow the game's distance sizes | experimental, off by default: where the game draws a character's own texture at a lower size, as it does further from the camera, the mod's texture goes down as many sizes, and back up with the game's. Saves video memory. Needs Auto or a size above. Saved to `wwmi_dx12.ini` |
 | Use look-alike texture matches | on by default (see Texture matches); saved to `wwmi_dx12.ini` |
 | Use texture match cache | on by default; off: no texture matches are learned, read or saved (see Texture matches) |
 | Mod buffers in video memory | on by default (faster); saved to `wwmi_dx12.ini` |
@@ -153,8 +155,8 @@ brings seeds of what was already learned (`wwmi_dx12\cache\seed-<version>.lodcac
 ## Plans
 
 - **Ray tracing**, next.
-- **Performance** - less CPU work per modded draw, and video-memory management so mod buffers and
-  textures stay resident without pushing the game's own data out.
+- **Performance** - less CPU work per modded draw, and video-memory management for mod buffers, as the
+  mod texture budget now does for textures.
 - **Easier setup** - a streamlined install and a better launcher.
 - **Shared texture matches** - an automatically updated seed of learned texture matches, so mods look
   right on first launch. Sharing a file by hand works already (see Texture matches).

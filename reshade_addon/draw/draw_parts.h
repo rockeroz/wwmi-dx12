@@ -21,7 +21,7 @@ void DrawProbeVb6Reader(const DrawArgs& da, DrawClaim& dc);   // draw_probes.cpp
 void DrawProbeOffLeak(const DrawArgs& da, DrawClaim& dc);     // draw_probes.cpp
 void DrawProbeUnstamp(const ResInfo& ri, bool restored);      // draw_probes.cpp
 void StampClaimedTextures(const DrawArgs& da, DrawClaim& dc); // draw_texswap.cpp
-bool ModTexturesReady(int mod); // queues once; never waits for file I/O
+bool ModTexturesReady(int mod); // no texture of the mod still loading; never waits for file I/O
 bool ClaimedTexturesReady(const MergedComp&); // includes every merged sibling
 // Where a game character draw binds each texture: recorded while crawling, linked from a seed (draw_comp.cpp).
 void NoteMeshPlaces(const DrawArgs& da);
@@ -40,6 +40,7 @@ struct SectionPsSlot {
     uint32_t                    slot = 0;
     D3D12_CPU_DESCRIPTOR_HANDLE src{ 0 };
     ID3D12Resource*             res = nullptr;
+    bool                        stored = false; // res is in the texture store: checked after the stamp
 };
 // The section's own ps-tN for one injected draw, each resolved to the slot of the game's table it lands in
 // (section_ps_stamp.cpp).

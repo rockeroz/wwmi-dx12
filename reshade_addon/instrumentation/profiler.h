@@ -42,7 +42,7 @@ enum ProfBucket {
     PROF_TexSel_Engine,  //         - SelectTextureOverride for a hash that HAS a section: engine lock + their list run.
                          //           Nests wherever a selection runs (TH:Select, copy hooks)
     PROF_TexSel_Lock,    //           - EngineLock acquisition WAIT in it
-    PROF_TH_Detect,      //       - $object_detected = 1 for the claimed mod, then its texture-timing / eager-load notes
+    PROF_TH_Detect,      //       - $object_detected = 1 for the claimed mod, then its texture-timing note
     PROF_TH_DetLock,     //         - EngineLock acquisition WAIT, only when the flag is not already 1
     PROF_TH_Prep,        //       - the table walk's setup: descriptor size, bound tables, scan lengths, read slots
     PROF_DI_VbPrep,      //     - VB/IB snapshot, ApplyVB, restore_state setup, cloth/deform/shadow-table binds

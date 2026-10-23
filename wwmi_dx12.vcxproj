@@ -116,7 +116,11 @@ exit /b 0</Command>
     <ClCompile Include="reshade_addon\textures\tex_lod.cpp" />
     <ClCompile Include="reshade_addon\textures\tex_look.cpp" />
     <ClCompile Include="reshade_addon\textures\tex_crawl.cpp" />
-    <ClCompile Include="reshade_addon\textures\tex_eager.cpp" />
+    <ClCompile Include="reshade_addon\textures\tex_defer.cpp" />
+    <ClCompile Include="reshade_addon\textures\tex_replace.cpp" />
+    <ClCompile Include="reshade_addon\textures\tex_encode.cpp" />
+    <ClCompile Include="reshade_addon\textures\tex_budget.cpp" />
+    <ClCompile Include="reshade_addon\textures\tex_gc.cpp" />
     <ClCompile Include="reshade_addon\instrumentation\tex_timing.cpp" />
     <ClCompile Include="reshade_addon\mods\skeleton.cpp" />
     <ClCompile Include="reshade_addon\ui\overlay.cpp" />
@@ -134,6 +138,7 @@ exit /b 0</Command>
     <ClCompile Include="reshade_addon\instrumentation\crash_handler.cpp" />
     <ClCompile Include="reshade_addon\instrumentation\gpu_timer.cpp" />
     <ClCompile Include="reshade_addon\instrumentation\perf_monitor.cpp" />
+    <ClCompile Include="reshade_addon\instrumentation\vram_meter.cpp" />
     <ClCompile Include="reshade_addon\hud\uid_hide.cpp" />
   </ItemGroup>
   <ItemGroup Label="RT stub" Condition="'$(WwmiRT)' == '0'">
@@ -197,6 +202,7 @@ exit /b 0</Command>
   </ItemGroup>
   <ItemGroup Label="Shaders">
     <WwmiShader Include="$(WwmiRoot)reshade_addon\shaders\BufCopy.hlsl" />
+    <WwmiShader Include="$(WwmiRoot)reshade_addon\shaders\Bc7Half.hlsl" />
     <WwmiShader Include="$(WwmiRoot)shaders_src\IbVbHash.hlsl" />
     <WwmiShader Include="$(WwmiRoot)reshade_addon\rt\shaders\RtSkinMod.hlsl" />
   </ItemGroup>

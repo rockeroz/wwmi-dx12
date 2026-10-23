@@ -157,7 +157,19 @@
     <ClCompile Include="reshade_addon\textures\tex_crawl.cpp">
       <Filter>textures</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\textures\tex_eager.cpp">
+    <ClCompile Include="reshade_addon\textures\tex_defer.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_replace.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_encode.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_budget.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_gc.cpp">
       <Filter>textures</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\instrumentation\tex_timing.cpp">
@@ -209,6 +221,9 @@
       <Filter>instrumentation</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\instrumentation\perf_monitor.cpp">
+      <Filter>instrumentation</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\instrumentation\vram_meter.cpp">
       <Filter>instrumentation</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\hud\uid_hide.cpp">
