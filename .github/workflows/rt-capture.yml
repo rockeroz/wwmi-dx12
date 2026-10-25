@@ -60,7 +60,7 @@ jobs:
         run: |
           git submodule update --init --depth 1 reshade_addon/sdk
           New-Item -ItemType Directory -Force build_addon\rt_capture | Out-Null
-          ./tools/ci/annotate.ps1 -VcVars -Title "rt_tex_defer_test" -Command "cl /nologo /std:c++20 /EHsc /W4 /WX /MT /external:W0 /external:I reshade_addon\sdk\include tests\rt_tex_defer_test.cpp reshade_addon\textures\tex_defer.cpp /Febuild_addon\rt_capture\rt_tex_defer_test.exe /Fobuild_addon\rt_capture\ && build_addon\rt_capture\rt_tex_defer_test.exe"
+          ./tools/ci/annotate.ps1 -VcVars -Title "rt_tex_defer_test" -Command "cl /nologo /std:c++20 /EHsc /W4 /WX /wd4324 /MT /external:W0 /external:I reshade_addon\sdk\include tests\rt_tex_defer_test.cpp reshade_addon\textures\tex_defer.cpp /Febuild_addon\rt_capture\rt_tex_defer_test.exe /Fobuild_addon\rt_capture\ && build_addon\rt_capture\rt_tex_defer_test.exe"
       - uses: actions/upload-artifact@v4
         with:
           name: wwmi-rt-capture-development
