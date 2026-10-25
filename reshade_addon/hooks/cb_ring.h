@@ -49,7 +49,8 @@ struct CbRing {
         made.store(true, std::memory_order_release);
         return true;
     }
-    uint8_t* Take(uint64_t* out_va, ID3D12Resource** out_res = nullptr)
+    // `count` contiguous slots (count * kSlot bytes, at most one block apart); 1 = the single slot of every older caller.
+    uint8_t* Take(uint64_t* out_va, ID3D12Resource** out_res = nullptr, uint32_t count = 1)
     {
         std::lock_guard<std::mutex> l(mtx);
         const uint64_t              now = GpuStamp(); // 0 = never written
@@ -59,18 +60,22 @@ struct CbRing {
                 retired.pop_back();
             } else
                 ++i;
-        if (!cur.res) return nullptr;
-        if (next >= cur.slots) next = 0;
-        const uint32_t blk = next / kBlock;
-        if (next % kBlock == 0 && cur.tag[blk] && !GpuPassed(cur.tag[blk])) {
+        if (!cur.res || count == 0 || count > kBlock || count > cur.slots) return nullptr;
+        if (next + count > cur.slots) next = 0;
+        // Every block the span enters at its first slot must be one the GPU is done with (count 1: as before).
+        bool busy = false;
+        for (uint32_t s = next; s < next + count; ++s)
+            if (s % kBlock == 0 && cur.tag[s / kBlock] && !GpuPassed(cur.tag[s / kBlock])) busy = true;
+        if (busy) {
             Buf g;
             if (!Make(g, cur.slots * kSlot * 2)) return nullptr;
             retired.push_back({ cur.res, now });
             cur = std::move(g);
             next = 0;
         }
-        cur.tag[next / kBlock] = now;
-        const uint32_t off = next++ * kSlot;
+        for (uint32_t s = next; s < next + count; ++s) cur.tag[s / kBlock] = now;
+        const uint32_t off = next * kSlot;
+        next += count;
         *out_va = cur.res->GetGPUVirtualAddress() + off;
         if (out_res) *out_res = cur.res.Get();
         return cur.ptr + off;

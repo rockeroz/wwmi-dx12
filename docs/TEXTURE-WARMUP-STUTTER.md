@@ -76,3 +76,15 @@ La prueba Windows `rt_tex_defer_test` usa el `TexDeferWorker` real con callbacks
 comprueba que la carga no corre en el hilo de dibujo, que el mod queda pendiente desde que se pide, que una
 textura ya cargada no se vuelve a cargar, que los fallos terminan, que una carga de una generación anterior no se
 publica y que no quedan recursos vivos.
+
+## Partes del original parpadeando con RT (OBJCB-BORROW-PREV)
+
+Con RT, el juego dibuja los personajes también desde el skin cache, en pasadas sin CB de huesos ni CB del objeto. Un
+mod con instance skeleton (WWMI Tools 1.7, p. ej. Hsin "Linglang") necesita `vs-cb2` para encontrar su instancia; sin él
+su sección no dibuja nada y pasa la sección original. `OBJCB-BORROW` le prestaba el CB del objeto de la pasada con
+huesos del mismo frame, pero en el base pass esa pasada llega después: el componente 0 de Hsin dibujaba el original en
+cada frame (`SECTION-NODRAW ... instance_valid=0`, `MODDRAW comp=0 drew=0` / `drew=1` por frame).
+
+Ahora un componente al que alguna vez le faltó (`OBJCB-WANT`) guarda una copia del contenido de su CB del objeto;
+cuando no hay uno del frame, la pasada recibe la copia más reciente (como mucho 8 frames) en un buffer propio
+(`CbRing`, reutilizado solo cuando la GPU terminó con él) -- `OBJCB-BORROW-PREV` en el log.

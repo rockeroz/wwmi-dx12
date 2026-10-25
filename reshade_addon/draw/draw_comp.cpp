@@ -8,6 +8,7 @@
 #include "../mods/skeleton.h"
 #include "../mods/port_section.h"
 #include "../hooks/resource_tracker.h"
+#include "../hooks/cb_ring.h" // OBJCB-BORROW-PREV: copies of an object CB in a buffer of ours
 #include "../hooks/cmd_bind_hooks.h"
 #include "../mods/layout_registry.h"
 #include "../mods/shader_alias.h"
@@ -839,27 +840,72 @@ bool DrawComponent(InjectFrame& fr, int dm, const WwmiMod::Component* wc)
                 // show (Hsin "Linglang": 9 of 18 section runs a frame; mods without the instance check draw on). Such a
                 // pass gets the object CB this component's skinned draw had this frame -- the same instance, the same
                 // pool slot, its skeleton as that draw left it.
+                // The skinned draw is not always earlier in the frame: Hsin's comp 0 draws in the base pass (skin cache, no
+                // object CB) before its skinned draw, every frame, so a same-frame borrow found nothing and her original
+                // comp 0 drew under the mod each frame (seen as flickering parts of the original). A component that ever
+                // lacked one therefore keeps a copy of its object CB's contents; with none of this frame yet, the pass gets
+                // the latest copy (at most kObjAge frames old: the same instance and pool slot, which is what the instance
+                // capture reads -- the posed vertices come from the skin cache) in a buffer of ours that the GPU is done with
+                // before it is reused (CbRing).
+                constexpr uint32_t kObjAge = 8;
+                constexpr uint32_t kObjBytes = kDx11ObjectCbByteWidth;
+                static_assert(kObjBytes % CbRing::kSlot == 0 && kObjBytes / CbRing::kSlot <= CbRing::kBlock);
                 struct ObjSeen {
                     RootCbvBind cb;
                     uint32_t    frame = 0;
+                    bool        wanted = false; // a pass of this component once found no object CB of the frame
+                    uint32_t    copy_frame = 0;
+                    uint32_t    copy_n = 0;
+                    uint8_t     copy[kObjBytes];
                 };
-                static std::mutex                         s_obj_m;
+                static std::mutex                            s_obj_m;
                 static std::unordered_map<uint32_t, ObjSeen> s_obj; // (mod, comp) -> its last object CB
-                const uint32_t                            key = (uint32_t(dm) << 8) | (uint32_t(wc->index) & 0xff);
+                static CbRing                                s_obj_ring;
+                const uint32_t                               key = (uint32_t(dm) << 8) | (uint32_t(wc->index) & 0xff);
                 if (obj.res && obj.va) {
                     std::lock_guard l(s_obj_m);
-                    s_obj[key] = { obj, g_frame_id };
+                    ObjSeen&        e = s_obj[key];
+                    e.cb = obj;
+                    e.frame = g_frame_id;
+                    if (e.wanted) {
+                        const uint32_t n = SnapshotGameCB(obj.res, obj.va, e.copy, kObjBytes);
+                        if (n) {
+                            e.copy_n = n;
+                            e.copy_frame = g_frame_id;
+                        }
+                    }
                 } else if (!port_cb4_res) {
                     std::lock_guard l(s_obj_m);
-                    const auto it = s_obj.find(key);
-                    if (it != s_obj.end() && it->second.frame == g_frame_id) {
-                        obj = it->second.cb;
+                    ObjSeen&        e = s_obj[key];
+                    if (e.frame == g_frame_id && e.cb.res) {
+                        obj = e.cb;
                         ++g_port_obj_borrowed;
                         if (logger::enabled(1) && DiagOnce("OBJCB-BORROW", (int)key))
                             logger::write("OBJCB-BORROW f=%u mod=%d comp=%d vs=%016llx: a pass with no bone and no object CB (the skin "
                                           "cache's posed vertices) gets this component's object CB of this frame (%llx) -- its instance "
                                           "capture sees the character's instance",
                                 g_frame_id, dm, wc->index, (unsigned long long)vs_hash, (unsigned long long)obj.va);
+                    } else {
+                        if (!e.wanted && logger::enabled(1))
+                            logger::write("OBJCB-WANT f=%u mod=%d comp=%d vs=%016llx: no object CB of this frame yet (its skinned "
+                                          "draw comes later in the frame) -- its object CB is kept from now on, for the frames after",
+                                g_frame_id, dm, wc->index, (unsigned long long)vs_hash);
+                        e.wanted = true;
+                        uint64_t        va = 0;
+                        ID3D12Resource* ring = nullptr;
+                        uint8_t*        p = nullptr;
+                        if (e.copy_n && g_frame_id - e.copy_frame <= kObjAge && s_obj_ring.Ensure(g_d3d12_device, 1024 * 1024))
+                            p = s_obj_ring.Take(&va, &ring, kObjBytes / CbRing::kSlot);
+                        if (p) {
+                            memcpy(p, e.copy, e.copy_n);
+                            if (e.copy_n < kObjBytes) memset(p + e.copy_n, 0, kObjBytes - e.copy_n);
+                            obj = { ring, va, kObjBytes };
+                            ++g_port_obj_borrowed;
+                            if (logger::enabled(1) && DiagOnce("OBJCB-BORROW-PREV", (int)key))
+                                logger::write("OBJCB-BORROW-PREV f=%u mod=%d comp=%d vs=%016llx: no object CB of this frame yet -- "
+                                              "given a copy of the one from frame %u (%u B)",
+                                    g_frame_id, dm, wc->index, (unsigned long long)vs_hash, e.copy_frame, e.copy_n);
+                        }
                     }
                 }
                 if (obj.res && obj.va) PortApi::PushGameConstantBuffer('v', 2, obj.res, obj.va, kDx11ObjectCbByteWidth);
