@@ -61,7 +61,10 @@ Lo que se conservó de esta rama:
 - `ModTexturesReady` sigue reteniendo el dibujo del juego mientras una textura del mod se carga, ahora con
   `g_tex_defer.Pending(mod)`. Como las cargas se piden al ejecutar la sección, la primera ejecución del mod pasa
   (con las texturas del juego en los slots que aún cargan) y los dibujos siguientes esperan hasta que todo lo pedido
-  se publique. Una textura descargada por el presupuesto vuelve a pasar por esta espera al reaparecer.
+  se publique. Solo la primera carga de cada recarga de inis espera: después el mod queda "caliente" y una textura
+  que se carga más tarde (descargada por el presupuesto y pedida otra vez, o usada por primera vez por una parte o
+  toggle) deja el mod dibujado con la textura del juego en ese slot hasta que llega. Antes, cada recarga devolvía
+  todo el personaje al modelo original, visto como partes del original parpadeando con RT.
 - `TEXEAGER-NOW` se llama ahora `TEXDEFER-NOW` y mantiene la medición del tiempo de carga síncrona.
 
 `RtForgetModTextures` (llamado desde `tex_replace` al bajar, descargar o liberar una textura de mod) borra los

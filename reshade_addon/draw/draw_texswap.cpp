@@ -87,14 +87,34 @@ const ReadSlots& DrawReadSlots(reshade::api::command_list* cmd_list)
     return m.rs;
 }
 
-// Keep the game's draw while any texture of this mod is still loading in the background, so no mod command list
-// (texture copies included) runs against a texture that is not in yet. Since 2026.10.4 textures load on first draw
+// Keep the game's draw while this mod's textures load for the first time in an ini load, so no mod command list
+// (texture copies included) runs against textures that are not in yet. Since 2026.10.4 textures load on first draw
 // (TexDeferWorker), not as a whole namespace at the first claim: the first run of a mod's commands is what asks for
-// them, so that run goes through and the draws after it wait here until every texture it asked for is published.
+// them, so the draws of that frame go through and the draws after it wait here until every texture asked is in.
+// Once that has happened the mod is warm until the inis reload: a texture that loads later -- one the budget let go
+// of and that is asked again, or one a part or toggle first uses now -- keeps the mod drawn, with the game's texture
+// in that slot until it is in (section_ps_stamp.cpp), instead of flipping the whole character back to the game's
+// model each time (seen as parts of the original flickering under RT, where the budget is short of video memory).
+namespace {
+constexpr int         kTexWarmCap = 4096;
+std::atomic<uint64_t> g_tex_warm[kTexWarmCap]; // (generation << 33) | (warm << 32) | frame of the first ask
+} // namespace
 bool ModTexturesReady(int mod_id)
 {
     if (mod_id < 0 || mod_id >= (int)g_geomods.size() || g_geomods[mod_id].wcl_ns.empty()) return true;
-    return !g_tex_defer.Pending(mod_id);
+    if (mod_id >= kTexWarmCap) return !g_tex_defer.Pending(mod_id);
+    const uint64_t         gen = PortApi::LoadGeneration() & 0x7FFFFFFFu;
+    std::atomic<uint64_t>& s = g_tex_warm[mod_id];
+    const uint64_t         v = s.load(std::memory_order_acquire);
+    if ((v >> 33) != gen) { // the first ask of this ini load: let the run through, so it asks for its textures
+        s.store((gen << 33) | g_frame_id, std::memory_order_release);
+        return true;
+    }
+    if (v & (1ull << 32)) return true;                // warm
+    if (g_tex_defer.Pending(mod_id)) return false;    // first load still running: the game's draw
+    if ((uint32_t)v == g_frame_id) return true;       // the first frame's other draws ask for theirs too
+    s.store(v | (1ull << 32), std::memory_order_release);
+    return true;
 }
 
 bool ClaimedTexturesReady(const MergedComp& mc)
