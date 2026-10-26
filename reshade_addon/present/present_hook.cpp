@@ -154,8 +154,6 @@ void on_present_body(command_queue* queue, swapchain* sc)
     FrameStep(queue, sc, true);
 }
 
-// The per-frame step, once per game frame: at a present on the game's own thread, or at the game's frame end on its
-// thread (at_present = false), where [Present]'s draws to the back buffer are left to the presents' redraw.
 static void SetReloadStatus(std::string s)
 {
     std::lock_guard l(g_reload_status_m);
@@ -202,6 +200,8 @@ static void ReloadMods()
     SetReloadStatus(text);
 }
 
+// The per-frame step, once per game frame: at a present on the game's own thread, or at the game's frame end on its
+// thread (at_present = false), where [Present]'s draws to the back buffer are left to the presents' redraw.
 static void FrameStep(command_queue* queue, swapchain* sc, bool at_present)
 {
     if (g_reload_requested.exchange(false)) ReloadMods();
