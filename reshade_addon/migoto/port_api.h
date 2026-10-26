@@ -35,6 +35,9 @@ public:
 };
 
 void PresentPre();
+// Re-parses d3dx.ini and every mod ini now, as their F10 does (the same ReloadConfig their deferred first parse runs);
+// the load generation moves on. false before that first parse. Called with the mod gate paused (mods/mods_gate.h).
+bool ReloadConfigNow();
 void PresentPost();
 // A present no game frame came before (frame generation): [Present] and its post list again for what they draw --
 // no copy, compute or UAV clear, and every variable and ini param back as it was.

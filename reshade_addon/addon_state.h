@@ -56,6 +56,10 @@ struct GeoMod {
     uint32_t     last_char_frame = 0; // g_frame_id of the last claimed draw of this unit's character; 0 = never
     float        det_at_keys = 0.f;   // $object_detected sampled at key-poll time, before [Present]'s post pass clears it
     bool         geom_enabled = true; // $mod_enabled sampled after [Present]'s post pass; what ModGeomEnabled answers
+    // Mod reload (F10): a unit whose mod was removed or changed is never claimed again (its namespace renamed, its
+    // components out of the claim maps); the unit itself stays, as pointers into it may still be held.
+    bool         dead = false;
+    uint64_t     files_fp = 0; // its inis and buffer files (path, size, write time): unchanged = kept as it is
     // this unit's share of the heartbeat's sect= / skip= / replaced=
     FrameCounter sect_runs;
     FrameCounter skip_orig;

@@ -20,6 +20,13 @@ void               ModTexturesTick();                                           
 void               Heartbeat(uint32_t texinj_last);                                                  // present_diag.cpp
 void               HealthHeartbeat();                                                                // present_diag.cpp
 void               LoadGeometryMods();                                                               // present_mod_load.cpp
+// A mod reload's geometry part, after their engine re-parsed the inis: unchanged units kept (their buffers adopted
+// again), changed ones replaced by a new unit, new mods added, removed ones no longer claimed. Mod gate paused.
+struct ModsReloadResult {
+    int  kept = 0, changed = 0, added = 0, removed = 0;
+    bool changed_units = false;
+};
+ModsReloadResult   ReloadGeometryMods();                                                             // present_mod_load.cpp
 
 extern std::wstring g_cfg_engine_path;
 extern std::wstring g_cfg_db_path;

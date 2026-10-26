@@ -123,6 +123,9 @@ void RtNoteSlotTexture(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRI
 // be given their views again. A stamp of a mod off screen in raster stays usable kSlotTexAge frames, and the
 // character can still be in the rays (reflections) meanwhile. The raster draw notes the new view on its next draw.
 void RtForgetModTextures(const std::unordered_set<ID3D12Resource*>& mod_res);
+// A mod reload (F10) may change g_geomods only while the RT mesh loader, a thread of its own, reads none: true once it
+// is idle (at most timeout_ms). The mod gate is paused, so nothing starts it meanwhile.
+bool RtMeshLoaderIdle(unsigned timeout_ms);
 // ...and a game texture it reads unstamped (diagnostic: RTM4 tex tells these from textures the raster never reads).
 void RtNoteKeptTexture(int mod, int comp, ID3D12Resource* game, ID3D12Resource* swapped);
 // The index count of the sub-draw whose binds are noted next on this thread (a component's material table can hold one

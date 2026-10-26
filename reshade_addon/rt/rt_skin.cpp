@@ -950,7 +950,20 @@ void PreloadAll()
 {
     std::lock_guard l(g_m);
     for (size_t i = 0; i < g_geomods.size(); ++i)
-        if (!g_meshes.count(int(i))) g_requested.insert(int(i));
+        if (!g_meshes.count(int(i)) && !g_geomods[i].dead) g_requested.insert(int(i));
+}
+
+bool LoaderIdle(unsigned timeout_ms)
+{
+    const ULONGLONG until = GetTickCount64() + timeout_ms;
+    for (;;) {
+        {
+            std::lock_guard l(g_m);
+            if (!g_loader_running) return true;
+        }
+        if (GetTickCount64() >= until) return false;
+        Sleep(1);
+    }
 }
 
 VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* cl, int mod, int comp, uint32_t c, uint32_t s2)

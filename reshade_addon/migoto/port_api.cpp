@@ -273,6 +273,23 @@ static void FrameDriverConfig()
     }
 }
 
+bool ReloadConfigNow()
+{
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    // Before their deferred first parse nothing is loaded yet: that parse is the one that loads the mods.
+    if (!g_loaded || !G->gConfigInitialized) return false;
+    logger::write("PORT-RELOAD: re-parsing d3dx.ini and every mod ini (as F10 on DX11) at gTime=%.3f", G->gTime);
+    BumpGeneration();
+    ReloadConfig(&g_dev); // saves d3dx_user.ini first, as theirs does
+    RebuildParseSnapshots(); // MANDATORY after every parse
+    BumpGeneration();
+    g_step_inputs_taken = false;
+    MigotoPort::ClearSelectionVars();
+    logger::write("PORT-RELOAD: done -- %zu command lists, %zu custom shaders, %zu resources, %zu texture overrides",
+        registered_command_lists.size(), customShaders.size(), customResources.size(), G->mTextureOverrideMap.size());
+    return true;
+}
+
 void PresentPre()
 {
     {

@@ -1,6 +1,7 @@
 // The addon's shared include block. Every hook module compiled into this addon sees the world through
 // addon_common.h, so an extracted file is a move rather than a re-derivation of which header declares
 // what. It is .cpp-only: it ends with `using namespace reshade::api`, which no header may impose.
+#include "mods/mods_gate.h"
 #include "addon_common.h"
 #include "rt/rt_hooks.h"
 #include <shlwapi.h>
@@ -102,6 +103,7 @@ struct OwnDevice<Fn> {
     static R call(First first, A... a)
     {
         if (DeviceOf(first) != g_reshade_device) return R();
+        ModsGate gate; // a mod reload (F10) changes the mod lists only while no callback is inside (mods/mods_gate.h)
         return Fn(first, a...);
     }
 };

@@ -42,6 +42,9 @@ bool MeshReady(int mod);
 void RequestMesh(int mod);
 void PresentTick(); // hands requested meshes to the background loader, retires bindings
 void PreloadAll();  // every loaded mod's mesh, in the background (ray tracing just started)
+// The background loader has no mesh in hand (it reads g_geomods): waits up to timeout_ms. A mod reload calls it with
+// the mod gate paused, on the present thread -- the only one that starts the loader.
+bool LoaderIdle(unsigned timeout_ms);
 
 // The draw (draw_section_draw.cpp -> RtSkinDraw): pose the sub-draw [s2, s2 + c) of component `comp` of mod `mod`,
 // bind it, redirect the VS's fetch buffers and LocalVF. Returns what the core must restore / whether to skip.

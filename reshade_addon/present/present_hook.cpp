@@ -4,6 +4,7 @@
 #include "../instrumentation/removal_pin.h"
 #include "../addon_core.h"
 #include "../mods/claim_state.h"
+#include "../mods/mods_gate.h" // ReloadMods
 #include "../instrumentation/occlusion_probe.h"
 #include "../hooks/resource_tracker.h"
 #include "present_parts.h"
@@ -13,7 +14,7 @@
 #include "../instrumentation/hot_path.h"
 #include "../instrumentation/perf_monitor.h"
 #include "../hud/uid_hide.h"
-#include "../rt/rt_hooks.h" // RtPresentTick
+#include "../rt/rt_hooks.h" // RtPresentTick, RtMeshLoaderIdle
 #include "../textures/tex_replace.h"
 #include "../textures/tex_budget.h"
 #include "../textures/tex_encode.h"
@@ -116,6 +117,13 @@ void on_present_body(command_queue* queue, swapchain* sc)
             s_notice_until = ~0ull;
         }
     }
+    { // F10: reload the mods, as on DX11 (their engine re-parses every ini; meshes added, changed or removed)
+        static bool s_f10 = false;
+        const bool  f10 = GameKeyDown(VK_F10);
+        if (f10 && !s_f10 && !g_addon_disabled && !g_rt_blocked && !g_faulted && !g_reload_requested.exchange(true))
+            logger::write("RELOAD: F10 -- at the next frame step");
+        s_f10 = f10;
+    }
     { // F6 (no modifiers) toggles A1. Polled before the bypass return below, so it also turns the addon back on.
         static bool s_f6 = false;
         const bool  f6 = GameKeyDown(VK_F6);
@@ -148,20 +156,61 @@ void on_present_body(command_queue* queue, swapchain* sc)
 
 // The per-frame step, once per game frame: at a present on the game's own thread, or at the game's frame end on its
 // thread (at_present = false), where [Present]'s draws to the back buffer are left to the presents' redraw.
+static void SetReloadStatus(std::string s)
+{
+    std::lock_guard l(g_reload_status_m);
+    g_reload_status = std::move(s);
+}
+
+// F10 / Reload mods: their engine re-parses every ini (as their F10), the mod textures follow the new parse, and the
+// geometry units are made again where a mod changed. The mod lists change only while no game callback runs (the mod
+// gate), so this runs before the frame step takes its lock: a thread waiting on that lock is inside a callback.
+static void ReloadMods()
+{
+    const ULONGLONG t0 = GetTickCount64();
+    unsigned        waited = 0;
+    if (!ModsPause(2000, &waited)) {
+        logger::write("RELOAD: not done -- the game's threads did not leave the add-on's callbacks within %u ms", waited);
+        SetReloadStatus("Reload not done: the game was busy. Press F10 again.");
+        return;
+    }
+    struct Resume {
+        ~Resume() { ModsResume(); }
+    } resume;
+    if (!RtMeshLoaderIdle(5000)) {
+        logger::write("RELOAD: not done -- the RT mesh loader is still loading a mesh");
+        SetReloadStatus("Reload not done: a mesh was still loading. Press F10 again.");
+        return;
+    }
+    std::lock_guard frame_lock(EngineFrameMutex()); // free: every thread that takes it is inside a callback
+    if (!PortApi::ReloadConfigNow()) {
+        logger::write("RELOAD: not done -- their engine has not loaded the mods yet");
+        SetReloadStatus("Reload not done: the mods are not loaded yet.");
+        return;
+    }
+    ModLoader::Reload(); // LOD and look-alike caches read again, mod SRV slots handed out afresh (a new epoch)
+    ModLoader::Tick();
+    g_texovr_ready = false; // the texture rules of the new parse
+    ModTexturesTick();
+    const ModsReloadResult r = ReloadGeometryMods();
+    const ULONGLONG        ms = GetTickCount64() - t0;
+    logger::write("RELOAD: done in %llu ms (game threads paused after %u ms) -- meshes: %d kept, %d changed, %d added, %d removed",
+        ms, waited, r.kept, r.changed, r.added, r.removed);
+    char text[160];
+    snprintf(text, sizeof text, "Reloaded in %llu ms: %d mod mesh(es) changed, %d added, %d removed, %d unchanged.", ms,
+        r.changed, r.added, r.removed, r.kept);
+    SetReloadStatus(text);
+}
+
 static void FrameStep(command_queue* queue, swapchain* sc, bool at_present)
 {
+    if (g_reload_requested.exchange(false)) ReloadMods();
     std::lock_guard frame_lock(EngineFrameMutex());
     RtPresentTick(); // RT module, once per game frame: hold transitions, M3 gates left closed, the observe log
     PortProbeTick(queue, sc);
     ConfigWatchTick();
     UpdateSkinBand(); // keep the skin-pool VA band tracking the learned char VB0s (auto re-derive across patches)
     SeedHeartbeat();
-    // Manual reload (B1) runs on the render thread, at the frame boundary.
-    if (g_reload_requested.exchange(false)) {
-        ModLoader::Reload(); // -> g_reload_pending, applied by Tick() just below
-        g_texovr_ready = false;
-        logger::write("RELOAD: engine state cleared (g_texovr_ready=0) -- inis will be re-parsed");
-    }
     ModLoader::Tick();
     if (!g_skip_engine_tick && !RtHoldVanilla()) EngineFrameTick(queue, sc, at_present); // RTHOLD: no [Present] lists while held (as A9)
     StartRemovalWatchdog(sc);

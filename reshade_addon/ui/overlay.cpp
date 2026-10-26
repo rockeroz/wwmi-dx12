@@ -1,6 +1,7 @@
 // overlay.cpp -- the addon's ImGui control panel; it only reads and writes the shared flag globals.
 #include <imgui.h>
 #include "overlay.h"
+#include "../mods/mods_gate.h"
 #include "../config.h"
 #include "../build_stamp.h"
 #include "../instrumentation/perf_monitor.h"
@@ -307,6 +308,7 @@ bool OnOverlayOpen(effect_runtime*, bool open, input_source)
 void DrawOverlayPanel(effect_runtime* runtime)
 {
     if (!g_overlay_open.load(std::memory_order_relaxed)) return;
+    ModsGate gate; // reads the mod lists; with frame generation the overlay is drawn on another thread than the reload
     const ImGuiIO& io = ImGui::GetIO();
     const float    w = io.DisplaySize.x * 0.27f;
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - w - 8.f, 8.f), ImGuiCond_FirstUseEver);
@@ -563,6 +565,15 @@ void DrawOverlay(effect_runtime*)
         }
         if (s_clear) ImGui::TextColored({ 1, 1, 0, 1 }, "Caches will be cleared at the next launch.");
     }
+    if (NButton("B1", "Reload mods (F10): re-reads every mod ini, adds new mods, drops removed ones")) {
+        g_reload_requested.store(true);
+        logger::write("RELOAD: requested from overlay -- at the next frame step");
+    }
+    ImGui::TextDisabled("  Take the modded character off screen first (switch to another), as with F10 on DX11.");
+    {
+        std::lock_guard l(g_reload_status_m);
+        if (!g_reload_status.empty()) ImGui::TextDisabled("  %s", g_reload_status.c_str());
+    }
 #ifdef WWMI_DEBUG
     {
         bool crawl = TexCrawlOn();
@@ -574,10 +585,6 @@ void DrawOverlay(effect_runtime*)
         VerboseArm(600);
     if (logger::unlimited())
         ImGui::TextColored({ 1, 1, 0, 1 }, "verbose log ON");
-    if (NButton("B1", "Reload mods (re-reads every mod ini)")) {
-        g_reload_requested.store(true);
-        logger::write("RELOAD: requested from overlay -- will run at the next frame boundary");
-    }
 #endif
     ImGui::Separator();
     {

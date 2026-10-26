@@ -17,6 +17,9 @@ inline std::atomic<bool>                     g_ps_slot_queries{ false }; // a lo
 extern std::deque<GeoMod>                    g_geomods;   // deque: a unit never moves (comps are pointed into)
 extern std::unordered_map<std::wstring, int> g_ns_to_mod; // their namespace (GeoMod::wcl_ns) -> geomod index
 extern bool                                  g_geom_loaded;
+// Bumped by each mod reload that changed the units (present thread, the mod gate paused): copies of the component
+// windows (the RT module's) are made again.
+inline std::atomic<unsigned>                 g_mods_epoch{ 0 };
 
 inline const WwmiMod::Component* WmodComp(int mod_id, int idx)
 {

@@ -86,8 +86,9 @@ with a `wwmi-dx12` window showing "Active mods" above 0.
 
 ## Known Issues
 
-- WWMI's own hotkeys and guides are not available
-- Mods load when the game starts; restart the game after adding or changing a mod
+- WWMI's own hotkeys and guides are not available (except `[F10]`, which reloads the mods)
+- `[F10]` reloads the mods while the game runs: switch the modded character off screen first, as on DX11. A changed
+  or removed mod keeps its old meshes in memory until the game restarts
 - Decensor and RabbitFX mods prepare shaders on first sight (one-time stutter, saved for next launch)
 
 ## Mod Installation
@@ -99,7 +100,9 @@ with a `wwmi-dx12` window showing "Active mods" above 0.
 
 - `[Home]` - ReShade, with the `wwmi-dx12` window
 - `[F6]` - turn the add-on off and on
-- Keys a mod defines work as in DX11; WWMI's own (`[F10]`, `[F12]`, hunting mode) do nothing here.
+- `[F10]` - reload the mods: every mod ini parsed again, new mods added, changed ones loaded again, removed ones dropped
+  (also **Reload mods** in the `wwmi-dx12` window)
+- Keys a mod defines work as in DX11; WWMI's other keys (`[F12]`, hunting mode) do nothing here.
 
 ## The wwmi-dx12 window
 

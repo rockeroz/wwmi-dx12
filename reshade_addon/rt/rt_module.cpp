@@ -3568,6 +3568,11 @@ void RtCriticalInit(device* dev)
     ReshadeLog(ok ? reshade::log::level::info : reshade::log::level::error,
         "wwmi-dx12 M5: exclusive descriptor reservation hook %s", ok ? "installed" : "unavailable (M5 won't borrow game heap space)");
 }
+bool RtMeshLoaderIdle(unsigned timeout_ms)
+{
+    return rtskin::LoaderIdle(timeout_ms);
+}
+
 void RtCriticalReset(command_list* list)
 {
     if (list) rtcritical::Reset(reinterpret_cast<const void*>(list->get_native()));
@@ -3657,13 +3662,18 @@ void RtPresentTick()
         g_log.Line(true, "RTSTART module M2, rt_mode=%d (%s); waiting for ray tracing (BLAS builds / DispatchRays)", Mode(), ModeText(Mode()));
     }
     {
-        static size_t s_comps_seen = SIZE_MAX;
-        static bool   s_loaded_seen = false;
-        if (g_merged_comps.size() != s_comps_seen || g_merged_loaded != s_loaded_seen) {
+        static size_t   s_comps_seen = SIZE_MAX;
+        static bool     s_loaded_seen = false;
+        static unsigned s_epoch_seen = ~0u;
+        const unsigned  epoch = g_mods_epoch.load(std::memory_order_acquire);
+        if (g_merged_comps.size() != s_comps_seen || g_merged_loaded != s_loaded_seen || epoch != s_epoch_seen) {
             s_comps_seen = g_merged_comps.size();
             s_loaded_seen = g_merged_loaded;
+            s_epoch_seen = epoch;
             std::vector<rtm::CompWindow> comps;
-            for (const MergedComp& c : g_merged_comps) comps.push_back({ c.mod_id, c.comp_idx, c.first_index, c.match_count });
+            for (const MergedComp& c : g_merged_comps) // a mod reload's removed units are not matched any more
+                if (c.mod_id >= 0 && c.mod_id < (int)g_geomods.size() && !g_geomods[c.mod_id].dead)
+                    comps.push_back({ c.mod_id, c.comp_idx, c.first_index, c.match_count });
             g_log.Line(true, "RTMODS merged_loaded=%d merged_enable=%d geomods=%zu components=%zu", g_merged_loaded ? 1 : 0,
                 g_merged_enable ? 1 : 0, g_geomods.size(), comps.size());
             ReshadeLog(reshade::log::level::info, "wwmi-dx12 RT module: %zu mod(s), %zu component window(s) loaded", g_geomods.size(),

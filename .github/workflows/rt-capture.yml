@@ -3,9 +3,9 @@ name: RT capture tool
 on:
   workflow_dispatch:
   push:
-    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'tests/mock_d3d12/**', 'reshade_addon/rt/**', 'reshade_addon/textures/tex_defer.*', 'reshade_addon/mods/claim_state.h', 'reshade_addon/migoto/port_vars.cpp', 'reshade_addon/draw/**', '.github/workflows/rt-capture.yml', 'tools/ci/**']
+    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'tests/mock_d3d12/**', 'reshade_addon/rt/**', 'reshade_addon/textures/tex_defer.*', 'reshade_addon/mods/claim_state.h', 'reshade_addon/mods/mods_gate.h', 'reshade_addon/migoto/port_vars.cpp', 'reshade_addon/draw/**', '.github/workflows/rt-capture.yml', 'tools/ci/**']
   pull_request:
-    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'tests/mock_d3d12/**', 'reshade_addon/rt/**', 'reshade_addon/textures/tex_defer.*', 'reshade_addon/mods/claim_state.h', 'reshade_addon/migoto/port_vars.cpp', 'reshade_addon/draw/**', '.github/workflows/rt-capture.yml', 'tools/ci/**']
+    paths: ['tools/rt_capture/**', 'tests/*rt_*', 'tests/mock_d3d12/**', 'reshade_addon/rt/**', 'reshade_addon/textures/tex_defer.*', 'reshade_addon/mods/claim_state.h', 'reshade_addon/mods/mods_gate.h', 'reshade_addon/migoto/port_vars.cpp', 'reshade_addon/draw/**', '.github/workflows/rt-capture.yml', 'tools/ci/**']
 
 permissions:
   contents: read
@@ -61,6 +61,13 @@ jobs:
           git submodule update --init --depth 1 reshade_addon/sdk
           New-Item -ItemType Directory -Force build_addon\rt_capture | Out-Null
           ./tools/ci/annotate.ps1 -VcVars -Title "rt_tex_defer_test" -Command "cl /nologo /std:c++20 /EHsc /W4 /WX /wd4324 /MT /external:W0 /external:I reshade_addon\sdk\include tests\rt_tex_defer_test.cpp reshade_addon\textures\tex_defer.cpp /Febuild_addon\rt_capture\rt_tex_defer_test.exe /Fobuild_addon\rt_capture\ && build_addon\rt_capture\rt_tex_defer_test.exe"
+      - name: CPU mod reload barrier
+        if: always()
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build_addon\rt_capture | Out-Null
+          ./tools/ci/annotate.ps1 -VcVars -Title "mods_gate_test" -Command "cl /nologo /std:c++20 /EHsc /W4 /WX /wd4324 /MT /O2 tests\mods_gate_test.cpp /Febuild_addon\rt_capture\mods_gate_test.exe /Fobuild_addon\rt_capture\ && build_addon\rt_capture\mods_gate_test.exe"
       - uses: actions/upload-artifact@v4
         with:
           name: wwmi-rt-capture-development

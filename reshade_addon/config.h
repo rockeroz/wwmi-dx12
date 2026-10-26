@@ -1,6 +1,7 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include "instrumentation/diag.h"
 
@@ -39,7 +40,9 @@ inline std::wstring      g_addon_ini_path;           // wwmi_dx12.ini, read at s
 inline bool              g_skip_engine_tick = false; // A9: perf A/B only -- no [Present] lists, no present pass; mods stop updating
 inline bool              g_frame_end_step = true;    // presents from another thread (frame generation): the per-frame step at the game's own frame end (Numpad 7)
 inline bool              g_hide_outline = false;
-inline std::atomic<bool> g_reload_requested{ false }; // overlay -> reload at the next frame boundary
+inline std::atomic<bool> g_reload_requested{ false }; // F10 / overlay -> reload at the next frame step
+inline std::mutex        g_reload_status_m;           // g_reload_status
+inline std::string       g_reload_status;             // the last reload's outcome, for the overlay
 
 inline std::atomic<uint32_t> g_rfx_glow_count{ 0 };  // patched draws that ran with the glow block's maps bound
 inline std::atomic<uint32_t> g_rfx_glow_params{ 0 }; // components the ini armed (h/brightness/GlowMap)
