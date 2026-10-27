@@ -113,9 +113,15 @@ uint64_t FpMix(uint64_t h, uint64_t v)
 {
     return (h ^ v) * 1099511628211ull;
 }
+std::wstring FpPath(const std::wstring& path) // one spelling per file: lower case, backslashes
+{
+    std::wstring p = path;
+    for (wchar_t& c : p) c = (c >= L'A' && c <= L'Z') ? (wchar_t)(c + 32) : (c == L'/' ? L'\\' : c);
+    return p;
+}
 uint64_t FpFile(uint64_t h, const std::wstring& path)
 {
-    for (wchar_t c : path) h = FpMix(h, (uint64_t)((c >= L'A' && c <= L'Z') ? c + 32 : c));
+    for (wchar_t c : path) h = FpMix(h, (uint64_t)c);
     WIN32_FILE_ATTRIBUTE_DATA a{};
     if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) {
         h = FpMix(h, ((uint64_t)a.nFileSizeHigh << 32) | a.nFileSizeLow);
@@ -125,14 +131,21 @@ uint64_t FpFile(uint64_t h, const std::wstring& path)
     }
     return h;
 }
-// What a unit is made of on disk: its inis and the files its buffers load (a change to either = another unit).
+// What a unit is made of on disk: its inis and the files its buffers load (a change to either = another unit). The
+// files are taken in sorted order: their engine lists its resources in hash-map order, which differs from one parse
+// to the next (it made every mod "changed" at each reload).
 uint64_t UnitFingerprint(const std::vector<std::wstring>& inis, const WwmiMod::Mod& mod)
 {
-    uint64_t h = 1469598103934665603ull;
-    for (const auto& p : inis) h = FpFile(h, p);
+    std::vector<std::wstring> files;
+    files.reserve(inis.size() + mod.resources.size() + 1);
+    for (const auto& p : inis) files.push_back(FpPath(p));
     for (const auto& r : mod.resources)
-        if (!r.filename.empty()) h = FpFile(h, r.filename);
-    if (!mod.forward_map_file.empty()) h = FpFile(h, mod.forward_map_file);
+        if (!r.filename.empty()) files.push_back(FpPath(r.filename));
+    if (!mod.forward_map_file.empty()) files.push_back(FpPath(mod.forward_map_file));
+    std::sort(files.begin(), files.end());
+    files.erase(std::unique(files.begin(), files.end()), files.end());
+    uint64_t h = 1469598103934665603ull;
+    for (const auto& f : files) h = FpFile(h, f);
     return h;
 }
 
