@@ -137,6 +137,12 @@ struct Mesh {
     bool                    blend16 = false; // Blend.buf: R16 ids + R16_UNORM weights (BlendMode 1)
     uint32_t                custom_pairs = 0; // instance skeleton: draw bone map pairs read
     Pose                    merged_cur, merged_prev; // the last merged palettes built (velocity-free history)
+    // WWMI shape keys (RtShapeKeys.hlsl): the mod's shape key data, read from its files, and the deltas made from it each
+    // frame (the game does not run its shape key compute while it ray traces). sk_entries 0 = none / not usable.
+    ComPtr<ID3D12Resource>  sk_off, sk_vid, sk_voff, sk_accum, sk_morph;
+    uint32_t                sk_entries = 0;
+    uint32_t                sk_frame = UINT32_MAX; // the frame sk_morph was made for
+    std::string             sk_why;                // why the mod has none (logged once)
     // M3: per component, the slots its sub-draws were posed into, this frame and the one before (the BLAS takes one)
     struct RtPose {
         int                                        slot = -1;
@@ -206,6 +212,10 @@ ComPtr<ID3D12DescriptorHeap> g_heap;
 uint32_t                     g_heap_next = 0, g_heap_inc = 0;
 bool                         g_pipeline_tried = false;
 std::string                  g_pipeline_why;
+ComPtr<ID3D12RootSignature>  g_sk_rs; // RtShapeKeys.cso: WWMI shape keys while the game ray traces
+ComPtr<ID3D12PipelineState>  g_sk_pso;
+bool                         g_sk_tried = false;
+std::string                  g_sk_why;
 CbRing                       g_cb;
 uint64_t                     g_draws = 0, g_skips = 0, g_dispatches = 0, g_cached = 0;
 // Per mod: how fresh the poses the raster draws are (a pose of an earlier frame shows as a jump in motion). g_m.
@@ -274,6 +284,33 @@ bool EnsurePipeline() // g_m held
     g_rs.Reset();
     g_heap.Reset();
     Log(true, "RTM2 pipeline FAILED: %s -- the mod is not drawn while the game ray traces", g_pipeline_why.c_str());
+    return false;
+}
+
+bool EnsureSkPipeline() // g_m held
+{
+    if (g_sk_pso) return true;
+    if (g_sk_tried) return false;
+    ID3D12Device* dev = g_d3d12_device;
+    if (!dev) return false;
+    g_sk_tried = true;
+    const std::vector<uint8_t> cso = WwmiReadFile((g_cso_dir + L"\\RtShapeKeys.cso").c_str());
+    D3D12_COMPUTE_PIPELINE_STATE_DESC d{};
+    if (cso.empty())
+        g_sk_why = "RtShapeKeys.cso missing";
+    else if (FAILED(dev->CreateRootSignature(0, cso.data(), cso.size(), IID_PPV_ARGS(&g_sk_rs))))
+        g_sk_why = "root signature";
+    else {
+        d.pRootSignature = g_sk_rs.Get();
+        d.CS = { cso.data(), cso.size() };
+        if (SUCCEEDED(dev->CreateComputePipelineState(&d, IID_PPV_ARGS(&g_sk_pso)))) {
+            Log(true, "RTM2 shape key pipeline ready (RtShapeKeys.cso %zu bytes)", cso.size());
+            return true;
+        }
+        g_sk_why = "compute PSO";
+    }
+    g_sk_rs.Reset();
+    Log(true, "RTM2 shape key pipeline FAILED: %s -- mods are posed without their shape keys while the game ray traces", g_sk_why.c_str());
     return false;
 }
 
@@ -459,6 +496,9 @@ bool LoadMesh(Mesh& m) // g_m NOT held (file and GPU work); the caller publishes
         { L"ResourceBlendBuffer", &m.blend, true, {} },     { L"ResourceVectorBuffer", &m.vec, true, {} },
         { L"ResourceTexcoordBuffer", &m.uv, true, {} },     { L"ResourceColorBuffer", &m.color, false, {} },
         { L"ResourceBlendRemapVertexVGBuffer", &m.vg, false, {} },
+        // WWMI shape keys (one batch: 128 shape keys)
+        { L"ResourceShapeKeyOffsetBuffer", &m.sk_off, false, {} },  { L"ResourceShapeKeyVertexIdBuffer", &m.sk_vid, false, {} },
+        { L"ResourceShapeKeyVertexOffsetBuffer", &m.sk_voff, false, {} },
     };
     for (Src& s : src) {
         const WwmiMod::Resource* r = WwmiMod::Find(mod, s.name);
@@ -477,6 +517,7 @@ bool LoadMesh(Mesh& m) // g_m NOT held (file and GPU work); the caller publishes
         }
     }
     Src &idx = src[0], &pos = src[1], &blend = src[2], &vec = src[3], &uv = src[4], &col = src[5], &vg = src[6];
+    Src &sko = src[7], &skv = src[8], &skd = src[9];
     m.verts = uint32_t(pos.bytes.size() / 12);
     m.indices = uint32_t(idx.bytes.size() / 4);
     m.blend_stride = blend.stride;
@@ -530,6 +571,30 @@ bool LoadMesh(Mesh& m) // g_m NOT held (file and GPU work); the caller publishes
         uv.bytes.size() < size_t(m.verts) * m.uv_stride) {
         m.why = "unexpected mesh layout";
         return false;
+    }
+    // shape keys: 128 entry starts (one batch), one vertex id and six R16_FLOAT offsets per entry
+    {
+        const uint32_t entries = uint32_t(skv.bytes.size() / 4);
+        if (sko.bytes.empty() && skv.bytes.empty() && skd.bytes.empty())
+            m.sk_why = "no shape keys";
+        else if (sko.bytes.size() != 512)
+            m.sk_why = "shape key offsets of " + std::to_string(sko.bytes.size()) + " bytes (one batch of 128 is 512; two batches are not supported)";
+        else if (!entries || skd.bytes.size() < size_t(entries) * 12)
+            m.sk_why = "shape key vertex data shorter than its " + std::to_string(entries) + " entries";
+        else if (FAILED(CreateD3D12Buffer(dev, D3D12_HEAP_TYPE_DEFAULT, uint64_t(m.verts) * 24, D3D12_RESOURCE_STATE_COMMON, &m.sk_accum,
+                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) ||
+                 FAILED(CreateD3D12Buffer(dev, D3D12_HEAP_TYPE_DEFAULT, uint64_t(m.verts) * 24, D3D12_RESOURCE_STATE_COMMON, &m.sk_morph,
+                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
+            m.sk_why = "shape key buffers";
+        else
+            m.sk_entries = entries;
+        if (!m.sk_entries) {
+            sko.bytes.clear();
+            skv.bytes.clear();
+            skd.bytes.clear();
+            m.sk_accum.Reset();
+            m.sk_morph.Reset();
+        }
     }
     uint64_t total = 0;
     for (Src& s : src)
@@ -789,6 +854,58 @@ MorphBind MorphFor(uint64_t ring_va, int mod, uint32_t frame, uint32_t mesh_vert
     out.va = rb.va;
     out.verts = (uint32_t)(std::min)(rb.bytes / 24, uint64_t(mesh_verts));
     return out;
+}
+
+// The mod's shape key deltas made by the module (the game ray traces: its own shape key compute, WWMI's hook, does not
+// run): once a frame, on the first list that poses the mod, from the values the mod's [Present] wrote into its
+// CustomShapeKeyValuesRW. 0 = none (no shape keys, or no values buffer). g_m held.
+uint64_t SkMorphFor(Mesh& m, ID3D12GraphicsCommandList* cl, uint32_t frame)
+{
+    if (!m.sk_entries || !m.sk_morph || !cl) return 0;
+    if (m.sk_frame == frame) return m.sk_morph->GetGPUVirtualAddress();
+    if (!EnsureSkPipeline()) return 0;
+    if (m.mod < 0 || size_t(m.mod) >= g_geomods.size()) return 0;
+    const WwmiMod::Resource* r = WwmiMod::Find(g_geomods[size_t(m.mod)].mod, L"ResourceCustomShapeKeyValuesRW");
+    if (!r || !r->res || !r->gpu_va || r->size < 512) {
+        char key[48];
+        snprintf(key, sizeof key, "skvalues %d", m.mod);
+        char line[200];
+        snprintf(line, sizeof line, "RTM2 mod=%d: shape keys not made -- no ResourceCustomShapeKeyValuesRW buffer of 512 bytes (WWMI's shape key values)", m.mod);
+        LogOnce(key, line);
+        return 0;
+    }
+    const D3D12_RESOURCE_STATES was = MigotoPort::OwnedTransition(cl, r->res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(cl, m.sk_accum.Get(), m.sk_morph.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    cl->SetComputeRootSignature(g_sk_rs.Get());
+    cl->SetPipelineState(g_sk_pso.Get());
+    cl->SetComputeRootShaderResourceView(1, m.sk_off->GetGPUVirtualAddress());
+    cl->SetComputeRootShaderResourceView(2, m.sk_vid->GetGPUVirtualAddress());
+    cl->SetComputeRootShaderResourceView(3, m.sk_voff->GetGPUVirtualAddress());
+    cl->SetComputeRootShaderResourceView(4, r->gpu_va);
+    cl->SetComputeRootUnorderedAccessView(5, m.sk_accum->GetGPUVirtualAddress());
+    cl->SetComputeRootUnorderedAccessView(6, m.sk_morph->GetGPUVirtualAddress());
+    D3D12_RESOURCE_BARRIER uav{};
+    uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav.UAV.pResource = m.sk_accum.Get();
+    const uint32_t words = m.verts * 6;
+    for (uint32_t pass = 0; pass < 3; ++pass) {
+        const uint32_t c[4] = { pass, m.sk_entries, m.verts, 0u };
+        cl->SetComputeRoot32BitConstants(0, 4, c, 0);
+        cl->Dispatch(((pass == 1 ? m.sk_entries : words) + 63) / 64, 1, 1);
+        if (pass < 2) cl->ResourceBarrier(1, &uav);
+    }
+    Transition(cl, m.sk_accum.Get(), m.sk_morph.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
+    MigotoPort::OwnedTransition(cl, r->res, was);
+    RemovalPin::Ours(cl, "rt-m2 shape keys");
+    RemovalPin::Refs(cl, r->res, "rt-m2 shape key values");
+    m.sk_frame = frame;
+    char key[48];
+    snprintf(key, sizeof key, "skmade %d", m.mod);
+    char line[200];
+    snprintf(line, sizeof line, "RTM2 mod=%d: shape keys made by the module (%u entries, %u vertices) -- the game does not run its shape key compute while it ray traces",
+        m.mod, m.sk_entries, m.verts);
+    LogOnce(key, line);
+    return m.sk_morph->GetGPUVirtualAddress();
 }
 
 bool Overlaps(const ResInfo& ri, uint64_t va)
@@ -1213,19 +1330,27 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         // pose: COMMON | read -> UAV, dispatch, -> read
         const D3D12_RESOURCE_STATES from = bind->state == 2 ? kRead : D3D12_RESOURCE_STATE_COMMON;
         if (bind->state != 1) Transition(cl, sl.pos.Get(), sl.tan.Get(), from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        // shape keys: WWMI's chain output when the game made it (a widened morph buffer its skin cache reads), else the
+        // module's own (the game does not run its shape key compute while it ray traces)
         const MorphBind mo = MorphFor(ctx.ring, mod, frame, m.verts);
+        const uint64_t  sk_va = mo.verts ? 0 : SkMorphFor(m, cl, frame);
+        const uint64_t  morph_va = mo.verts ? mo.va : sk_va;
+        const uint32_t  morph_verts = mo.verts ? mo.verts : (sk_va ? m.verts : 0u);
         {
             char key[48];
-            snprintf(key, sizeof key, "morph %d %d", mod, mo.verts ? 1 : 0);
-            char line[200];
-            snprintf(line, sizeof line, "RTM2 mod=%d comp=%d: shape keys %s", mod, comp,
-                mo.verts ? "applied (the widened morph buffer its skin cache reads)" : "not applied (no widened morph buffer of this mod read by the ring's skin cache)");
+            snprintf(key, sizeof key, "morph %d %d", mod, mo.verts ? 1 : sk_va ? 2 : 0);
+            char line[240];
+            snprintf(line, sizeof line, "RTM2 mod=%d comp=%d: shape keys %s%s", mod, comp,
+                mo.verts ? "applied (the widened morph buffer its skin cache reads)"
+                : sk_va  ? "applied (made by the module)"
+                         : "not applied: ",
+                mo.verts || sk_va ? "" : (m.sk_why.empty() ? "no values" : m.sk_why.c_str()));
             LogOnce(key, line);
         }
         D3D12_RESOURCE_STATES morph_was = D3D12_RESOURCE_STATE_COMMON;
         if (mo.verts) morph_was = MigotoPort::OwnedTransition(cl, mo.res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         const uint32_t consts[12] = { s2, c, m.verts, palette_bones, m.influences, m.blend_stride, 0u, 0u, 0u, m.vg ? m.vg_stride : 0u,
-            m.blend16 ? 1u : 0u, mo.verts };
+            m.blend16 ? 1u : 0u, morph_verts };
         cl->SetComputeRootSignature(g_rs.Get());
         cl->SetPipelineState(g_pso.Get());
         cl->SetComputeRoot32BitConstants(0, 12, consts, 0);
@@ -1237,7 +1362,7 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         cl->SetComputeRootShaderResourceView(6, (m.vg ? m.vg : m.blend)->GetGPUVirtualAddress());
         cl->SetComputeRootUnorderedAccessView(7, sl.pos->GetGPUVirtualAddress());
         cl->SetComputeRootUnorderedAccessView(8, sl.tan->GetGPUVirtualAddress());
-        cl->SetComputeRootShaderResourceView(9, mo.verts ? mo.va : m.pos->GetGPUVirtualAddress());
+        cl->SetComputeRootShaderResourceView(9, morph_verts ? morph_va : m.pos->GetGPUVirtualAddress());
         cl->Dispatch((c + 63) / 64, 1, 1);
         RemovalPin::Ours(cl, "rt-m2 skin");
         if (mo.verts) {

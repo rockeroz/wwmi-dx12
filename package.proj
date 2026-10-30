@@ -17,6 +17,7 @@
     <WwmiPackageFile Include="$(WwmiRoot)shaders_cso\IbVbHash.cso" To="wwmi_dx12\IbVbHash.cso" />
     <WwmiPackageFile Include="$(WwmiRoot)shaders_cso\BufCopy.cso" To="wwmi_dx12\BufCopy.cso" />
     <WwmiPackageFile Include="$(WwmiRoot)shaders_cso\RtSkinMod.cso" To="wwmi_dx12\RtSkinMod.cso" Condition="'$(WwmiPackageRT)' == 'observe'" />
+    <WwmiPackageFile Include="$(WwmiRoot)shaders_cso\RtShapeKeys.cso" To="wwmi_dx12\RtShapeKeys.cso" Condition="'$(WwmiPackageRT)' == 'observe'" />
     <WwmiPackageFile Include="$(WwmiRoot)shaders_cso\Bc7Half.cso" To="wwmi_dx12\Bc7Half.cso" />
     <WwmiPackageFile Include="$(WwmiRoot)package\wwmi_dx12_seed.lodcache" To="wwmi_dx12\cache\seed-$(WwmiVersion).lodcache" />
     <WwmiPackageFile Include="$(WwmiRoot)package\wwmi_dx12_seed.texlook" To="wwmi_dx12\cache\seed-$(WwmiVersion).texlook" />

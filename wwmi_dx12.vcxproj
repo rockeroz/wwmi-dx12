@@ -205,6 +205,7 @@ exit /b 0</Command>
     <WwmiShader Include="$(WwmiRoot)reshade_addon\shaders\Bc7Half.hlsl" />
     <WwmiShader Include="$(WwmiRoot)shaders_src\IbVbHash.hlsl" />
     <WwmiShader Include="$(WwmiRoot)reshade_addon\rt\shaders\RtSkinMod.hlsl" />
+    <WwmiShader Include="$(WwmiRoot)reshade_addon\rt\shaders\RtShapeKeys.hlsl" />
   </ItemGroup>
   <Target Name="WwmiShaders" BeforeTargets="ClCompile"
           Inputs="@(WwmiShader);$(MSBuildProjectFullPath)"
