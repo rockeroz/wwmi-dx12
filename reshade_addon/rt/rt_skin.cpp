@@ -93,6 +93,7 @@ uint64_t FindRingKey(uint64_t va) // g_m held; 0 = no ring written by the skin c
     return 0;
 }
 constexpr uint32_t                     kStartForget = 1800; // frames a start not posed again stays in the layout
+constexpr uint32_t                     kLayoutRecent = 120; // frames within which every remembered start must have been posed
 // (the skin cache can leave a section unposed for long stretches; a ring the pool gives to another mesh is told apart
 // by its section count, see LookupSection)
 
@@ -234,7 +235,7 @@ thread_local ClaimCtx t_claim;
 
 void LogOnce(const std::string& key, const char* line) // g_m held
 {
-    if (g_logged.size() < 4096 && g_logged.insert(key).second) Log(true, "%s", line);
+    if (g_logged.size() < 16384 && g_logged.insert(key).second) Log(true, "%s", line);
 }
 
 void SkipLocked(const char* why, int mod, int comp) // g_m held
@@ -727,10 +728,18 @@ bool LookupSection(uint64_t ring_va, int comp, uint32_t frame, Sec* out, int mod
     auto           it = g_rings.find(ring);
     if (!ring || it == g_rings.end() || comp < 0) return false;
     const RingSecs& r = it->second;
-    // the mod's remembered layout: its start for this component, when the ring has posed it
+    // the mod's remembered layout: its start for this component, when the ring has posed it -- and only while this ring
+    // still lays the mesh out that way (every remembered start posed lately, as many sections as the BLAS has): a ring
+    // the game sets up again (a loading screen) may place the sections elsewhere, and a remembered start another section
+    // now begins at would pose this component with that section's bones
     if (mod >= 0) {
         const auto lm = g_mod_layout.find(mod);
-        if (lm != g_mod_layout.end() && size_t(comp) < lm->second.size()) {
+        bool       still = lm != g_mod_layout.end() && size_t(comp) < lm->second.size() && (!r.expected || r.expected == lm->second.size());
+        for (size_t i = 0; still && i < lm->second.size(); ++i) {
+            const auto x = r.by_start.find(lm->second[i]);
+            still = x != r.by_start.end() && frame - x->second.frame <= kLayoutRecent;
+        }
+        if (still) {
             const auto rs = r.by_start.find(lm->second[size_t(comp)]);
             if (rs != r.by_start.end() && int32_t(frame - rs->second.frame) <= int32_t(kSectionAge)) {
                 if (out) *out = rs->second.s;
@@ -759,10 +768,18 @@ bool LookupSection(uint64_t ring_va, int comp, uint32_t frame, Sec* out, int mod
     if (size_t(comp) >= live.size()) return false;
     // complete: remember it for this mod
     if (mod >= 0 && (r.expected ? live.size() == r.expected : ncomps && live.size() == ncomps)) {
+        std::vector<uint32_t> now;
+        for (const auto& [start, rec] : live) now.push_back(start);
         std::vector<uint32_t>& lay = g_mod_layout[mod];
-        if (lay.size() != live.size()) {
-            lay.clear();
-            for (const auto& [start, rec] : live) lay.push_back(start);
+        if (lay != now) { // a new layout (not only a new count): remembered from here on
+            static uint32_t s_told = 0;
+            if (!lay.empty() && s_told++ < 40) {
+                std::string was, is;
+                for (const uint32_t st : lay) was += " " + std::to_string(st);
+                for (const uint32_t st : now) is += " " + std::to_string(st);
+                Log(true, "RTM2 layout mod=%d f=%u: the ring lays the sections out anew -- starts%s (were%s)", mod, frame, is.c_str(), was.c_str());
+            }
+            lay = std::move(now);
         }
     }
     const SecRec& rec = *live[size_t(comp)].second;
@@ -790,6 +807,33 @@ bool BuildMerged(Mesh& m, Slot& sl, Bind& bind, int self_slot, uint64_t ring, ui
     }
     if (!base && posed.size() != m.merged_idx.size()) return false;
     if (posed.empty() && !base) return false;
+    // STALE-MERGE (diagnostic): sections not posed this frame keep the bones of the last merged palette. After a loading
+    // screen that palette can be thousands of frames old: a section the skin cache no longer poses for this ring would
+    // keep a pose from before it (stretched triangles). Which sections, how old, and what the ring holds.
+    if (base && posed.size() != m.merged_idx.size()) {
+        const uint32_t age = frame - bp.frame;
+        static std::map<int, uint32_t> s_last; // mod -> frame last logged
+        static uint32_t                s_lines = 0;
+        auto&                          last = s_last[m.mod];
+        if (age > 2 && s_lines < 60 && (last == 0 || frame - last >= 300)) {
+            last = frame;
+            ++s_lines;
+            std::string miss, lay, rem;
+            for (const int idx : m.merged_idx)
+                if (!posed.count(idx)) miss += " " + std::to_string(idx);
+            const uint64_t rk = FindRingKey(ring);
+            const auto     ri = g_rings.find(rk);
+            if (ri != g_rings.end())
+                for (const auto& [st, rec] : ri->second.by_start)
+                    lay += " " + std::to_string(st) + "/" + std::to_string(rec.s.bones) + "@-" + std::to_string(frame - rec.frame);
+            const auto lm = g_mod_layout.find(m.mod);
+            if (lm != g_mod_layout.end())
+                for (const uint32_t st : lm->second) rem += " " + std::to_string(st);
+            Log(true, "RTM2 STALE-MERGE mod=%d f=%u: section(s)%s not posed this frame -> their bones from the merged palette of %u frame(s) ago | "
+                      "ring %llx (expected %u) starts/bones@age:%s | remembered layout:%s",
+                m.mod, frame, miss.c_str(), age, (unsigned long long)rk, ri != g_rings.end() ? ri->second.expected : 0u, lay.c_str(), rem.c_str());
+        }
+    }
     D3D12_RESOURCE_BARRIER br{};
     br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     br.Transition.pResource = sl.merged.Get();
