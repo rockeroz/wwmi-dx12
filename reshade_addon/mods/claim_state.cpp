@@ -82,19 +82,37 @@ std::mutex                      g_ib_anchor_mtx;
 constexpr size_t                kIbAnchorCap = 256;    // a character is one entry; a sweep past this is a leak guard
 constexpr uint32_t              kIbAnchorStale = 1800; // ~30 s unconfirmed -- the buffer is not on screen any more
 
-CompSet ModDeclaredComps(int mod_id)
+// The components an anchor must see in full: the mod's components that share comp_idx's ini `hash=` (one index
+// buffer). A mod whose parts live in two buffers (Suoming Summer: components 0-6 in one, component 7 in another)
+// never shows every component in one buffer, so asking for the whole mod never learned it. Components without a
+// hash= group together (key 0), as before. Rebuilt when the component list or the loaded units change (F10).
+CompSet ModDeclaredComps(int mod_id, int comp_idx, unsigned* mod_total = nullptr)
 {
-    static std::mutex                       m;
-    static size_t                           built_for = (size_t)-1;
-    static std::unordered_map<int, CompSet> sets;
-    std::lock_guard                         l(m);
-    if (built_for != g_merged_comps.size()) {
+    static std::mutex                            m;
+    static size_t                                built_for = (size_t)-1;
+    static unsigned                              built_epoch = ~0u;
+    static std::unordered_map<uint64_t, CompSet> sets; // (mod << 32) | ib hash
+    static std::unordered_map<int, unsigned>     totals; // every component of the mod, whatever its buffer
+    std::lock_guard                              l(m);
+    const unsigned                               epoch = g_mods_epoch.load(std::memory_order_acquire);
+    if (built_for != g_merged_comps.size() || built_epoch != epoch) {
         sets.clear();
+        totals.clear();
         for (const MergedComp& c : g_merged_comps)
-            if (c.comp_idx >= 0) sets[c.mod_id].set(c.comp_idx);
+            if (c.comp_idx >= 0) {
+                ++totals[c.mod_id];
+                const WwmiMod::Component* wc = WmodComp(c.mod_id, c.comp_idx);
+                sets[((uint64_t)(uint32_t)c.mod_id << 32) | (wc ? wc->ib_hash : 0u)].set(c.comp_idx);
+            }
         built_for = g_merged_comps.size();
+        built_epoch = epoch;
     }
-    auto it = sets.find(mod_id);
+    if (mod_total) {
+        auto t = totals.find(mod_id);
+        *mod_total = t == totals.end() ? 0u : t->second;
+    }
+    const WwmiMod::Component* wc = WmodComp(mod_id, comp_idx);
+    auto it = sets.find(((uint64_t)(uint32_t)mod_id << 32) | (wc ? wc->ib_hash : 0u));
     return it == sets.end() ? CompSet{} : it->second;
 }
 } // namespace
@@ -102,7 +120,8 @@ CompSet ModDeclaredComps(int mod_id)
 bool IbAnchorNoteAndAsk(uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_idx)
 {
     if (!ib_va || mod_id < 0 || comp_idx < 0) return false;
-    const CompSet declared = ModDeclaredComps(mod_id);
+    unsigned      mod_total = 0;
+    const CompSet declared = ModDeclaredComps(mod_id, comp_idx, &mod_total);
     if (declared.empty()) return false;
     std::lock_guard l(g_ib_anchor_mtx);
     IbEvidence&     e = g_ib_ev[ib_va];
@@ -112,7 +131,18 @@ bool IbAnchorNoteAndAsk(uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_
         e.seen = CompSet{};
     }
     e.seen.set(comp_idx);
-    if (e.seen.covers(declared)) {
+    // A lone component in a buffer of its own (Suoming's component 7) is one (first, count) window: by itself that
+    // is weak evidence. It is anchored only while another buffer of the same mod is anchored and on screen.
+    bool enough = e.seen.covers(declared);
+    if (enough && declared.count() == 1 && mod_total > 1) {
+        enough = false;
+        for (const auto& [va, a] : g_ib_anchor)
+            if (va != ib_va && a.mod == mod_id && g_frame_id - a.confirmed <= 2) {
+                enough = true;
+                break;
+            }
+    }
+    if (enough) {
         IbAnchorRec& a = g_ib_anchor[ib_va];
         a.bytes = ib_bytes;
         if (a.mod != mod_id) {
@@ -120,9 +150,9 @@ bool IbAnchorNoteAndAsk(uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_
             a.learned = g_frame_id;
             g_ib_anchor_learned.fetch_add(1, std::memory_order_relaxed);
             logger::write("IBANCHOR learned: index buffer %llx carries mod %d's COMPLETE declared component "
-                          "set (%u components) in frame %u -- its draws are claimed from the next frame on, "
-                          "with no vertex content consulted",
-                (unsigned long long)ib_va, mod_id, declared.count(), g_frame_id);
+                          "set for its hash= (%u of the mod's %u components) in frame %u -- its draws are claimed "
+                          "from the next frame on, with no vertex content consulted",
+                (unsigned long long)ib_va, mod_id, declared.count(), mod_total, g_frame_id);
         }
         a.confirmed = g_frame_id;
     }
