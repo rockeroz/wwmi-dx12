@@ -211,6 +211,13 @@ $engineCvars = [ordered]@{
     "r.Streaming.HLODStrategy"          = "2"
     "r.MipMapLODBias"                   = "-1"
 }
+# Unreal's own RHI choice when the command line names none: Wuthering Waves.exe starts the game, and when it does not
+# hand -dx12 on (observed: some starts come up in DX11), the game reads this. Not read-only: the game saves its
+# settings here.
+$gameUserIni = [IO.Path]::Combine($root, "Client\Saved\Config\WindowsNoEditor\GameUserSettings.ini")
+$gameUserRhi = [ordered]@{
+    "bUseD3D12InGame" = "True"
+}
 # As XXMI Launcher writes it for WWMI: characters keep the model mods replace out to the farthest camera.
 $userEngineIni = [IO.Path]::Combine($root, "Client\Config\UserEngine.ini")
 $userEngineCvars = [ordered]@{
@@ -304,6 +311,19 @@ while ($true) {
 }
 Write-Host ""
 
+# The game's command line as Windows started it ("" when it cannot be read): did Wuthering Waves.exe hand -dx12 on?
+function Get-GameCommandLine {
+    try {
+        $p = Get-CimInstance Win32_Process -Filter "Name='$proc.exe'" -ErrorAction Stop | Select-Object -First 1
+        if ($p -and $p.CommandLine) { return [string]$p.CommandLine }
+    } catch {}
+    return ""
+}
+$launchLog = [IO.Path]::Combine($dir, "wwmi_dx12_launch.log")
+function Write-LaunchLog([string]$line) {
+    try { [IO.File]::AppendAllText($launchLog, "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $line`r`n") } catch {}
+}
+
 function Hide-LauncherWindow {
     try {
         Add-Type -Namespace WwmiDx12 -Name Console -MemberDefinition @'
@@ -319,6 +339,7 @@ $problem = ""
 try {
     Set-EngineCvars
     Set-IniValues $userEngineIni "ConsoleVariables" $userEngineCvars
+    try { Set-IniValues $gameUserIni "D3DRHIPreference" $gameUserRhi } catch { Write-Host "Could not write GameUserSettings.ini: $_" -ForegroundColor Yellow }
     $start = New-Object Diagnostics.ProcessStartInfo
     $start.FileName = $exe
     $start.Arguments = "-krqlv=$tier -dx12"
@@ -330,9 +351,21 @@ try {
         Start-Sleep -Seconds 1
     }
     if (-not $problem) {
-        Write-Host "Game starting. This window minimizes and closes by itself in a minute, once the game has read its settings."
-        Hide-LauncherWindow
-        Start-Sleep -Seconds 60
+        $cmd = ""
+        for ($i = 0; $i -lt 10 -and -not $cmd; $i++) { $cmd = Get-GameCommandLine; if (-not $cmd) { Start-Sleep -Milliseconds 500 } }
+        Write-LaunchLog "started '$exe -krqlv=$tier -dx12'; the game runs as: $(if ($cmd) { $cmd } else { '(command line not readable)' })"
+        if ($cmd -and $cmd -notmatch '(?i)(^|\s)-(dx12|d3d12)(\s|$)') {
+            Write-Host ""
+            Write-Host "Wuthering Waves.exe started the game WITHOUT -dx12:" -ForegroundColor Yellow
+            Write-Host "  $cmd" -ForegroundColor Yellow
+            Write-Host "GameUserSettings.ini asks for DX12, so it should still start in DX12. If it comes up in DX11, close it and start again." -ForegroundColor Yellow
+            Write-Host "(Written to wwmi_dx12_launch.log too.)"
+            Start-Sleep -Seconds 60
+        } else {
+            Write-Host "Game starting. This window minimizes and closes by itself in a minute, once the game has read its settings."
+            Hide-LauncherWindow
+            Start-Sleep -Seconds 60
+        }
     }
 }
 finally {

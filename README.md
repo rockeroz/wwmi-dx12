@@ -72,7 +72,10 @@ engine with the game in **DirectX 12**, on the WWMI folder and mods you already 
    - **Easy:** double-click `wwmi_dx12_launch.bat`. It finds your WWMI folder (or asks), saves it in
      `wwmi_dx12.ini`, writes the settings mods need into `Engine.ini` and `UserEngine.ini` and starts DX12.
      It shows the add-on and ReShade versions and both folders first; the arrow keys pick the graphics
-     files (UHD, HD, SD), any other key starts the game.
+     files (UHD, HD, SD), any other key starts the game. DirectX 12 is asked for twice: `-dx12` on the
+     command line and `bUseD3D12InGame=True` in `GameUserSettings.ini` (the game falls back to that when
+     `Wuthering Waves.exe` does not hand the argument on). The command line the game really got goes to
+     `wwmi_dx12_launch.log`; without `-dx12` the launcher window stays open and says so.
    - **By hand:** copy `wwmi_dx12.default.ini` to `wwmi_dx12.ini` (first time only), set `wwmi_dir` in it once, choose DirectX 12 in the game's settings and
      start the game as usual. XXMI Launcher already writes these lines when it starts WWMI; if mod
      textures, or whole characters at a distance, stay vanilla, add them (see What it changes) or run the
