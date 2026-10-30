@@ -73,12 +73,13 @@ engine with the game in **DirectX 12**, on the WWMI folder and mods you already 
      `wwmi_dx12.ini`, writes the settings mods need into `Engine.ini` and `UserEngine.ini` and starts DX12.
      It shows the add-on and ReShade versions and both folders first; the arrow keys pick the graphics
      files (UHD, HD, SD), any other key starts the game.
-   - **By hand:** set `wwmi_dir` in `wwmi_dx12.ini` once, choose DirectX 12 in the game's settings and
+   - **By hand:** copy `wwmi_dx12.default.ini` to `wwmi_dx12.ini` (first time only), set `wwmi_dir` in it once, choose DirectX 12 in the game's settings and
      start the game as usual. XXMI Launcher already writes these lines when it starts WWMI; if mod
      textures, or whole characters at a distance, stay vanilla, add them (see What it changes) or run the
      bat once.
 
-To update, unzip over the old files and keep your `wwmi_dx12.ini`.
+To update, unzip over the old files: the package carries its settings template as `wwmi_dx12.default.ini`, so your
+`wwmi_dx12.ini` stays as it is (the launcher makes one from the template when there is none).
 
 **Checklist** (Windows may hide `.dll`): `<Win64>` holds `dxgi.dll` (ReShade), `wwmi_dx12.addon64`, the
 `wwmi_dx12` folder with `IbVbHash.cso` and `dxc`, and the launcher files. In game, Home opens ReShade

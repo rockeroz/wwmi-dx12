@@ -5,6 +5,7 @@ $dir    = $PSScriptRoot
 $proc   = "Client-Win64-Shipping"
 $proxy  = [IO.Path]::Combine($dir, "dxgi.dll")
 $ini    = [IO.Path]::Combine($dir, "wwmi_dx12.ini")
+$iniDefault = [IO.Path]::Combine($dir, "wwmi_dx12.default.ini") # shipped under this name: an update never resets the settings
 $minReShade = [version]"6.8.0"
 
 function Wait-Key {
@@ -140,6 +141,10 @@ if (-not $addonDir -or -not [IO.File]::Exists([IO.Path]::Combine($addonDir, "wwm
     Fail "wwmi_dx12.addon64 is not in '$addonDir' (where ReShade loads add-ons from; ReShade.ini says AddonPath='$addonPath'). See README: Install."
 }
 
+if (-not [IO.File]::Exists($ini) -and [IO.File]::Exists($iniDefault)) {
+    [IO.File]::Copy($iniDefault, $ini)
+    Write-Host "wwmi_dx12.ini made from wwmi_dx12.default.ini (first start)."
+}
 $wwmi = Get-WwmiSetting
 $resolved = Resolve-Dir $wwmi
 $save = $false

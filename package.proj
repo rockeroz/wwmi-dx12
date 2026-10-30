@@ -53,7 +53,8 @@ File.WriteAllText(Destination, File.ReadAllText(Source), Encoding.Unicode);
              Properties="Configuration=Release;Platform=x64;WwmiRT=$(WwmiPackageRT);WwmiDeploy=false" />
     <RemoveDir Directories="$(WwmiStage)" />
     <Copy SourceFiles="@(WwmiPackageFile)" DestinationFiles="@(WwmiPackageFile->'$(WwmiStage)%(To)')" />
-    <WwmiWriteUtf16 Source="$(WwmiRoot)package\wwmi_dx12.ini" Destination="$(WwmiStage)wwmi_dx12.ini" />
+    <!-- the settings template under another name: unzipping an update over the game folder must not reset the player's wwmi_dx12.ini; the launcher makes wwmi_dx12.ini from it when there is none -->
+    <WwmiWriteUtf16 Source="$(WwmiRoot)package\wwmi_dx12.ini" Destination="$(WwmiStage)wwmi_dx12.default.ini" />
     <ZipDirectory SourceDirectory="$(WwmiStage)" DestinationFile="$(WwmiZip)" Overwrite="true" />
     <GetFileHash Files="$(WwmiZip)" Algorithm="SHA256">
       <Output TaskParameter="Hash" PropertyName="WwmiZipHash" />
