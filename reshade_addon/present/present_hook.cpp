@@ -160,6 +160,43 @@ static void SetReloadStatus(std::string s)
     g_reload_status = std::move(s);
 }
 
+// Waits until the GPU has finished what was already submitted to the game's queue and the present queue. Their engine's
+// re-parse releases every mod texture and buffer at once; ray dispatches and draws of the frames still in flight read
+// them (the RT material slots, the stamped descriptors): released under them, the GPU reads freed memory and the device
+// hangs (a mod removed with F10 while it was on screen). The game's threads are held at the mod gate meanwhile, so
+// nothing new is queued; a queue waiting on something only a held thread would signal makes this give up instead.
+static bool DrainGpuForReload(unsigned timeout_ms, unsigned* waited_ms)
+{
+    static ID3D12Fence* s_fence = nullptr;
+    static UINT64       s_value = 0;
+    static HANDLE       s_event = nullptr;
+    const ULONGLONG     t0 = GetTickCount64();
+    *waited_ms = 0;
+    if (!g_d3d12_device) return true;
+    if (!s_fence && FAILED(g_d3d12_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s_fence)))) return false;
+    if (!s_event && !(s_event = CreateEventW(nullptr, FALSE, FALSE, nullptr))) return false;
+    ID3D12CommandQueue* queues[2] = {
+        reinterpret_cast<ID3D12CommandQueue*>(g_game_submit_queue.load(std::memory_order_relaxed)),
+        reinterpret_cast<ID3D12CommandQueue*>(g_present_queue.load(std::memory_order_relaxed)),
+    };
+    if (queues[1] == queues[0]) queues[1] = nullptr;
+    for (ID3D12CommandQueue* q : queues) {
+        if (!q) continue;
+        const UINT64 v = ++s_value;
+        if (FAILED(q->Signal(s_fence, v))) return false;
+        if (s_fence->GetCompletedValue() >= v) continue;
+        if (FAILED(s_fence->SetEventOnCompletion(v, s_event))) return false;
+        const ULONGLONG spent = GetTickCount64() - t0;
+        const DWORD     left = spent >= timeout_ms ? 0 : DWORD(timeout_ms - spent);
+        if (WaitForSingleObject(s_event, left) != WAIT_OBJECT_0) {
+            *waited_ms = unsigned(GetTickCount64() - t0);
+            return false;
+        }
+    }
+    *waited_ms = unsigned(GetTickCount64() - t0);
+    return true;
+}
+
 // F10 / Reload mods: their engine re-parses every ini (as their F10), the mod textures follow the new parse, and the
 // geometry units are made again where a mod changed. The mod lists change only while no game callback runs (the mod
 // gate), so this runs before the frame step takes its lock: a thread waiting on that lock is inside a callback.
@@ -180,6 +217,13 @@ static void ReloadMods()
         SetReloadStatus("Reload not done: a mesh was still loading. Press F10 again.");
         return;
     }
+    unsigned drained = 0;
+    if (!DrainGpuForReload(3000, &drained)) {
+        logger::write("RELOAD: not done -- the GPU did not finish the frames in flight within %u ms", drained);
+        SetReloadStatus("Reload not done: the GPU was busy. Press F10 again.");
+        return;
+    }
+    logger::write("RELOAD: GPU idle after %u ms -- the frames in flight no longer read the mods' resources", drained);
     std::lock_guard frame_lock(EngineFrameMutex()); // free: every thread that takes it is inside a callback
     if (!PortApi::ReloadConfigNow()) {
         logger::write("RELOAD: not done -- their engine has not loaded the mods yet");
