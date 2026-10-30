@@ -30,6 +30,8 @@
 #include "../../src/gpu_progress.h" // GpuStamp / GpuPassed (M5 extended tables)
 #include "../mods/layout_registry.h" // TableStartOf
 #include "../mods/skeleton.h"        // SnapshotGameCB
+#include "../mods/buffer_relocation.h" // g_buffer_reloc: the skin cache's morph buffer, widened for a mod
+#include "../hooks/dxil_psv.h"         // DxilShaderSrvRegs: which skin cache variants read a morph buffer
 #include "../textures/texture_module.h" // TexHoldForRetry / TexRetryMissed
 #include "rt_hooks.h"
 #include "rt_registry.h"
@@ -422,10 +424,12 @@ uint64_t                                         g_cs_code_bytes = 0;
 constexpr uint64_t                               kCsCodeCap = 64ull << 20;
 std::set<uint64_t>                               g_cs_dumped; // g_shader_m
 std::set<uint64_t>                               g_skin_cs;   // g_shader_m: entry point SkinCacheUpdateBatchCS (UE GPU skin cache)
+std::set<uint64_t>                               g_skin_cs_morph; // g_shader_m: ...its MORPH_BLEND variants (they declare t6, the morph buffer)
 
-bool IsSkinCs(uint64_t cs)
+bool IsSkinCs(uint64_t cs, bool* morph = nullptr)
 {
     std::lock_guard l(g_shader_m);
+    if (morph) *morph = g_skin_cs_morph.count(cs) != 0;
     return g_skin_cs.count(cs) != 0;
 }
 
@@ -486,18 +490,20 @@ void NoteSkinSection(command_list* cmd_list, const CmdState& state, uint64_t cs_
 {
     thread_local uint64_t t_cs = 0;
     thread_local bool     t_skin = false;
+    thread_local bool     t_morph = false;
     if (cs_hash != t_cs) {
         t_cs = cs_hash;
-        t_skin = IsSkinCs(cs_hash);
+        t_skin = IsSkinCs(cs_hash, &t_morph);
     }
     if (!t_skin) return;
     // as observed, when the root signature has no map: tables p0 (SRVs) / p2 (UAVs), $Globals root CBV p3
-    RegBind t0{ 0, 0, true }, u0{ 2, 0, true }, u1{ 2, 1, true }, b0{ 3, 0, false };
+    RegBind t0{ 0, 0, true }, t6{ 0, 6, true }, u0{ 2, 0, true }, u1{ 2, 1, true }, b0{ 3, 0, false };
     {
         std::lock_guard l(g_layout_regmap_mtx);
         auto            it = g_layout_regmap.find(CmdCmpLayout(cmd_list));
         if (it != g_layout_regmap.end() && it->second.built && it->second.t_cs[0].param != 0xFF && it->second.u_cs[1].param != 0xFF) {
             t0 = it->second.t_cs[0];
+            if (it->second.t_cs[6].param != 0xFF) t6 = it->second.t_cs[6];
             u0 = it->second.u_cs[0];
             u1 = it->second.u_cs[1];
             if (it->second.b_cs[0].param != 0xFF) b0 = it->second.b_cs[0];
@@ -563,7 +569,13 @@ void NoteSkinSection(command_list* cmd_list, const CmdState& state, uint64_t cs_
         return;
     }
     const uint64_t tan_va = resolve(u0, rtan) ? rtan.cached_va : 0;
-    rtskin::NoteSection(ring, rring.size, start, pal, bones, tan_va, expected, g_frame_id, pal_res, pal_off);
+    // shape keys: the morph buffer the MORPH_BLEND variants read at t6, when the add-on widened it for a mod
+    ID3D12Resource* morph_inst = nullptr;
+    if (t_morph) {
+        ResInfo rmorph{};
+        if (resolve(t6, rmorph) && rmorph.res && g_buffer_reloc.Resolve(rmorph.res, nullptr)) morph_inst = rmorph.res;
+    }
+    rtskin::NoteSection(ring, rring.size, start, pal, bones, tan_va, expected, g_frame_id, pal_res, pal_off, morph_inst);
     g_c.sections.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -1403,6 +1415,16 @@ bool M3Records(ModBlas& mb, ID3D12Resource* rd, uint64_t rd_va, uint64_t hit_siz
         memcpy(&vb, r + 40, 8);
         memcpy(&cfg, r + 48, 4);
         memcpy(&off, r + 52, 4);
+        // a record the game left empty (no vertex factory data: observed for a geometry of Chisa's, all three ray types)
+        // reads nothing of the mesh: kept as it is. Refusing it kept the whole character the game's (vanilla in
+        // reflections).
+        if (!ib && !vb && !cfg && !off) {
+            static std::atomic<uint32_t> s_empty{ 0 };
+            if (s_empty.fetch_add(1) < 4)
+                g_log.Line(true, "RTM3 record %llu (contrib %u, geometry %u) carries no vertex factory data: kept as the game left it",
+                    (unsigned long long)(contrib + i), contrib, g);
+            continue;
+        }
         const bool is_game = ib == mb.game_ib && off == mb.game_off[g] && (cfg & 0xff) == mb.game_iw && ((cfg >> 8) & 0xff) == 12 &&
                              rtskin::RingKey(vb) != 0;
         const bool is_ours = ib == ib_va && off == mb.ib_off[g] && (cfg & 0xff) == 4;
@@ -4171,7 +4193,11 @@ void RtNoteShader(uint64_t cs_hash, const void* code, size_t code_size)
     g_cs_code_bytes += code_size;
     // The entry name is stored as plain text in the container's PSV0 string table.
     static const char kSkin[] = "SkinCacheUpdateBatchCS";
-    if (std::search(p, p + code_size, kSkin, kSkin + sizeof kSkin - 1) != p + code_size) g_skin_cs.insert(cs_hash);
+    if (std::search(p, p + code_size, kSkin, kSkin + sizeof kSkin - 1) != p + code_size) {
+        g_skin_cs.insert(cs_hash);
+        DxilSrvRegs regs;
+        if (DxilShaderSrvRegs(p, code_size, regs) && regs.has(6)) g_skin_cs_morph.insert(cs_hash);
+    }
 }
 
 // M4 (observe): a ray tracing pipeline's shaders. Each shader's library is dumped once (rtlib_<hash>.dxil); RTLIB names

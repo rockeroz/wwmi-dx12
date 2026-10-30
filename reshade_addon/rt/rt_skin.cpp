@@ -14,8 +14,10 @@
 // command list recording), bind it at IA slot 0 (and 4), point the VS's fetch slots at the mod's own buffers
 // (through the core's shadow table, ShadowSlotOvr) and patch LocalVF's NumTexcoords.
 //
-// The mod's mesh buffers are read from the files the engine loaded and kept in buffers of ours (shape keys are
-// not applied in this version). Root descriptors only on the game's list; its graphics PSO is put back after the
+// The mod's mesh buffers are read from the files the engine loaded and kept in buffers of ours. Shape keys: the deltas
+// WWMI's chain writes into the widened morph buffer (24 bytes a vertex: position delta, normal delta -- what the raster
+// path's VB6 reads) are added before skinning, when the skin cache dispatch of the ring reads that buffer (t6 of the
+// MORPH_BLEND variants) and the chain's instance for it is this mod's. Root descriptors only on the game's list; its graphics PSO is put back after the
 // dispatch; our output buffers move COMMON -> UAV -> read within a recording (buffers decay between submissions).
 #include "../addon_common.h"
 #include "../hooks/resource_tracker.h"
@@ -26,6 +28,9 @@
 #include "../mods/layout_registry.h"
 #include "../mods/skeleton.h"     // SnapshotGameCB
 #include "../mods/wwmi_runtime.h" // WwmiReadFile
+#include "../mods/buffer_relocation.h"  // g_buffer_reloc: the widened morph buffer of the game's
+#include "../migoto/dx12_bridge.h"       // OwnedTransition
+#include "../shapekeys/shapekey_chain.h" // SkGetBinding: whose shape keys the widened buffer holds
 #include "../rabbitfx/rabbitfx_bind.h"
 #include "../../src/d3d12_buffer.h"
 #include "../../src/gpu_progress.h"
@@ -71,6 +76,8 @@ struct RingSecs {
     uint32_t                   frame = 0;    // last dispatch seen
     uint64_t                   bytes = 0;    // the ring buffer's size (a VB0 inside it finds it)
     std::string                layout;       // the starts last logged
+    ID3D12Resource*            morph_inst = nullptr; // the game's morph buffer its skin cache read (a key, never dereferenced)
+    uint32_t                   morph_frame = 0;
 };
 std::unordered_map<uint64_t, RingSecs> g_rings;
 // A mod's section layout (start vertex per component) once seen complete: the same mesh lays its sections out the same
@@ -759,6 +766,31 @@ Slot* CachedPose(Mesh& m, int comp, uint32_t frame) // g_m held
     return &m.slots[size_t(p.slot)];
 }
 
+// The mod's shape key deltas for this ring: the widened morph buffer of the game's morph buffer its skin cache read
+// lately, when the shape key chain's instance for that buffer is this mod's (the raster path's RELOCBIND test).
+struct MorphBind {
+    ID3D12Resource* res = nullptr;
+    uint64_t        va = 0;
+    uint32_t        verts = 0;
+};
+MorphBind MorphFor(uint64_t ring_va, int mod, uint32_t frame, uint32_t mesh_verts) // g_m held
+{
+    MorphBind      out;
+    const uint64_t key = FindRingKey(ring_va);
+    const auto     it = g_rings.find(key);
+    if (!key || it == g_rings.end() || !it->second.morph_inst || frame - it->second.morph_frame > 2) return out;
+    if (mod < 0 || mod >= (int)g_geomods.size() || g_geomods[mod].dead) return out;
+    RelocBuf        rb{};
+    SkBufferBinding u0{};
+    if (!g_buffer_reloc.Resolve(it->second.morph_inst, &rb) ||
+        !SkGetBinding(g_geomods[mod].wcl_ns, it->second.morph_inst, TargetClass::UnorderedAccessView, 0, &u0) || u0.res != rb.res)
+        return out;
+    out.res = rb.res;
+    out.va = rb.va;
+    out.verts = (uint32_t)(std::min)(rb.bytes / 24, uint64_t(mesh_verts));
+    return out;
+}
+
 bool Overlaps(const ResInfo& ri, uint64_t va)
 {
     return va && ri.cached_va && va >= ri.cached_va && va < ri.cached_va + (ri.size ? ri.size : 1);
@@ -767,13 +799,17 @@ bool Overlaps(const ResInfo& ri, uint64_t va)
 } // namespace
 
 void NoteSection(uint64_t ring_va, uint64_t ring_bytes, uint32_t start, uint64_t palette_va, uint32_t bones, uint64_t tangent_ring_va,
-    uint32_t expected, uint32_t frame, ID3D12Resource* palette_res, uint64_t palette_off)
+    uint32_t expected, uint32_t frame, ID3D12Resource* palette_res, uint64_t palette_off, ID3D12Resource* morph_inst)
 {
     std::lock_guard l(g_m);
     if (g_rings.size() >= 64 && !g_rings.count(ring_va))
         for (auto it = g_rings.begin(); it != g_rings.end();)
             it = frame - it->second.frame > kStartForget ? g_rings.erase(it) : std::next(it);
     RingSecs& r = g_rings[ring_va];
+    if (morph_inst) {
+        r.morph_inst = morph_inst;
+        r.morph_frame = frame;
+    }
     if (expected) r.expected = expected;
     if (ring_bytes) r.bytes = ring_bytes;
     r.frame = frame;
@@ -1177,8 +1213,19 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         // pose: COMMON | read -> UAV, dispatch, -> read
         const D3D12_RESOURCE_STATES from = bind->state == 2 ? kRead : D3D12_RESOURCE_STATE_COMMON;
         if (bind->state != 1) Transition(cl, sl.pos.Get(), sl.tan.Get(), from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const MorphBind mo = MorphFor(ctx.ring, mod, frame, m.verts);
+        {
+            char key[48];
+            snprintf(key, sizeof key, "morph %d %d", mod, mo.verts ? 1 : 0);
+            char line[200];
+            snprintf(line, sizeof line, "RTM2 mod=%d comp=%d: shape keys %s", mod, comp,
+                mo.verts ? "applied (the widened morph buffer its skin cache reads)" : "not applied (no widened morph buffer of this mod read by the ring's skin cache)");
+            LogOnce(key, line);
+        }
+        D3D12_RESOURCE_STATES morph_was = D3D12_RESOURCE_STATE_COMMON;
+        if (mo.verts) morph_was = MigotoPort::OwnedTransition(cl, mo.res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         const uint32_t consts[12] = { s2, c, m.verts, palette_bones, m.influences, m.blend_stride, 0u, 0u, 0u, m.vg ? m.vg_stride : 0u,
-            m.blend16 ? 1u : 0u, 0u };
+            m.blend16 ? 1u : 0u, mo.verts };
         cl->SetComputeRootSignature(g_rs.Get());
         cl->SetPipelineState(g_pso.Get());
         cl->SetComputeRoot32BitConstants(0, 12, consts, 0);
@@ -1190,8 +1237,13 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         cl->SetComputeRootShaderResourceView(6, (m.vg ? m.vg : m.blend)->GetGPUVirtualAddress());
         cl->SetComputeRootUnorderedAccessView(7, sl.pos->GetGPUVirtualAddress());
         cl->SetComputeRootUnorderedAccessView(8, sl.tan->GetGPUVirtualAddress());
+        cl->SetComputeRootShaderResourceView(9, mo.verts ? mo.va : m.pos->GetGPUVirtualAddress());
         cl->Dispatch((c + 63) / 64, 1, 1);
         RemovalPin::Ours(cl, "rt-m2 skin");
+        if (mo.verts) {
+            RemovalPin::Refs(cl, mo.res, "rt-m2 shape keys");
+            MigotoPort::OwnedTransition(cl, mo.res, morph_was);
+        }
         Transition(cl, sl.pos.Get(), sl.tan.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
         bind->state = 2;
         sl.used = frame;

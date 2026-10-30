@@ -13,8 +13,10 @@ namespace rtskin {
 
 // A skin cache dispatch (any thread): the ring it writes (u1's buffer), the section's start vertex in it ($Globals
 // SkinCacheStart), its bone palette view and tangent output; `expected` = sections the ring's BLAS has (0 unknown).
+// morph_inst: the game's morph buffer the dispatch reads (t6 of the MORPH_BLEND variants) when the add-on widened it for
+// a mod -- the key of the shape key chain's instance, whose widened buffer holds the mod's shape key deltas.
 void NoteSection(uint64_t ring_va, uint64_t ring_bytes, uint32_t start, uint64_t palette_va, uint32_t bones, uint64_t tangent_ring_va,
-    uint32_t expected, uint32_t frame, ID3D12Resource* palette_res, uint64_t palette_off);
+    uint32_t expected, uint32_t frame, ID3D12Resource* palette_res, uint64_t palette_off, ID3D12Resource* morph_inst);
 bool MeshFailed(int mod); // the module cannot draw this mod (RTM2 mesh FAILED says why)
 
 // What the module saw of the game's draw it is about to replace (draw_claim.cpp -> RtClaimNote, same thread).

@@ -19,12 +19,16 @@
 //   BlendMode 1: Blend.buf holds InfluenceCount R16_UINT bone ids then InfluenceCount R16_UNORM weights (stride 32,
 //                8 influences: mods that build their own instance skeleton, e.g. Hsin "Moonover Fox"; the palette is
 //                that skeleton, rebuilt by the module from the sections' palettes and the mod's bone maps)
+//   t6 Morphs    optional (MorphVerts != 0): the widened morph buffer WWMI's shape key chain writes, 24 bytes a vertex
+//                (float3 position delta, float3 normal delta, the raster path's VB6), added in bind space before
+//                skinning as the game's morph does
 //   u0 OutPositions FLOAT3 per vertex
 //   u1 OutTangents  two R16G16B16A16_SNORM per vertex (TangentX, TangentZ.w = sign), the skin cache's own format
 #define RtSkinModRS \
     "RootConstants(num32BitConstants=12, b0)," \
     "SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), SRV(t5)," \
-    "UAV(u0), UAV(u1)"
+    "UAV(u0), UAV(u1)," \
+    "SRV(t6)"
 
 cbuffer Parameters : register(b0)
 {
@@ -39,7 +43,7 @@ cbuffer Parameters : register(b0)
     uint OutTanOffset;   // byte offset of this list's region in u1
     uint VgStride;       // bytes per vertex in VgIds (InfluenceCount * 2), 0 = the bone ids are Blend.buf's bytes
     uint BlendMode;      // 0: byte ids + UNORM8 weights, 1: R16 ids + UNORM16 weights
-    uint Pad2;
+    uint MorphVerts;     // vertices in Morphs, 0 = no shape keys
 };
 
 ByteAddressBuffer   Indices      : register(t0);
@@ -48,6 +52,7 @@ ByteAddressBuffer   Blends       : register(t2);
 ByteAddressBuffer   Vectors      : register(t3);
 ByteAddressBuffer   Palette      : register(t4);
 ByteAddressBuffer   VgIds        : register(t5);
+ByteAddressBuffer   Morphs       : register(t6);
 RWByteAddressBuffer OutPositions : register(u0);
 RWByteAddressBuffer OutTangents  : register(u1);
 
@@ -110,7 +115,14 @@ void main(uint3 tid : SV_DispatchThreadID)
         r2 += asfloat(Palette.Load4(b * 48u + 32u)) * f;
         sum += f;
     }
-    const float3 p = asfloat(Positions.Load3(v * 12u));
+    float3 p  = asfloat(Positions.Load3(v * 12u));
+    float3 dn = 0;
+    if (v < MorphVerts) {
+        const float3 dp = asfloat(Morphs.Load3(v * 24u));
+        const float3 dz = asfloat(Morphs.Load3(v * 24u + 12u));
+        if (all(isfinite(dp))) p += dp;
+        if (all(isfinite(dz))) dn = dz;
+    }
     float3       q = p;
     if (sum > 0.0) {
         const float4 h = float4(p, 1.0);
@@ -123,7 +135,11 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint2  vec = Vectors.Load2(v * 8u);
     const float4 a = Snorm8x4((VectorFlags & 1u) ? vec.y : vec.x); // tangent
     const float4 n = Snorm8x4((VectorFlags & 1u) ? vec.x : vec.y); // normal, w = bitangent sign
-    float3       t = a.xyz, z = n.xyz;
+    float3       t = a.xyz, z = n.xyz + dn;
+    if (any(dn != 0)) { // the morphed normal; the tangent made orthogonal to it again (UE's morph does the same)
+        z = normalize(z + 1e-12);
+        t = t - dot(t, z) * z;
+    }
     if (sum > 0.0) {
         t = float3(dot(r0.xyz, a.xyz), dot(r1.xyz, a.xyz), dot(r2.xyz, a.xyz));
         z = float3(dot(r0.xyz, n.xyz), dot(r1.xyz, n.xyz), dot(r2.xyz, n.xyz));
