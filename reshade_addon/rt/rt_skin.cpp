@@ -156,6 +156,8 @@ struct Mesh {
     };
     std::vector<MergedComp> merged;
     std::vector<int>        merged_idx; // the distinct sections the runs read
+    uint64_t                full_ring = 0; // merged skeleton: the ring last seen carrying every section it reads
+    uint32_t                full_ring_frame = 0;
     uint32_t                merged_bones = 0;
     bool                    blend16 = false; // Blend.buf: R16 ids + R16_UNORM weights (BlendMode 1)
     uint32_t                custom_pairs = 0; // instance skeleton: draw bone map pairs read
@@ -845,6 +847,16 @@ bool LookupSection(uint64_t ring_va, int comp, uint32_t frame, Sec* out, int mod
     return SecFor(r, *live[size_t(comp)].second, frame, out); // false: posed too long ago, its palette is gone
 }
 
+// Starts a ring holds (posed within kStartForget frames): how many sections of a mesh it carries.
+size_t RingSections(uint64_t ring_va, uint32_t frame) // g_m held
+{
+    const auto it = g_rings.find(FindRingKey(ring_va));
+    if (it == g_rings.end()) return 0;
+    size_t n = 0;
+    for (const auto& [st, rec] : it->second.by_start) n += frame - rec.frame <= kStartForget;
+    return n;
+}
+
 // RTM2 IDLE-RING (diagnostic): a draw posed from a ring the skin cache has not posed for a while (its kept palettes,
 // Keep). The ring holds that pose, so the game's own model there stands still too -- unless it is animated elsewhere
 // (another ring of the same mesh posed meanwhile, listed here). Once per ring as the idle stretch passes 8, 60, 300
@@ -1351,18 +1363,39 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         Sec  sec;
         bool fresh = LookupSection(ctx.ring, comp, frame, &sec, mod);
         uint32_t newest = fresh ? sec.frame : 0; // the latest dispatch the palettes come from
+        // Merged skeleton: its bones come from every section it reads, so only a ring carrying all of them can pose it.
+        // A part the game skins into a ring of its own (Aemeath's comp 7, Lynae's: one section) took that ring's section
+        // 0 as the body's section 0 -- wrong bones, and a wrong merged palette left as the base for the other parts.
+        // Such a draw is posed from the ring that carried the whole character within the last two frames.
+        uint64_t pose_ring = ctx.ring;
+        if (!m.merged.empty()) {
+            size_t need = 0;
+            for (const int idx : m.merged_idx) need = (std::max)(need, size_t(idx) + 1);
+            if (RingSections(ctx.ring, frame) >= need) {
+                m.full_ring = FindRingKey(ctx.ring);
+                m.full_ring_frame = frame;
+            } else if (m.full_ring && frame - m.full_ring_frame <= 2 && RingSections(m.full_ring, frame) >= need) {
+                pose_ring = m.full_ring;
+                static std::set<uint64_t> s_told;
+                if (s_told.size() < 64 && s_told.insert((uint64_t(uint32_t(mod)) << 40) ^ (uint64_t(uint32_t(comp)) << 32) ^ ctx.ring).second)
+                    Log(true, "RTM2 merged mod=%d comp=%d: its draw reads ring %llx (%zu section(s)), the merged skeleton needs %zu -- "
+                              "posed from ring %llx, the one carrying the whole character",
+                        mod, comp, (unsigned long long)ctx.ring, RingSections(ctx.ring, frame), need, (unsigned long long)pose_ring);
+            } else
+                pose_ring = 0; // no ring with the whole character lately: not posed (our last pose, or the game's draw)
+        }
         if (!m.merged.empty()) { // merged skeleton: any section posed this frame, or last frame's palettes, will do
             bool any = false;
             for (const int idx : m.merged_idx) {
                 Sec x;
-                if (LookupSection(ctx.ring, idx, frame, &x, mod)) {
+                if (pose_ring && LookupSection(pose_ring, idx, frame, &x, mod)) {
                     any = true;
                     if (int32_t(x.frame - newest) > 0 || !newest) newest = x.frame;
                 }
             }
             fresh = any;
         }
-        if (fresh) NoteIdleRing(ctx.ring, mod, comp, frame, newest);
+        if (fresh) NoteIdleRing(pose_ring ? pose_ring : ctx.ring, mod, comp, frame, newest);
         // no palette this frame (the skin cache did not pose the section): our last pose of it, drawn as it was
         Slot* cached = fresh ? nullptr : CachedPose(m, comp, frame);
         if (!fresh && !cached) {
@@ -1378,7 +1411,7 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         uint64_t palette_va = sec.pal;
         uint32_t palette_bones = sec.bones;
         if (fresh && !m.merged.empty()) {
-            if (!BuildMerged(m, sl, *bind, bind->slot, ctx.ring, frame, cl)) {
+            if (!BuildMerged(m, sl, *bind, bind->slot, pose_ring, frame, cl)) {
                 SkipLocked("merged skeleton: not every section posed and no earlier merged palettes", mod, comp);
                 return out;
             }
@@ -1387,7 +1420,7 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
             bool old = false;
             for (const int idx : m.merged_idx) {
                 Sec x;
-                old = old || !LookupSection(ctx.ring, idx, frame, &x, mod) || x.frame != frame;
+                old = old || !LookupSection(pose_ring, idx, frame, &x, mod) || x.frame != frame;
             }
             if (old) ++g_pose_stats[mod].merged_old;
         }
