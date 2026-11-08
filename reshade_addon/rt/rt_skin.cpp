@@ -68,9 +68,22 @@ struct Sec {
 };
 // A ring's sections by their start vertex in it ($Globals SkinCacheStart): section k = the k-th start. Dispatch order
 // is not section order (two shader variants pose different sections, and a pass can straddle a frame id).
+// The palette of the section's last dispatch, copied into a buffer of ours on the game's list right after it was
+// recorded: the game's upload buffer holding it is reused a frame later, but the ring keeps that pose until the skin
+// cache poses the section again -- which it does not every frame (a character standing in a menu, a section left as
+// it was). Three copies in turn, so a copy being read by a frame in flight is never written.
+constexpr uint32_t kKeepBones = 256; // the skin cache's palettes (kMaxBones)
+constexpr uint64_t kKeepStride = uint64_t(kKeepBones) * 48;
+constexpr uint32_t kKeepAge = 3600; // frames a kept palette may stand in for a section not posed again
+struct Keep {
+    ComPtr<ID3D12Resource> buf; // 3 x kKeepStride, DEFAULT, COMMON (copies and reads by implicit promotion)
+    uint32_t               frame[3] = { UINT32_MAX, UINT32_MAX, UINT32_MAX }; // the dispatch frame each copy holds
+    uint8_t                next = 0;
+};
 struct SecRec {
     Sec      s;
     uint32_t frame = 0;
+    Keep     keep;
 };
 struct RingSecs {
     std::map<uint32_t, SecRec> by_start;
@@ -94,6 +107,13 @@ uint64_t FindRingKey(uint64_t va) // g_m held; 0 = no ring written by the skin c
         if (va >= key && va < key + (r.bytes ? r.bytes : 1)) return key;
     return 0;
 }
+// Kept palettes of sections that left the record: released once the GPU is past their last use.
+std::vector<std::pair<uint64_t, ComPtr<ID3D12Resource>>> g_keep_grave;
+void BuryKeep(SecRec& rec) // g_m held
+{
+    if (rec.keep.buf) g_keep_grave.emplace_back(GpuStamp(), std::move(rec.keep.buf));
+}
+uint64_t g_keep_copies = 0, g_keep_used = 0;
 constexpr uint32_t                     kStartForget = 1800; // frames a start not posed again stays in the layout
 constexpr uint32_t                     kLayoutRecent = 120; // frames within which every remembered start must have been posed
 // (the skin cache can leave a section unposed for long stretches; a ring the pool gives to another mesh is told apart
@@ -726,6 +746,31 @@ void Transition(ID3D12GraphicsCommandList* cl, ID3D12Resource* a, ID3D12Resource
 constexpr D3D12_RESOURCE_STATES kRead =
     D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
+// A section's palette usable at `frame`: this frame's or last frame's dispatch (its upload buffer still holds it), else
+// the kept copy of its last dispatch -- while the ring was not posed since (the ring still holds that pose) and the copy
+// is at least two frames old (its list has been submitted and is not still being recorded or read back).
+bool SecFor(const RingSecs& r, const SecRec& rec, uint32_t frame, Sec* out) // g_m held
+{
+    const int32_t age = int32_t(frame - rec.frame);
+    if (age <= int32_t(kSectionAge)) {
+        if (out) *out = rec.s;
+        return true;
+    }
+    if (age > int32_t(kKeepAge) || !rec.keep.buf || int32_t(r.frame - rec.frame) > 2) return false;
+    for (int k = 0; k < 3; ++k)
+        if (rec.keep.frame[k] == rec.frame) {
+            if (out) {
+                *out = rec.s;
+                out->pal_res = rec.keep.buf.Get();
+                out->pal_off = uint64_t(k) * kKeepStride;
+                out->pal = rec.keep.buf->GetGPUVirtualAddress() + out->pal_off;
+            }
+            ++g_keep_used;
+            return true;
+        }
+    return false;
+}
+
 bool LookupSection(uint64_t ring_va, int comp, uint32_t frame, Sec* out, int mod) // g_m held
 {
     const uint64_t ring = FindRingKey(ring_va);
@@ -736,19 +781,21 @@ bool LookupSection(uint64_t ring_va, int comp, uint32_t frame, Sec* out, int mod
     // still lays the mesh out that way (every remembered start posed lately, as many sections as the BLAS has): a ring
     // the game sets up again (a loading screen) may place the sections elsewhere, and a remembered start another section
     // now begins at would pose this component with that section's bones
+    // The BLAS's geometry count is not always the section count (a build of fewer geometries: the game left some out):
+    // a remembered layout whose every start the ring's latest dispatches posed is this ring's whatever the count.
     if (mod >= 0) {
         const auto lm = g_mod_layout.find(mod);
-        bool       still = lm != g_mod_layout.end() && size_t(comp) < lm->second.size() && (!r.expected || r.expected == lm->second.size());
+        bool       still = lm != g_mod_layout.end() && size_t(comp) < lm->second.size();
+        bool       batch = still; // every remembered start posed with the ring's latest dispatches
         for (size_t i = 0; still && i < lm->second.size(); ++i) {
             const auto x = r.by_start.find(lm->second[i]);
             still = x != r.by_start.end() && frame - x->second.frame <= kLayoutRecent;
+            batch = batch && still && int32_t(r.frame - x->second.frame) <= 2;
         }
+        if (still && r.expected && r.expected != lm->second.size() && !batch) still = false;
         if (still) {
             const auto rs = r.by_start.find(lm->second[size_t(comp)]);
-            if (rs != r.by_start.end() && int32_t(frame - rs->second.frame) <= int32_t(kSectionAge)) {
-                if (out) *out = rs->second.s;
-                return true;
-            }
+            if (rs != r.by_start.end() && SecFor(r, rs->second, frame, out)) return true;
         }
     }
     uint32_t ncomps = 0;
@@ -759,19 +806,28 @@ bool LookupSection(uint64_t ring_va, int comp, uint32_t frame, Sec* out, int mod
     std::vector<std::pair<uint32_t, const SecRec*>> live; // (start, record), by start
     for (const auto& [start, rec] : r.by_start)
         if (frame - rec.frame <= kStartForget) live.push_back({ start, &rec });
-    // the layout must be complete: a missing start would shift every later section
-    if (r.expected && live.size() < r.expected) return false;
-    if (r.expected && live.size() > r.expected) {
-        // more starts than sections: the pool gave the ring to another mesh; the most recently posed ones are its own
+    uint32_t expected = r.expected;
+    if (expected && live.size() > expected) {
+        // More starts than the BLAS has geometries. Either the pool gave the ring to another mesh (the most recently
+        // posed starts are its own, the others older) or the BLAS left sections out (every start posed with the ring's
+        // latest dispatches): then the count says nothing about the layout. Starts posed in the same frame on both
+        // sides of the cut cannot be told apart: no layout rather than a shifted one (stretched triangles).
         std::sort(live.begin(), live.end(), [](const auto& a, const auto& b) { return a.second->frame > b.second->frame; });
-        live.resize(r.expected);
+        if (int32_t(r.frame - live.back().second->frame) <= 2)
+            expected = 0; // all current: the skin cache's own layout
+        else if (live[expected - 1].second->frame == live[expected].second->frame)
+            return false;
+        else
+            live.resize(expected);
         std::sort(live.begin(), live.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     }
+    // the layout must be complete: a missing start would shift every later section
+    if (expected && live.size() < expected) return false;
     // without the BLAS's count, at least as many sections as the mod has components (a partial layout would shift them)
-    if (!r.expected && ncomps && live.size() < ncomps) return false;
+    if (!expected && ncomps && live.size() < ncomps) return false;
     if (size_t(comp) >= live.size()) return false;
     // complete: remember it for this mod
-    if (mod >= 0 && (r.expected ? live.size() == r.expected : ncomps && live.size() == ncomps)) {
+    if (mod >= 0 && (expected ? live.size() == expected : ncomps && live.size() == ncomps)) {
         std::vector<uint32_t> now;
         for (const auto& [start, rec] : live) now.push_back(start);
         std::vector<uint32_t>& lay = g_mod_layout[mod];
@@ -786,10 +842,7 @@ bool LookupSection(uint64_t ring_va, int comp, uint32_t frame, Sec* out, int mod
             lay = std::move(now);
         }
     }
-    const SecRec& rec = *live[size_t(comp)].second;
-    if (int32_t(frame - rec.frame) > int32_t(kSectionAge)) return false; // posed too long ago: its palette is gone
-    if (out) *out = rec.s;
-    return true;
+    return SecFor(r, *live[size_t(comp)].second, frame, out); // false: posed too long ago, its palette is gone
 }
 
 // Merged skeleton for this list's slot: last frame's merged palettes as the base, then every section posed this frame
@@ -966,12 +1019,19 @@ bool Overlaps(const ResInfo& ri, uint64_t va)
 } // namespace
 
 void NoteSection(uint64_t ring_va, uint64_t ring_bytes, uint32_t start, uint64_t palette_va, uint32_t bones, uint64_t tangent_ring_va,
-    uint32_t expected, uint32_t frame, ID3D12Resource* palette_res, uint64_t palette_off, ID3D12Resource* morph_inst)
+    uint32_t expected, uint32_t frame, ID3D12Resource* palette_res, uint64_t palette_off, ID3D12Resource* morph_inst,
+    ID3D12GraphicsCommandList* cl)
 {
     std::lock_guard l(g_m);
     if (g_rings.size() >= 64 && !g_rings.count(ring_va))
-        for (auto it = g_rings.begin(); it != g_rings.end();)
-            it = frame - it->second.frame > kStartForget ? g_rings.erase(it) : std::next(it);
+        for (auto it = g_rings.begin(); it != g_rings.end();) {
+            if (frame - it->second.frame <= kStartForget) {
+                ++it;
+                continue;
+            }
+            for (auto& [st, rec] : it->second.by_start) BuryKeep(rec);
+            it = g_rings.erase(it);
+        }
     RingSecs& r = g_rings[ring_va];
     if (morph_inst) {
         r.morph_inst = morph_inst;
@@ -981,13 +1041,41 @@ void NoteSection(uint64_t ring_va, uint64_t ring_bytes, uint32_t start, uint64_t
     if (ring_bytes) r.bytes = ring_bytes;
     r.frame = frame;
     // the pool gave this ring to another mesh: starts not posed for a while leave the layout
-    for (auto it = r.by_start.begin(); it != r.by_start.end();)
-        it = frame - it->second.frame > kStartForget ? r.by_start.erase(it) : std::next(it);
+    for (auto it = r.by_start.begin(); it != r.by_start.end();) {
+        if (frame - it->second.frame <= kStartForget) {
+            ++it;
+            continue;
+        }
+        BuryKeep(it->second);
+        it = r.by_start.erase(it);
+    }
     const bool fresh = !r.by_start.count(start);
     if (fresh && r.by_start.size() >= 32) return;
     SecRec& rec = r.by_start[start];
     rec.s = { palette_va, bones, tangent_ring_va, palette_res, palette_off, frame };
     rec.frame = frame;
+    // keep this dispatch's palette (see Keep): copied on the game's list before its upload buffer is reused. Only from
+    // an UPLOAD heap (GENERIC_READ, a valid copy source in any state the game left it in).
+    if (cl && palette_res && bones && bones <= kKeepBones && g_d3d12_device) {
+        D3D12_HEAP_PROPERTIES hp{};
+        D3D12_HEAP_FLAGS      hf{};
+        const D3D12_RESOURCE_DESC pd = palette_res->GetDesc();
+        const uint64_t        bytes = uint64_t(bones) * 48;
+        if (SUCCEEDED(palette_res->GetHeapProperties(&hp, &hf)) && hp.Type == D3D12_HEAP_TYPE_UPLOAD &&
+            pd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && palette_off + bytes <= pd.Width) {
+            if (!rec.keep.buf &&
+                FAILED(CreateD3D12Buffer(g_d3d12_device, D3D12_HEAP_TYPE_DEFAULT, kKeepStride * 3, D3D12_RESOURCE_STATE_COMMON, &rec.keep.buf)))
+                rec.keep.buf = nullptr;
+            if (rec.keep.buf) {
+                // the copy older than the other two: no frame in flight reads it (reads need it two frames old)
+                const uint8_t k = rec.keep.next;
+                rec.keep.next = uint8_t((k + 1) % 3);
+                cl->CopyBufferRegion(rec.keep.buf.Get(), uint64_t(k) * kKeepStride, palette_res, palette_off, bytes);
+                rec.keep.frame[k] = frame;
+                ++g_keep_copies;
+            }
+        }
+    }
     if (fresh) { // the layout as it grows (one line per distinct layout)
         std::string lay;
         for (const auto& [st, x] : r.by_start) lay += " " + std::to_string(st) + "/" + std::to_string(x.s.bones);
@@ -1149,6 +1237,9 @@ void PresentTick()
             std::thread(LoaderThread).detach();
         }
     }
+    // kept palettes of sections that left the record, once the GPU is past them
+    for (auto it = g_keep_grave.begin(); it != g_keep_grave.end();)
+        it = GpuPassed(it->first) ? g_keep_grave.erase(it) : std::next(it);
     // bindings of recordings from earlier frames are done with (their lists were submitted long ago)
     for (auto it = g_binds.begin(); it != g_binds.end();)
         it = g_frame_id - it->second.frame > 3 ? g_binds.erase(it) : std::next(it);
@@ -1537,16 +1628,18 @@ bool MakeVfViews(int mod, int slot, uint32_t uv_fmt, VfViews* out)
 std::string Status()
 {
     std::lock_guard l(g_m);
-    char            b[384];
+    char            b[512];
     size_t          ready = 0, slots = 0;
     for (const auto& [k, m] : g_meshes) {
         ready += m.ready ? 1 : 0;
         slots += m.slots.size();
     }
-    snprintf(b, sizeof b, "m2 pipeline=%s meshes=%zu/%zu slots=%zu draws=%llu dispatches=%llu cached=%llu skips=%llu last_skip=%s rings=%zu views=%u",
+    snprintf(b, sizeof b, "m2 pipeline=%s meshes=%zu/%zu slots=%zu draws=%llu dispatches=%llu cached=%llu skips=%llu last_skip=%s rings=%zu views=%u "
+                          "kept_palettes=%llu (used %llu)",
         g_pso ? "ok" : (g_pipeline_why.empty() ? "not yet" : g_pipeline_why.c_str()), ready, g_meshes.size(), slots,
         (unsigned long long)g_draws, (unsigned long long)g_dispatches, (unsigned long long)g_cached, (unsigned long long)g_skips,
-        g_last_skip.empty() ? "-" : g_last_skip.c_str(), g_rings.size(), g_heap_next);
+        g_last_skip.empty() ? "-" : g_last_skip.c_str(), g_rings.size(), g_heap_next, (unsigned long long)g_keep_copies,
+        (unsigned long long)g_keep_used);
     return b;
 }
 

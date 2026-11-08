@@ -169,8 +169,10 @@ public:
         char      head[24];
         const int h = snprintf(head, sizeof head, "[f%u] ", g_frame_id);
         std::lock_guard l(m_);
-        const uint64_t  cap = essential ? kLogCap : kLogDetailCap;
-        if (written_ + text_.size() >= cap || text_.size() + size_t(h + n + 1) > kPendingText) {
+        // the session's first file: detail to kLogDetailCap, essential lines to kLogCap; then the log goes on in files
+        // of essential lines only, rotated at kLogCap (Flush): the start and the latest stretch of the session are kept
+        const bool      drop = essential ? false : (rotations_ > 0 || written_ + text_.size() >= kLogDetailCap);
+        if (drop || text_.size() + size_t(h + n + 1) > kPendingText) {
             g_c.dropped_lines.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -220,6 +222,7 @@ public:
             fwrite(text.data(), 1, text.size(), f_);
             fflush(f_);
         }
+        if (written_ >= kLogCap) Rotate();
         if (!bins.empty()) {
             const std::wstring dir = dir_ + L"\\bins";
             CreateDirectoryW(dir.c_str(), nullptr);
@@ -238,6 +241,29 @@ public:
     std::wstring Dir() const { return dir_; } // present / overlay thread
 
 private:
+    // rt_observe.log full: the session's first file becomes rt_observe.start.log, a later one rt_observe.old.log, and a
+    // new rt_observe.log goes on (present path only)
+    void Rotate()
+    {
+        if (!f_) return;
+        fclose(f_);
+        f_ = nullptr;
+        const std::wstring path = dir_ + L"\\rt_observe.log";
+        const std::wstring to = dir_ + (rotations_ == 0 ? L"\\rt_observe.start.log" : L"\\rt_observe.old.log");
+        MoveFileExW(path.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING);
+        f_ = _wfsopen(path.c_str(), L"wb", _SH_DENYNO);
+        {
+            std::lock_guard l(m_);
+            written_ = 0;
+            ++rotations_;
+        }
+        if (f_) {
+            fprintf(f_, "wwmi-dx12 %s (build %s) RT module; continued at frame %u (part %u; the session's start: "
+                        "rt_observe.start.log, the part before: rt_observe.old.log) -- essential lines only\n",
+                WWMI_VERSION, WWMI_BUILD_SHA, g_frame_id, rotations_ + 1);
+            fflush(f_);
+        }
+    }
     bool Open() // present path only
     {
         if (f_) return true;
@@ -253,6 +279,8 @@ private:
         CreateDirectoryW(dir_.c_str(), nullptr);
         const std::wstring path = dir_ + L"\\rt_observe.log";
         MoveFileExW(path.c_str(), (path + L".prev").c_str(), MOVEFILE_REPLACE_EXISTING);
+        DeleteFileW((dir_ + L"\\rt_observe.start.log").c_str()); // the last session's parts
+        DeleteFileW((dir_ + L"\\rt_observe.old.log").c_str());
         f_ = _wfsopen(path.c_str(), L"wb", _SH_DENYNO); // readable (and zippable) while the game runs
         if (!f_) {
             ReshadeLog(reshade::log::level::warning, "wwmi-dx12 RT module: cannot create %s (error %lu)", Utf8(path).c_str(),
@@ -272,6 +300,7 @@ private:
     uint32_t                                                  prio_files_ = 0;
     uint64_t                                                  prio_bytes_ = 0;
     uint64_t                                                  written_ = 0;
+    uint32_t                                                  rotations_ = 0;
     FILE*                                                     f_ = nullptr;
     bool                                                      tried_ = false;
     std::wstring                                              dir_;
@@ -579,7 +608,8 @@ void NoteSkinSection(command_list* cmd_list, const CmdState& state, uint64_t cs_
         ResInfo rmorph{};
         if (resolve(t6, rmorph) && rmorph.res && g_buffer_reloc.Resolve(rmorph.res, nullptr)) morph_inst = rmorph.res;
     }
-    rtskin::NoteSection(ring, rring.size, start, pal, bones, tan_va, expected, g_frame_id, pal_res, pal_off, morph_inst);
+    rtskin::NoteSection(ring, rring.size, start, pal, bones, tan_va, expected, g_frame_id, pal_res, pal_off, morph_inst,
+        reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
     g_c.sections.fetch_add(1, std::memory_order_relaxed);
 }
 
