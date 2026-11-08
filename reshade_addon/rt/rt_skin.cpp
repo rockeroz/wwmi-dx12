@@ -21,20 +21,22 @@
 // dispatch; our output buffers move COMMON -> UAV -> read within a recording (buffers decay between submissions).
 #include "../addon_common.h"
 #include "../hooks/resource_tracker.h"
-#include "../hooks/cb_ring.h"
-#include "../hooks/pipeline_hooks.h" // PipelineSrvRegs
+#include "../core/cb_ring.h"
+#include "../hooks/pipeline_registry.h" // g_pipelines.SrvRegs
 #include "../instrumentation/removal_pin.h"
-#include "../mods/claim_state.h" // g_geomods
+#include "../mods/mod_set.h" // Mods(), Comps()
 #include "../mods/layout_registry.h"
-#include "../mods/skeleton.h"     // SnapshotGameCB
+#include "../mods/game_cb_reader.h" // g_game_cbs.Snapshot
 #include "../mods/wwmi_runtime.h" // WwmiReadFile
 #include "../mods/buffer_relocation.h"  // g_buffer_reloc: the widened morph buffer of the game's
-#include "../migoto/dx12_bridge.h"       // OwnedTransition
+#include "../migoto/dx12_bridge.h"
+#include "../migoto/dx12_pipeline.h" // MigotoPort::OwnedTransition
 #include "../shapekeys/shapekey_chain.h" // SkGetBinding: whose shape keys the widened buffer holds
 #include "../rabbitfx/rabbitfx_bind.h"
-#include "../../src/d3d12_buffer.h"
-#include "../../src/gpu_progress.h"
+#include "../core/d3d12_buffer.h"
+#include "../core/gpu_progress.h"
 #include "rt_skin.h"
+#include "rt_compat.h"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -476,7 +478,9 @@ bool LoadInstanceSkeleton(const WwmiMod::Mod& mod, Mesh& m) // g_m NOT held
 
 bool LoadMesh(Mesh& m) // g_m NOT held (file and GPU work); the caller publishes
 {
-    if (m.mod < 0 || size_t(m.mod) >= g_geomods.size()) {
+    ModSetRef set_ref; // the mod set this thread reads (a reload's new set does not free it under us)
+    const GeoMod* unit = RtUnit(m.mod); // m.mod: the module's id (rt_compat.h)
+    if (!unit) {
         m.why = "no such mod";
         return false;
     }
@@ -485,7 +489,7 @@ bool LoadMesh(Mesh& m) // g_m NOT held (file and GPU work); the caller publishes
         m.why = "no device";
         return false;
     }
-    const WwmiMod::Mod& mod = g_geomods[m.mod].mod;
+    const WwmiMod::Mod& mod = unit->mod;
     struct Src {
         const wchar_t*          name;
         ComPtr<ID3D12Resource>* dst;
@@ -888,11 +892,12 @@ MorphBind MorphFor(uint64_t ring_va, int mod, uint32_t frame, uint32_t mesh_vert
     const uint64_t key = FindRingKey(ring_va);
     const auto     it = g_rings.find(key);
     if (!key || it == g_rings.end() || !it->second.morph_inst || frame - it->second.morph_frame > 2) return out;
-    if (mod < 0 || mod >= (int)g_geomods.size() || g_geomods[mod].dead) return out;
+    const GeoMod* unit = RtUnit(mod);
+    if (!unit) return out;
     RelocBuf        rb{};
     SkBufferBinding u0{};
     if (!g_buffer_reloc.Resolve(it->second.morph_inst, &rb) ||
-        !SkGetBinding(g_geomods[mod].wcl_ns, it->second.morph_inst, TargetClass::UnorderedAccessView, 0, &u0) || u0.res != rb.res)
+        !SkGetBinding(unit->wcl_ns, it->second.morph_inst, TargetClass::UnorderedAccessView, 0, &u0) || u0.res != rb.res)
         return out;
     out.res = rb.res;
     out.va = rb.va;
@@ -908,8 +913,9 @@ uint64_t SkMorphFor(Mesh& m, ID3D12GraphicsCommandList* cl, uint32_t frame)
     if (!m.sk_entries || !m.sk_morph || !cl) return 0;
     if (m.sk_frame == frame) return m.sk_morph->GetGPUVirtualAddress();
     if (!EnsureSkPipeline()) return 0;
-    if (m.mod < 0 || size_t(m.mod) >= g_geomods.size()) return 0;
-    const WwmiMod::Resource* r = WwmiMod::Find(g_geomods[size_t(m.mod)].mod, L"ResourceCustomShapeKeyValuesRW");
+    const GeoMod* unit = RtUnit(m.mod);
+    if (!unit) return 0;
+    const WwmiMod::Resource* r = WwmiMod::Find(unit->mod, L"ResourceCustomShapeKeyValuesRW");
     if (!r || !r->res || !r->gpu_va || r->size < 512) {
         char key[48];
         snprintf(key, sizeof key, "skvalues %d", m.mod);
@@ -1049,9 +1055,14 @@ bool PoseCached(int mod, int comp)
     // this mod's pose of the component, or that of another mod of the same object (a toggle mod -- Hsin's face -- can
     // draw components its body mod's claims never draw themselves)
     std::lock_guard l(g_m);
-    const int       guid = mod >= 0 && size_t(mod) < g_geomods.size() ? g_geomods[size_t(mod)].mod.object_guid : 0;
+    const GeoMod*   unit = RtUnit(mod);
+    const int       guid = unit ? unit->mod.object_guid : 0;
     for (auto& [id, m] : g_meshes) {
-        if (!m.ready || (id != mod && (!guid || size_t(id) >= g_geomods.size() || g_geomods[size_t(id)].mod.object_guid != guid))) continue;
+        if (!m.ready) continue;
+        if (id != mod) {
+            const GeoMod* other = guid ? RtUnit(id) : nullptr;
+            if (!other || other->mod.object_guid != guid) continue;
+        }
         if (CachedPose(m, comp, g_frame_id)) return true;
     }
     return false;
@@ -1145,9 +1156,11 @@ void PresentTick()
 
 void PreloadAll()
 {
+    ModSetRef       set_ref;
+    const size_t    n = Mods().Count();
     std::lock_guard l(g_m);
-    for (size_t i = 0; i < g_geomods.size(); ++i)
-        if (!g_meshes.count(int(i)) && !g_geomods[i].dead) g_requested.insert(int(i));
+    for (size_t i = 0; i < n; ++i) // the module's ids of the current set's mods (rt_compat.h)
+        if (const int id = RtStableMod(int(i)); id >= 0 && !g_meshes.count(id)) g_requested.insert(id);
 }
 
 bool LoaderIdle(unsigned timeout_ms)
@@ -1173,17 +1186,13 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
     const uint64_t gen = CmdGen(cmd_list);
     // the layout's VS registers: the fetch slots (t0..t3) and LocalVF (b2)
     RegBind t_vs[4], b_vs[3];
-    {
-        std::unique_lock l(g_layout_regmap_mtx);
-        auto             it = g_layout_regmap.find(CmdGfxLayout(cmd_list));
-        if (it == g_layout_regmap.end() || !it->second.built) {
-            l.unlock();
-            std::lock_guard l2(g_m);
-            SkipLocked("no register map for the draw's root signature", mod, comp);
-            return out;
-        }
-        memcpy(t_vs, it->second.t_vs, sizeof t_vs);
-        memcpy(b_vs, it->second.b_vs, sizeof b_vs);
+    if (!g_layouts.WithRegMap(CmdGfxLayout(cmd_list), [&](const LayoutRegMap& lm) {
+            memcpy(t_vs, lm.t_vs, sizeof t_vs);
+            memcpy(b_vs, lm.b_vs, sizeof b_vs);
+        })) {
+        std::lock_guard l2(g_m);
+        SkipLocked("no register map for the draw's root signature", mod, comp);
+        return out;
     }
     const CmdState& st = CmdGfx(cmd_list);
     device*         dv = cmd_list->get_device();
@@ -1194,7 +1203,7 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
     uint64_t       vf_game_va = 0;
     if (lb.param != 0xFF && lb.param < 64 && !lb.is_table) {
         const RootCbvBind rc = CmdCbv(cmd_list).binds[lb.param];
-        if (rc.res && rc.va && BufferLive(rc.res) && SnapshotGameCB(rc.res, rc.va, reinterpret_cast<uint8_t*>(vf_words), sizeof vf_words, true) >= 24) {
+        if (rc.res && rc.va && g_resources.Live(rc.res) && g_game_cbs.Snapshot(rc.res, rc.va, reinterpret_cast<uint8_t*>(vf_words), sizeof vf_words, true) >= 24) {
             have_vf = true;
             vf_game_va = rc.va;
         }
@@ -1268,7 +1277,7 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
             }
         }
         // the VS's fetch slots: what the game put there decides what of ours replaces it
-        const DxilSrvRegs vs_regs = PipelineSrvRegs(st.gfx_pso, 'v');
+        const DxilSrvRegs vs_regs = g_pipelines.SrvRegs(st.gfx_pso, 'v');
         bool              new_uv = false, new_color = false, any = false;
         for (unsigned r = 0; r < 4; ++r) {
             const RegBind& b = t_vs[r];
@@ -1455,7 +1464,7 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         }
     }
     if (!slots.empty()) {
-        SetShadowExtraSlots(slots.data(), unsigned(slots.size()));
+        g_rfx_bind.SetExtraSlots(slots.data(), unsigned(slots.size()));
         out.shadow_bind = true;
     }
     out.skip = false;

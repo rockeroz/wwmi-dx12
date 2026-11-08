@@ -1,10 +1,10 @@
 // dxil_info.cpp -- offline: what a dumped compute shader (bins\cs_<hash>.dxil) is, without DXC.
-// Reuses the add-on's own minimal DXIL bitcode reader (src/dxil_cb.cpp, compiled into this file) and prints the
+// Reuses the add-on's own minimal DXIL bitcode reader (reshade_addon/core/dxil_cb.cpp, compiled into this file) and prints the
 // entry points, every resource (SRVs, UAVs, CBVs, samplers: name, space, register, range) and the struct
 // layouts the DXIL metadata annotates (cbuffer field names and offsets).
 //
 //   g++ -std=c++20 -O1 tools/rt_capture/dxil_info.cpp -o dxil_info && ./dxil_info cs_*.dxil
-#include "../../src/dxil_cb.cpp"
+#include "../../reshade_addon/core/dxil_cb.cpp"
 #include <cstdio>
 #include <fstream>
 #include <iterator>

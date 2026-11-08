@@ -26,14 +26,21 @@
 #include "../addon_common.h"
 #include "../hooks/resource_tracker.h"
 #include "../instrumentation/removal_pin.h"
-#include "../../src/d3d12_buffer.h"
-#include "../../src/gpu_progress.h" // GpuStamp / GpuPassed (M5 extended tables)
+#include "../core/d3d12_buffer.h"
+#include "../core/gpu_progress.h" // GpuStamp / GpuPassed (M5 extended tables)
 #include "../mods/layout_registry.h" // TableStartOf
-#include "../mods/skeleton.h"        // SnapshotGameCB
+#include "../mods/game_cb_reader.h" // g_game_cbs.Snapshot
 #include "../mods/buffer_relocation.h" // g_buffer_reloc: the skin cache's morph buffer, widened for a mod
 #include "../hooks/dxil_psv.h"         // DxilShaderSrvRegs: which skin cache variants read a morph buffer
-#include "../textures/texture_module.h" // TexHoldForRetry / TexRetryMissed
+#include "../textures/tex_place.h" // g_tex_place: HoldForRetry / RetryMissed
 #include "rt_hooks.h"
+#include "rt_module_api.h"
+#include "rt_compat.h"
+#include "../core/fnv.h" // Fnv1a64
+#include "../migoto/dx12_input_layout.h" // MigotoPort::DescribeInputLayout
+#include "../migoto/dx12_bridge.h" // MigotoPort::kResStateUnknown
+#include "../hooks/stamp_ledger.h" // g_stamps.UnstampAll
+#include "../build_stamp.h" // WWMI_VERSION, WWMI_BUILD_SHA
 #include "rt_registry.h"
 #include "rt_skin.h"
 #include "rt_m5_critical.h"
@@ -350,13 +357,13 @@ uint32_t GuardedSnapshot(ID3D12Resource* res, uint64_t va, uint8_t* dst, uint32_
 {
 #ifdef _MSC_VER
     __try {
-        return SnapshotGameCB(res, va, dst, n, true);
+        return g_game_cbs.Snapshot(res, va, dst, n, true);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         g_c.snapshot_faults.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
 #else
-    return SnapshotGameCB(res, va, dst, n, true);
+    return g_game_cbs.Snapshot(res, va, dst, n, true);
 #endif
 }
 
@@ -498,17 +505,14 @@ void NoteSkinSection(command_list* cmd_list, const CmdState& state, uint64_t cs_
     if (!t_skin) return;
     // as observed, when the root signature has no map: tables p0 (SRVs) / p2 (UAVs), $Globals root CBV p3
     RegBind t0{ 0, 0, true }, t6{ 0, 6, true }, u0{ 2, 0, true }, u1{ 2, 1, true }, b0{ 3, 0, false };
-    {
-        std::lock_guard l(g_layout_regmap_mtx);
-        auto            it = g_layout_regmap.find(CmdCmpLayout(cmd_list));
-        if (it != g_layout_regmap.end() && it->second.built && it->second.t_cs[0].param != 0xFF && it->second.u_cs[1].param != 0xFF) {
-            t0 = it->second.t_cs[0];
-            if (it->second.t_cs[6].param != 0xFF) t6 = it->second.t_cs[6];
-            u0 = it->second.u_cs[0];
-            u1 = it->second.u_cs[1];
-            if (it->second.b_cs[0].param != 0xFF) b0 = it->second.b_cs[0];
-        }
-    }
+    g_layouts.WithRegMap(CmdCmpLayout(cmd_list), [&](const LayoutRegMap& m) {
+        if (m.t_cs[0].param == 0xFF || m.u_cs[1].param == 0xFF) return;
+        t0 = m.t_cs[0];
+        if (m.t_cs[6].param != 0xFF) t6 = m.t_cs[6];
+        u0 = m.u_cs[0];
+        u1 = m.u_cs[1];
+        if (m.b_cs[0].param != 0xFF) b0 = m.b_cs[0];
+    });
     device* dev = cmd_list->get_device();
     auto    resolve = [&](const RegBind& b, ResInfo& ri) -> bool {
         if (b.param == 0xFF || b.param >= 64) return false;
@@ -535,7 +539,7 @@ void NoteSkinSection(command_list* cmd_list, const CmdState& state, uint64_t cs_
     if (!b0.is_table && b0.param < 64) {
         const RootCbvBind rc = CmdCbv(cmd_list).binds[b0.param];
         uint32_t          w[2] = {};
-        if (rc.res && rc.va && BufferLive(rc.res) && SnapshotGameCB(rc.res, rc.va, reinterpret_cast<uint8_t*>(w), sizeof w, true) == sizeof w)
+        if (rc.res && rc.va && g_resources.Live(rc.res) && g_game_cbs.Snapshot(rc.res, rc.va, reinterpret_cast<uint8_t*>(w), sizeof w, true) == sizeof w)
             start = w[1];
     }
     if (start == UINT32_MAX) {
@@ -619,13 +623,14 @@ bool ResOfVa(resource r, uint64_t off, ID3D12Resource** res, uint64_t* va)
     *va = BufferVa(r, off);
     *res = r.handle ? reinterpret_cast<ID3D12Resource*>(r.handle) : nullptr;
     if (*res) return true;
-    std::lock_guard l(g_mem_mutex);
-    for (const auto& [base, ri] : g_va_to_res)
-        if (ri.res && *va >= base && *va < base + (ri.size ? ri.size : 1)) {
-            *res = ri.res;
-            return true;
-        }
-    return false;
+    const uint64_t want = *va;
+    ID3D12Resource* found = nullptr;
+    g_resources.ForEachBuffer([&](uint64_t base, const ResInfo& ri) {
+        if (ri.res && want >= base && want < base + (ri.size ? ri.size : 1)) found = ri.res;
+        return found != nullptr;
+    });
+    *res = found;
+    return found != nullptr;
 }
 int HeapTypeOf(ID3D12Resource* res)
 {
@@ -1890,7 +1895,7 @@ bool SlotTexFor(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRIPTOR_HA
             if (std::get<0>(k) == mod && std::get<2>(k) == reinterpret_cast<uint64_t>(game) && (!best || v.frame > best->frame)) best = &v;
     if (!best || best->gen != gen || g_frame_id - best->frame > kSlotTexAge || !best->src.ptr) {
         // by identity: the same texture in another resource
-        const uint32_t h = TexIdentityNorm(TexHashOf(reinterpret_cast<uint64_t>(game)));
+        const uint32_t h = TexIdentityNorm(g_tex_identity.HashOf(reinterpret_cast<uint64_t>(game)));
         const auto     ih = h ? g_slot_tex_h.find({ mod, h }) : g_slot_tex_h.end();
         if (ih == g_slot_tex_h.end() || ih->second.gen != gen || g_frame_id - ih->second.frame > kSlotTexAge || !ih->second.src.ptr) return false;
         *out = ih->second.src;
@@ -1979,12 +1984,9 @@ void M4Apply(device* dev, const ModBlas& mb, const RecTx& tx, uint64_t stride, u
             }
             ID3D12Resource* res = ri.res; // the game's texture
             if (!res) continue;
-            bool target; // a texture some mod replaces (g_modtex_res: GAME resources the mods target, not mod textures)
-            {
-                std::shared_lock l(g_tex_mutex);
-                target = g_modtex_res.count(reinterpret_cast<uint64_t>(res)) != 0;
-            }
-            const uint32_t hash = TexHashOf(reinterpret_cast<uint64_t>(res));
+            // a texture some mod replaces (GAME resources the mods target, not mod textures)
+            const bool target = g_tex_identity.IsModTex(reinterpret_cast<uint64_t>(res));
+            const uint32_t hash = g_tex_identity.HashOf(reinterpret_cast<uint64_t>(res));
             if (detail.size() < 1400) {
                 char b[64];
                 snprintf(b, sizeof b, " [%u %p h%08x ", k, (void*)res, hash);
@@ -2010,15 +2012,14 @@ void M4Apply(device* dev, const ModBlas& mb, const RecTx& tx, uint64_t stride, u
             //    in the mod's namespace, the global selection, or the target it is a lower mip of
             if (hash) {
                 const int      dm = mb.pose_mod[g];
-                const wchar_t* own_ns = dm >= 0 && size_t(dm) < g_geomods.size() && !g_geomods[size_t(dm)].wcl_ns.empty()
-                    ? g_geomods[size_t(dm)].wcl_ns.c_str() : nullptr;
+                const wchar_t* own_ns = RtUnitNs(dm);
                 ModLoader::TexEntry e;
                 if (ModLoader::TexEntryAt(TexSelectIdxNs(hash, own_ns, 0), &e) && e.srv.ptr) {
                     put(e.srv, tex_sw, " RULE]");
                     continue;
                 }
-                if (const uint32_t rule = TexRuleHashFor(hash)) {
-                    const D3D12_CPU_DESCRIPTOR_HANDLE src = TexReplacement(rule);
+                if (const uint32_t rule = g_tex_select.RuleHashFor(hash)) {
+                    const D3D12_CPU_DESCRIPTOR_HANDLE src = g_tex_select.Replacement(rule);
                     if (src.ptr) {
                         put(src, tex_sw, " RULE-GLOBAL]");
                         continue;
@@ -2185,25 +2186,24 @@ bool M5ResolveTex(int mod, uint32_t g, ID3D12Resource* res, const M5Binds& set, 
             return true;
         }
     *how = "set-by-identity";
-    if (const uint32_t h = TexIdentityNorm(TexHashOf(reinterpret_cast<uint64_t>(res))))
+    if (const uint32_t h = TexIdentityNorm(g_tex_identity.HashOf(reinterpret_cast<uint64_t>(res))))
         for (const auto& [game, src] : set)
-            if (src && TexIdentityNorm(TexHashOf(game)) == h) {
+            if (src && TexIdentityNorm(g_tex_identity.HashOf(game)) == h) {
                 out->ptr = SIZE_T(src);
                 return true;
             }
     *how = "section-stamp";
     if (SlotTexFor(mod, int(g), res, out)) return true;
     *how = "rule";
-    if (const uint32_t hash = TexHashOf(reinterpret_cast<uint64_t>(res))) {
-        const wchar_t* own_ns = mod >= 0 && size_t(mod) < g_geomods.size() && !g_geomods[size_t(mod)].wcl_ns.empty()
-            ? g_geomods[size_t(mod)].wcl_ns.c_str() : nullptr;
+    if (const uint32_t hash = g_tex_identity.HashOf(reinterpret_cast<uint64_t>(res))) {
+        const wchar_t* own_ns = RtUnitNs(mod);
         ModLoader::TexEntry e;
         if (ModLoader::TexEntryAt(TexSelectIdxNs(hash, own_ns, 0), &e) && e.srv.ptr) {
             *out = e.srv;
             return true;
         }
-        if (const uint32_t rule = TexRuleHashFor(hash)) {
-            const D3D12_CPU_DESCRIPTOR_HANDLE src = TexReplacement(rule);
+        if (const uint32_t rule = g_tex_select.RuleHashFor(hash)) {
+            const D3D12_CPU_DESCRIPTOR_HANDLE src = g_tex_select.Replacement(rule);
             if (src.ptr) {
                 *out = src;
                 return true;
@@ -3512,6 +3512,93 @@ void M3Summary()
 
 } // namespace
 
+// ==== mod ids across mod sets (rt_compat.h) =======================================================
+namespace {
+std::mutex g_stable_m;
+std::map<std::pair<uint64_t, uint64_t>, int> g_stable_of; // (namespace hash, content) -> the module's id
+std::vector<std::pair<uint64_t, uint64_t>> g_stable_keys; // the module's id -> (namespace hash, content)
+std::unordered_map<uint64_t, int> g_set_stable; // (set id << 24) | set's mod id -> the module's id
+uint64_t FpMix(uint64_t h, uint64_t v)
+{
+    return (h ^ v) * 1099511628211ull;
+}
+// What a unit is made of: its buffer files (path, size, write time) and its components as the ini describes them.
+uint64_t UnitContent(const GeoMod& gm)
+{
+    uint64_t h = 1469598103934665603ull;
+    std::vector<std::wstring> files;
+    for (const WwmiMod::Resource& r : gm.mod.resources)
+        if (!r.filename.empty()) files.push_back(r.filename);
+    std::sort(files.begin(), files.end()); // their engine lists its resources in hash-map order
+    for (const std::wstring& f : files) {
+        for (const wchar_t c : f) h = FpMix(h, (uint64_t)towlower(c));
+        WIN32_FILE_ATTRIBUTE_DATA a{};
+        if (GetFileAttributesExW(f.c_str(), GetFileExInfoStandard, &a)) {
+            h = FpMix(h, ((uint64_t)a.nFileSizeHigh << 32) | a.nFileSizeLow);
+            h = FpMix(h, ((uint64_t)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime);
+        }
+    }
+    h = FpMix(h, (uint64_t)(uint32_t)gm.mod.object_guid);
+    h = FpMix(h, gm.mod.mesh_vertex_count);
+    for (const WwmiMod::Component& c : gm.mod.comps) {
+        h = FpMix(h, ((uint64_t)(uint32_t)c.index << 32) | c.ib_hash);
+        h = FpMix(h, ((uint64_t)c.match_first_index << 32) | c.match_index_count);
+        h = FpMix(h, ((uint64_t)c.vg_offset << 32) | c.vg_count);
+        h = FpMix(h, ((uint64_t)(uint32_t)c.remap_id << 32) | c.remap_vg);
+        for (const WwmiMod::SubDraw& d : c.draws) h = FpMix(h, ((uint64_t)d.start << 32) | d.count);
+    }
+    return h;
+}
+int StableOfLocked(ModSet& set, int set_mod) // g_stable_m held
+{
+    const uint64_t k = ((uint64_t)set.id << 24) | (uint32_t)set_mod;
+    if (const auto it = g_set_stable.find(k); it != g_set_stable.end()) return it->second;
+    const GeoMod& gm = set.mods.At((size_t)set_mod);
+    const std::pair<uint64_t, uint64_t> key{ gm.ns_hash ? gm.ns_hash : NsHash(gm.wcl_ns.c_str()), UnitContent(gm) };
+    int stable;
+    if (const auto it = g_stable_of.find(key); it != g_stable_of.end())
+        stable = it->second;
+    else {
+        stable = (int)g_stable_keys.size();
+        g_stable_keys.push_back(key);
+        g_stable_of.emplace(key, stable);
+        if (stable >= (int)set.mods.Count() || set.id) // a mod a reload added or changed (or the first of a later set)
+            g_log.Line(true, "RTMODID mod %d of set #%u (ns=%s) is the module's mod %d", set_mod, set.id,
+                Utf8(gm.wcl_ns).c_str(), stable);
+    }
+    if (g_set_stable.size() > 65536) g_set_stable.clear(); // sets long gone
+    g_set_stable.emplace(k, stable);
+    return stable;
+}
+} // namespace
+
+int RtStableMod(int set_mod)
+{
+    if (set_mod < 0) return -1;
+    ModSet& set = CurrentSet();
+    if ((size_t)set_mod >= set.mods.Count()) return -1;
+    thread_local unsigned t_set = ~0u;
+    thread_local int t_from = -1, t_to = -1;
+    if (t_set == set.id && t_from == set_mod) return t_to;
+    std::lock_guard l(g_stable_m);
+    const int stable = StableOfLocked(set, set_mod);
+    t_set = set.id;
+    t_from = set_mod;
+    t_to = stable;
+    return stable;
+}
+
+int RtSetMod(int stable)
+{
+    if (stable < 0) return -1;
+    ModSet& set = CurrentSet();
+    std::lock_guard l(g_stable_m);
+    if ((size_t)stable >= g_stable_keys.size()) return -1;
+    const int m = set.mods.IdOfNsHash(g_stable_keys[(size_t)stable].first);
+    if (m < 0 || (size_t)m >= set.mods.Count()) return -1;
+    return StableOfLocked(set, m) == stable ? m : -1; // the same namespace, changed: not this mod any more
+}
+
 // ==== rt_hooks.h =================================================================================
 bool RtModulePresent()
 {
@@ -3589,10 +3676,6 @@ void RtCriticalInit(device* dev)
     const bool ok = dev && rtcritical::InitDevice(reinterpret_cast<ID3D12Device*>(dev->get_native()));
     ReshadeLog(ok ? reshade::log::level::info : reshade::log::level::error,
         "wwmi-dx12 M5: exclusive descriptor reservation hook %s", ok ? "installed" : "unavailable (M5 won't borrow game heap space)");
-}
-bool RtMeshLoaderIdle(unsigned timeout_ms)
-{
-    return rtskin::LoaderIdle(timeout_ms);
 }
 
 void RtCriticalReset(command_list* list)
@@ -3687,23 +3770,28 @@ void RtPresentTick()
         static size_t   s_comps_seen = SIZE_MAX;
         static bool     s_loaded_seen = false;
         static unsigned s_epoch_seen = ~0u;
-        const unsigned  epoch = g_mods_epoch.load(std::memory_order_acquire);
-        if (g_merged_comps.size() != s_comps_seen || g_merged_loaded != s_loaded_seen || epoch != s_epoch_seen) {
-            s_comps_seen = g_merged_comps.size();
-            s_loaded_seen = g_merged_loaded;
+        ModSetRef       set_ref; // the current mod set, held while it is read
+        ModSet&         set = CurrentSet();
+        const unsigned  epoch = set.id; // a reload (F10) publishes a new set
+        std::deque<GeoMod>&     units = set.mods.Units();
+        std::vector<MergedComp>& all_comps = set.comps.All();
+        if (all_comps.size() != s_comps_seen || set.comps.Loaded() != s_loaded_seen || epoch != s_epoch_seen) {
+            s_comps_seen = all_comps.size();
+            s_loaded_seen = set.comps.Loaded();
             s_epoch_seen = epoch;
             std::vector<rtm::CompWindow> comps;
-            for (const MergedComp& c : g_merged_comps) // a mod reload's removed units are not matched any more
-                if (c.mod_id >= 0 && c.mod_id < (int)g_geomods.size() && !g_geomods[c.mod_id].dead)
-                    comps.push_back({ c.mod_id, c.comp_idx, c.first_index, c.match_count });
-            g_log.Line(true, "RTMODS merged_loaded=%d merged_enable=%d geomods=%zu components=%zu", g_merged_loaded ? 1 : 0,
-                g_merged_enable ? 1 : 0, g_geomods.size(), comps.size());
-            ReshadeLog(reshade::log::level::info, "wwmi-dx12 RT module: %zu mod(s), %zu component window(s) loaded", g_geomods.size(),
+            for (const MergedComp& c : all_comps) // the module's mod ids (rt_compat.h)
+                if (c.mod_id >= 0 && c.mod_id < (int)units.size())
+                    comps.push_back({ RtStableMod(c.mod_id), c.comp_idx, c.first_index, c.match_count });
+            g_log.Line(true, "RTMODS set #%u merged_loaded=%d geomods=%zu components=%zu", set.id, set.comps.Loaded() ? 1 : 0,
+                units.size(), comps.size());
+            ReshadeLog(reshade::log::level::info, "wwmi-dx12 RT module: %zu mod(s), %zu component window(s) loaded", units.size(),
                 comps.size());
-            for (size_t gi = 0; gi < g_geomods.size() && gi < 16; ++gi) {
-                const WwmiMod::Mod& mod = g_geomods[gi].mod;
-                g_log.Line(true, "  geomod %zu ns=%s mesh_vertex_count=%u object_guid=%d comps=%zu resources=%zu", gi,
-                    Utf8(g_geomods[gi].wcl_ns).c_str(), mod.mesh_vertex_count, mod.object_guid, mod.comps.size(), mod.resources.size());
+            for (size_t gi = 0; gi < units.size() && gi < 16; ++gi) {
+                const WwmiMod::Mod& mod = units[gi].mod;
+                g_log.Line(true, "  geomod %zu (module mod %d) ns=%s mesh_vertex_count=%u object_guid=%d comps=%zu resources=%zu", gi,
+                    RtStableMod((int)gi), Utf8(units[gi].wcl_ns).c_str(), mod.mesh_vertex_count, mod.object_guid, mod.comps.size(),
+                    mod.resources.size());
                 for (const WwmiMod::Component& wc : mod.comps) {
                     std::string draws;
                     for (const WwmiMod::SubDraw& d : wc.draws) {
@@ -3740,9 +3828,9 @@ void RtPresentTick()
                     }
                 }
             }
-            for (size_t i = 0; i < g_merged_comps.size() && i < 96; ++i) {
-                const MergedComp& c = g_merged_comps[i];
-                const std::string ns = c.mod_id >= 0 && size_t(c.mod_id) < g_geomods.size() ? Utf8(g_geomods[c.mod_id].wcl_ns) : std::string();
+            for (size_t i = 0; i < all_comps.size() && i < 96; ++i) {
+                const MergedComp& c = all_comps[i];
+                const std::string ns = c.mod_id >= 0 && size_t(c.mod_id) < units.size() ? Utf8(units[c.mod_id].wcl_ns) : std::string();
                 g_log.Line(true, "  mod=%d comp=%d first=%u count=%u remap_bones=%d hide=%d ns=%s", c.mod_id, c.comp_idx, c.first_index,
                     c.match_count, c.remap_size, c.hide ? 1 : 0, ns.c_str());
             }
@@ -3753,7 +3841,7 @@ void RtPresentTick()
     }
     const bool held = RtHoldVanilla();
     if (held && !s_held) {
-        const UnstampTally t = UnstampAll(TexHoldForRetry); // as C1/C2 off does: the game's textures back, kept for retry
+        const UnstampTally t = g_stamps.UnstampAll(TexHoldForRetry); // as C1/C2 off does: the game's textures back, kept for retry
         g_c.unstamped.fetch_add(t.recorded, std::memory_order_relaxed);
         g_log.Line(true, "RTHOLD ON: the game ray traces -- mod held, %u stamped slot(s) given back (+%u in CPU-only heaps, %zu still stamped there)",
             t.recorded, t.cpu_only, t.cpu_only_stamped);
@@ -3776,10 +3864,13 @@ void RtPresentTick()
         s_drawing = drawing;
         // rt_preload = 0: a mod's mesh is loaded only when its character is first drawn (the original shows meanwhile)
         static const bool s_preload = g_addon_ini_path.empty() || GetPrivateProfileIntW(L"wwmi-dx12", L"rt_preload", 1, g_addon_ini_path.c_str()) != 0;
-        static size_t     s_preloaded = 0;
-        if (drawing && s_preload && g_geomods.size() != s_preloaded) {
-            s_preloaded = g_geomods.size();
-            rtskin::PreloadAll();
+        static unsigned   s_preloaded = ~0u; // the mod set preloaded
+        if (drawing && s_preload) {
+            ModSetRef set_ref;
+            if (CurrentSet().id != s_preloaded) {
+                s_preloaded = CurrentSet().id;
+                rtskin::PreloadAll();
+            }
         }
     }
     if (Mode() == 2) rtskin::PresentTick();
@@ -3876,15 +3967,10 @@ void LogPassThroughDraw(const RtClaimInfo& in)
         const uint64_t layh = CmdGfxLayout(in.cmd_list);
         RegBind        t_vs[4], b_vs[5];
         bool           have = false;
-        {
-            std::lock_guard l(g_layout_regmap_mtx);
-            auto            it = g_layout_regmap.find(layh);
-            if (it != g_layout_regmap.end() && it->second.built) {
-                memcpy(t_vs, it->second.t_vs, sizeof t_vs);
-                memcpy(b_vs, it->second.b_vs, sizeof b_vs);
-                have = true;
-            }
-        }
+        have = g_layouts.WithRegMap(layh, [&](const LayoutRegMap& m) {
+            memcpy(t_vs, m.t_vs, sizeof t_vs);
+            memcpy(b_vs, m.b_vs, sizeof b_vs);
+        });
         if (!have)
             g_log.Line(true, "  vs registers: no register map for layout %llx", (unsigned long long)layh);
         else {
@@ -3922,7 +4008,7 @@ void LogPassThroughDraw(const RtClaimInfo& in)
                 const RootCbvBind& rc = cb.binds[b.param];
                 uint32_t           w[8] = {};
                 uint32_t           n = 0;
-                if (rc.res && rc.va && BufferLive(rc.res)) n = GuardedSnapshot(rc.res, rc.va, reinterpret_cast<uint8_t*>(w), sizeof w);
+                if (rc.res && rc.va && g_resources.Live(rc.res)) n = GuardedSnapshot(rc.res, rc.va, reinterpret_cast<uint8_t*>(w), sizeof w);
                 g_log.Line(true, "  vs b%u: root p%u va=%llx size=%u read=%u words=%08x %08x %08x %08x %08x %08x %08x %08x", r, b.param,
                     (unsigned long long)rc.va, rc.size, n, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
             }
@@ -3932,7 +4018,7 @@ void LogPassThroughDraw(const RtClaimInfo& in)
     std::vector<uint8_t> buf(256);
     for (uint32_t p = 0; p < 64; ++p) {
         const RootCbvBind& r = cb.binds[p];
-        if (!r.res || !r.va || !BufferLive(r.res)) continue;
+        if (!r.res || !r.va || !g_resources.Live(r.res)) continue;
         const uint32_t n = GuardedSnapshot(r.res, r.va, buf.data(), 256);
         if (!n) continue;
         char name[128];
@@ -3942,10 +4028,12 @@ void LogPassThroughDraw(const RtClaimInfo& in)
     DumpShader(in.vs_hash, true);
 }
 
-bool RtClaimNote(const RtClaimInfo& in)
+bool RtClaimNote(const RtClaimInfo& in_set)
 {
     rtskin::SetClaim({}); // this claim is the thread's current one, whatever it was before
     if (!RtActive() || Mode() == 0) return false;
+    RtClaimInfo in = in_set;
+    in.mod = RtStableMod(in_set.mod); // the module's id (rt_compat.h)
     g_c.claims.fetch_add(1, std::memory_order_relaxed);
     if (in.identified) g_c.claims_identified.fetch_add(1, std::memory_order_relaxed);
     const uint32_t width = in.index_bytes == 2 || in.index_bytes == 4 ? in.index_bytes : 0;
@@ -4158,8 +4246,9 @@ uint32_t RtSkinOutGen()
     return g_ring_gen.load(std::memory_order_relaxed);
 }
 
-void RtNoteDrawVb(int mod_id, int comp_idx, const RtDrawVb& v)
+void RtNoteDrawVb(int set_mod, int comp_idx, const RtDrawVb& v)
 {
+    const int mod_id = RtStableMod(set_mod);
     std::lock_guard l(g_m);
     const int       key = CompKey(mod_id, comp_idx);
     if (g_draw_vb.size() < 4096 || g_draw_vb.count(key)) g_draw_vb[key] = v;
@@ -4378,10 +4467,10 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
     bool barrier_uav = false, state_uav = false;
     if (ring_bind && ring_bind->res) {
         const uint64_t rh = reinterpret_cast<uint64_t>(ring_bind->res);
-        if (const CmdBlock* blk = g_cmd_blocks.get(reinterpret_cast<uintptr_t>(cmd_list)))
+        if (const CmdBlock* blk = g_command_lists.Block(cmd_list))
             for (const UavNote& n : blk->uav_recent)
                 if (n.res == rh && n.frame + 1 >= g_frame_id) barrier_uav = true;
-        const uint32_t st = ResourceStateOf(ring_bind->res);
+        const uint32_t st = g_resources.StateOf(ring_bind->res);
         state_uav = st != MigotoPort::kResStateUnknown && (st & uint32_t(resource_usage::unordered_access)) != 0;
     }
     if (sample && is_skin) {
@@ -4414,7 +4503,7 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
                 std::string queued;
                 uint32_t    n = 0;
                 rtm::BoneRun run;
-                if (!is_ring && b.res && BufferLive(b.res) && off < b.size) {
+                if (!is_ring && b.res && g_resources.Live(b.res) && off < b.size) {
                     const uint32_t want = uint32_t((std::min)(bytes ? bytes : uint64_t(kSnapBytes), uint64_t(kSnapBytes)));
                     n = GuardedPrivateRead(b.res, b.va + off, sbuf.data(), want);
                     if (n) {
@@ -4429,7 +4518,7 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
                     b.param, b.slot, (unsigned long long)b.va, b.size, uint32_t(vd.type), uint32_t(vd.format), (unsigned long long)vd.buffer.offset,
                     (unsigned long long)vd.buffer.size, elem, (unsigned long long)off, (unsigned long long)bytes, is_ring ? " <RING" : "", n,
                     run.count, run.offset, queued.empty() ? "" : queued.c_str());
-            } else if (b.kind == 0 && b.res && BufferLive(b.res)) {
+            } else if (b.kind == 0 && b.res && g_resources.Live(b.res)) {
                 const uint32_t want = b.size && b.size < 256 ? b.size : 256;
                 const uint32_t n = GuardedSnapshot(b.res, b.va, sbuf.data(), want);
                 if (!n) continue;
@@ -4463,7 +4552,7 @@ void RtPalRecord(command_list* cmd_list, const CmdState& state, uint64_t cs_hash
         // A table slot can outlive its resource (slots beyond what this shader reads), and so could a stale bind:
         // only a buffer the resource tracker still knows as live is touched, every read is SEH-guarded, and a
         // table slot is read only if its descriptor was written within the last two frames, through a private map.
-        if (!s.is_ring && b.res && BufferLive(b.res) && (b.kind != 3 || b.age <= 2)) {
+        if (!s.is_ring && b.res && g_resources.Live(b.res) && (b.kind != 3 || b.age <= 2)) {
             const uint32_t want = b.size ? (b.size < kSnapBytes ? b.size : kSnapBytes) : kSnapBytes;
             const uint32_t n = b.kind == 3 ? GuardedPrivateRead(b.res, b.va, buf.data(), want)
                                            : GuardedSnapshot(b.res, b.va, buf.data(), want); // 0 = not UPLOAD / unmappable
@@ -4542,7 +4631,7 @@ bool RtBonesWindowOpen()
 {
     return false;
 }
-void RtBonesLog(command_list*, const CmdState&, uint32_t groups_x, uint64_t cs_hash, bool learned)
+void RtBonesLogLine(command_list*, const CmdState&, uint32_t groups_x, uint64_t cs_hash, bool learned)
 {
     if (DiagOnce("RTBONES-M1", (int)(cs_hash ^ (cs_hash >> 32))))
         g_log.Line(false, "RTBONES cs=%016llx groups_x=%u learned_skin_cs=%d (core diagnostic; bindings in RTPAL lines)",
@@ -4557,10 +4646,11 @@ VfRestore RtSkinDraw(command_list* cmd_list, ID3D12GraphicsCommandList* d3d12_cl
     uint32_t s2, uint32_t, uint32_t, int32_t, uint64_t, uint64_t, int, bool)
 {
     if (!wc || !d3d12_cl || Mode() != 2 || !rtskin::ClaimIsPassThrough(cmd_list)) return {};
-    return rtskin::Draw(cmd_list, d3d12_cl, dm, int(wc->index), c, s2);
+    return rtskin::Draw(cmd_list, d3d12_cl, RtStableMod(dm), int(wc->index), c, s2);
 }
-void RtNoteDrawOutcome(int dm, int comp, int outcome)
+void RtNoteDrawOutcome(int set_dm, int comp, int outcome)
 {
+    const int dm = RtStableMod(set_dm);
     static std::mutex                         s_m;
     static std::set<std::tuple<int, int, int>> s_seen;
     static const char*                        kWhat[] = { "drawn", "declined by the module (see RTM2 skip)",
@@ -4651,8 +4741,9 @@ void Log(bool essential, _Printf_format_string_ const char* fmt, ...)
 // A raster draw of mod component (mod, comp) stamped the mod's texture `src` (its resource mod_res) over the game's
 // texture `game` in its pixel shader's table (section_ps_stamp.cpp): the RT material table of that section gets the
 // same (M4Apply).
-void RtNoteSlotTexture(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRIPTOR_HANDLE src, ID3D12Resource* mod_res)
+void RtNoteSlotTexture(int set_mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRIPTOR_HANDLE src, ID3D12Resource* mod_res)
 {
+    const int mod = RtStableMod(set_mod);
     if (mod < 0 || comp < 0 || !game || !src.ptr || game == mod_res) return; // mod_res may be unknown (RabbitFX maps)
     std::lock_guard l(g_slot_tex_m);
     ++g_slot_tex_notes;
@@ -4685,7 +4776,7 @@ void RtNoteSlotTexture(int mod, int comp, ID3D12Resource* game, D3D12_CPU_DESCRI
     e.frame = g_frame_id;
     e.gen = PortApi::LoadGeneration();
     if (fresh || g_frame_id - e.hframe > 60) {
-        e.hash = TexIdentityNorm(TexHashOf(reinterpret_cast<uint64_t>(game)));
+        e.hash = TexIdentityNorm(g_tex_identity.HashOf(reinterpret_cast<uint64_t>(game)));
         e.hframe = g_frame_id;
     }
     if (e.hash) {
@@ -4721,8 +4812,9 @@ void RtForgetModTextures(const std::unordered_set<ID3D12Resource*>& mod_res)
 }
 
 // A raster draw of mod component (mod, comp) reads the game's texture `game` as bound (section_ps_stamp.cpp).
-void RtNoteKeptTexture(int mod, int comp, ID3D12Resource* game, ID3D12Resource* swapped)
+void RtNoteKeptTexture(int set_mod, int comp, ID3D12Resource* game, ID3D12Resource* swapped)
 {
+    const int mod = RtStableMod(set_mod);
     if (mod < 0 || !game) return;
     std::lock_guard l(g_slot_tex_m);
     if (swapped && swapped != game) { // the slot holds a mod texture the core placed (placement swap / in-place stamp)
@@ -4734,7 +4826,7 @@ void RtNoteKeptTexture(int mod, int comp, ID3D12Resource* game, ID3D12Resource* 
             static std::atomic<uint32_t> s_log{ 0 };
             if (s_log.fetch_add(1) < 96)
                 g_log.Line(true, "RTM4 raster swap mod=%d comp=%d: game texture %p (%s h%08x) -> mod texture %p (%s)", mod, comp, (void*)game,
-                    TexDesc(game).c_str(), TexHashOf(reinterpret_cast<uint64_t>(game)), (void*)swapped, TexDesc(swapped).c_str());
+                    TexDesc(game).c_str(), g_tex_identity.HashOf(reinterpret_cast<uint64_t>(game)), (void*)swapped, TexDesc(swapped).c_str());
         }
         return;
     }

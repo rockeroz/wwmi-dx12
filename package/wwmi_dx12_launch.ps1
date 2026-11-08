@@ -5,7 +5,7 @@ $dir    = $PSScriptRoot
 $proc   = "Client-Win64-Shipping"
 $proxy  = [IO.Path]::Combine($dir, "dxgi.dll")
 $ini    = [IO.Path]::Combine($dir, "wwmi_dx12.ini")
-$iniDefault = [IO.Path]::Combine($dir, "wwmi_dx12.default.ini") # shipped under this name: an update never resets the settings
+$iniSeed = [IO.Path]::Combine($dir, "wwmi_dx12.ini.seed")
 $minReShade = [version]"6.8.0"
 
 function Wait-Key {
@@ -23,6 +23,10 @@ trap {
     Write-Host "The launcher stopped on an error: $_" -ForegroundColor Red
     Wait-Key
     exit 2
+}
+
+if (-not [IO.File]::Exists($ini) -and [IO.File]::Exists($iniSeed)) {
+    try { [IO.File]::Copy($iniSeed, $ini) } catch { Fail "Could not write wwmi_dx12.ini in $dir -- is the game folder read-only?" }
 }
 
 $wwmiKey = [regex]'(?m)^[ \t]*wwmi_dir[ \t]*=([^\r\n]*)'
@@ -94,6 +98,15 @@ function Select-Found($found) {
 function Test-ReShade([string]$dll) {
     return [Diagnostics.FileVersionInfo]::GetVersionInfo($dll).ProductName -match "ReShade"
 }
+function Get-WwmiVersion([string]$p) {
+    try {
+        $ini = [IO.Path]::Combine($p, "Core\WWMI\WuWa-Model-Importer.ini")
+        if (-not [IO.File]::Exists($ini)) { return "not found" }
+        $m = [regex]::Match([IO.File]::ReadAllText($ini), '(?m)^[ \t]*global[ \t]+(?:persist[ \t]+)?\$wwmi_version[ \t]*=[ \t]*([0-9.]+)')
+        if ($m.Success) { return $m.Groups[1].Value }
+        return "unknown"
+    } catch { return "unknown" }
+}
 function Test-GameRunning { return [bool](Get-Process $proc -ErrorAction SilentlyContinue) }
 
 function Get-AddonVersion {
@@ -141,10 +154,6 @@ if (-not $addonDir -or -not [IO.File]::Exists([IO.Path]::Combine($addonDir, "wwm
     Fail "wwmi_dx12.addon64 is not in '$addonDir' (where ReShade loads add-ons from; ReShade.ini says AddonPath='$addonPath'). See README: Install."
 }
 
-if (-not [IO.File]::Exists($ini) -and [IO.File]::Exists($iniDefault)) {
-    [IO.File]::Copy($iniDefault, $ini)
-    Write-Host "wwmi_dx12.ini made from wwmi_dx12.default.ini (first start)."
-}
 $wwmi = Get-WwmiSetting
 $resolved = Resolve-Dir $wwmi
 $save = $false
@@ -286,6 +295,7 @@ Write-Host ""
 Write-Host "  Add-on         $(Get-AddonVersion)"
 Write-Host "  Game folder    $root"
 Write-Host "  WWMI folder    $resolved"
+Write-Host "  WWMI version   $(Get-WwmiVersion $resolved)"
 Write-Host "  ReShade        $reshadeVersion"
 $graphicsRow = -1
 try { $graphicsRow = [Console]::CursorTop } catch {}

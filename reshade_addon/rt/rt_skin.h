@@ -8,6 +8,7 @@
 #include <reshade.hpp>
 #include <d3d12.h>
 #include "rt_hooks.h"
+#include "rt_draw.h" // VfRestore
 
 namespace rtskin {
 
@@ -44,8 +45,8 @@ bool MeshReady(int mod);
 void RequestMesh(int mod);
 void PresentTick(); // hands requested meshes to the background loader, retires bindings
 void PreloadAll();  // every loaded mod's mesh, in the background (ray tracing just started)
-// The background loader has no mesh in hand (it reads g_geomods): waits up to timeout_ms. A mod reload calls it with
-// the mod gate paused, on the present thread -- the only one that starts the loader.
+// The background loader has no mesh in hand: waits up to timeout_ms. (It holds the mod set it reads -- ModSetRef --
+// so a reload does not need to wait for it.)
 bool LoaderIdle(unsigned timeout_ms);
 
 // The draw (draw_section_draw.cpp -> RtSkinDraw): pose the sub-draw [s2, s2 + c) of component `comp` of mod `mod`,
