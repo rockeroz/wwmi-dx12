@@ -4305,18 +4305,21 @@ void RtNoteVertexShader(uint64_t vs_hash, const void* code, size_t code_size)
 void RtNoteShader(uint64_t cs_hash, const void* code, size_t code_size)
 {
     if (!cs_hash || !code || !code_size || code_size > (4u << 20) || Mode() == 0) return;
-    std::lock_guard l(g_shader_m);
-    if (g_cs_code.count(cs_hash) || g_cs_code_bytes + code_size > kCsCodeCap) return;
     const auto* p = static_cast<const uint8_t*>(code);
-    g_cs_code.emplace(cs_hash, std::vector<uint8_t>(p, p + code_size));
-    g_cs_code_bytes += code_size;
-    // The entry name is stored as plain text in the container's PSV0 string table.
+    std::lock_guard l(g_shader_m);
+    // The skin cache's shaders are recognised whatever the dump budget: one created late (a variant first used in a
+    // menu) would otherwise never be seen posing a ring. The entry name is plain text in the container's PSV0 table.
     static const char kSkin[] = "SkinCacheUpdateBatchCS";
-    if (std::search(p, p + code_size, kSkin, kSkin + sizeof kSkin - 1) != p + code_size) {
+    if (!g_skin_cs.count(cs_hash) && std::search(p, p + code_size, kSkin, kSkin + sizeof kSkin - 1) != p + code_size) {
         g_skin_cs.insert(cs_hash);
         DxilSrvRegs regs;
         if (DxilShaderSrvRegs(p, code_size, regs) && regs.has(6)) g_skin_cs_morph.insert(cs_hash);
+        g_log.Line(true, "RTSKINCS cs=%016llx: a skin cache shader (SkinCacheUpdateBatchCS%s), %zu known", (unsigned long long)cs_hash,
+            g_skin_cs_morph.count(cs_hash) ? ", morph blend" : "", g_skin_cs.size());
     }
+    if (g_cs_code.count(cs_hash) || g_cs_code_bytes + code_size > kCsCodeCap) return;
+    g_cs_code.emplace(cs_hash, std::vector<uint8_t>(p, p + code_size));
+    g_cs_code_bytes += code_size;
 }
 
 // M4 (observe): a ray tracing pipeline's shaders. Each shader's library is dumped once (rtlib_<hash>.dxil); RTLIB names

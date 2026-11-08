@@ -845,6 +845,34 @@ bool LookupSection(uint64_t ring_va, int comp, uint32_t frame, Sec* out, int mod
     return SecFor(r, *live[size_t(comp)].second, frame, out); // false: posed too long ago, its palette is gone
 }
 
+// RTM2 IDLE-RING (diagnostic): a draw posed from a ring the skin cache has not posed for a while (its kept palettes,
+// Keep). The ring holds that pose, so the game's own model there stands still too -- unless it is animated elsewhere
+// (another ring of the same mesh posed meanwhile, listed here). Once per ring as the idle stretch passes 8, 60, 300
+// frames; at most 80 lines.
+void NoteIdleRing(uint64_t ring_va, int mod, int comp, uint32_t frame, uint32_t posed) // g_m held
+{
+    const uint32_t idle = frame - posed;
+    if (int32_t(idle) < 8) return;
+    static std::map<uint64_t, uint32_t> s_told; // ring -> the last threshold told
+    static uint32_t                     s_lines = 0;
+    const uint64_t                      key = FindRingKey(ring_va);
+    const uint32_t                      level = idle >= 300 ? 3 : idle >= 60 ? 2 : 1;
+    uint32_t&                           told = s_told[key];
+    if (told >= level || s_lines >= 80) return;
+    told = level;
+    ++s_lines;
+    const auto ri = g_rings.find(key);
+    const size_t nsec = ri != g_rings.end() ? ri->second.by_start.size() : 0;
+    std::string others;
+    for (const auto& [k, r] : g_rings)
+        if (k != key && r.by_start.size() == nsec && frame - r.frame <= 4)
+            others += " " + std::to_string(k) + "@-" + std::to_string(frame - r.frame);
+    Log(true, "RTM2 IDLE-RING ring=%llx (VB0 %llx) mod=%d comp=%d: drawn with palettes the skin cache wrote %u frame(s) ago (f%u)"
+              "%s -- rings of %zu sections posed in the last 4 frames:%s",
+        (unsigned long long)key, (unsigned long long)ring_va, mod, comp, idle, posed, ring_va == key ? "" : " [VB0 inside the ring]",
+        nsec, others.empty() ? " none" : others.c_str());
+}
+
 // Merged skeleton for this list's slot: last frame's merged palettes as the base, then every section posed this frame
 // copied over its range. false = nothing to build from (no base, not every section posed).
 bool BuildMerged(Mesh& m, Slot& sl, Bind& bind, int self_slot, uint64_t ring, uint32_t frame, ID3D12GraphicsCommandList* cl) // g_m held
@@ -1322,14 +1350,19 @@ VfRestore Draw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* 
         }
         Sec  sec;
         bool fresh = LookupSection(ctx.ring, comp, frame, &sec, mod);
+        uint32_t newest = fresh ? sec.frame : 0; // the latest dispatch the palettes come from
         if (!m.merged.empty()) { // merged skeleton: any section posed this frame, or last frame's palettes, will do
             bool any = false;
             for (const int idx : m.merged_idx) {
                 Sec x;
-                any = any || LookupSection(ctx.ring, idx, frame, &x, mod);
+                if (LookupSection(ctx.ring, idx, frame, &x, mod)) {
+                    any = true;
+                    if (int32_t(x.frame - newest) > 0 || !newest) newest = x.frame;
+                }
             }
             fresh = any;
         }
+        if (fresh) NoteIdleRing(ctx.ring, mod, comp, frame, newest);
         // no palette this frame (the skin cache did not pose the section): our last pose of it, drawn as it was
         Slot* cached = fresh ? nullptr : CachedPose(m, comp, frame);
         if (!fresh && !cached) {
